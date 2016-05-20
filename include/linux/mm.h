@@ -373,7 +373,7 @@ extern pgprot_t protection_map[16];
 #define FAULT_FLAG_REMOTE			0x80
 #define FAULT_FLAG_INSTRUCTION  		0x100
 #define FAULT_FLAG_INTERRUPTIBLE		0x200
-
+#define FAULT_FLAG_PREFAULT_OLD 0x400   /* Make faultaround ptes old */
 /*
  * The default fault flags that should be used by most of the
  * arch-specific page fault handlers.
@@ -399,7 +399,6 @@ static inline bool fault_flag_allow_retry_first(unsigned int flags)
 	return (flags & FAULT_FLAG_ALLOW_RETRY) &&
 	    (!(flags & FAULT_FLAG_TRIED));
 }
-
 #define FAULT_FLAG_TRACE \
 	{ FAULT_FLAG_WRITE,		"WRITE" }, \
 	{ FAULT_FLAG_MKWRITE,		"MKWRITE" }, \
@@ -410,7 +409,8 @@ static inline bool fault_flag_allow_retry_first(unsigned int flags)
 	{ FAULT_FLAG_USER,		"USER" }, \
 	{ FAULT_FLAG_REMOTE,		"REMOTE" }, \
 	{ FAULT_FLAG_INSTRUCTION,	"INSTRUCTION" }, \
-	{ FAULT_FLAG_INTERRUPTIBLE,	"INTERRUPTIBLE" }
+	{ FAULT_FLAG_INTERRUPTIBLE,	"INTERRUPTIBLE" }, \
+	{ FAULT_FLAG_PREFAULT_OLD,      "PREFAULT_OLD" }
 
 /*
  * vm_fault is filled by the the pagefault handler and passed to the vma's
@@ -2949,7 +2949,6 @@ void __init setup_nr_node_ids(void);
 static inline void setup_nr_node_ids(void) {}
 #endif
 
-
 #ifdef CONFIG_PROCESS_RECLAIM
 struct reclaim_param {
 	struct vm_area_struct *vma;
@@ -2969,6 +2968,7 @@ extern int reclaim_address_space(struct address_space *mapping,
 extern int proc_reclaim_notifier_register(struct notifier_block *nb);
 extern int proc_reclaim_notifier_unregister(struct notifier_block *nb);
 #endif
+extern int want_old_faultaround_pte;
 
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */
