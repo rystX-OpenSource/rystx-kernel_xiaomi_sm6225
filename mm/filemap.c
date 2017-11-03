@@ -115,7 +115,36 @@ int want_old_faultaround_pte = 1;
  *   ->tasklist_lock            (memory_failure, collect_procs_ao)
  */
 
-static void page_cache_delete(struct address_space *mapping,
+static int page_cache_tree_insert(struct address_space *mapping,
+				  struct page *page, void **shadowp)
+{
+	struct radix_tree_node *node;
+	void **slot;
+	int error;
+
+	error = __radix_tree_create(&mapping->i_pages, page->index, 0,
+				    &node, &slot);
+	if (error)
+		return error;
+	if (*slot) {
+		void *p;
+
+		p = radix_tree_deref_slot_protected(slot,
+						    &mapping->i_pages.xa_lock);
+		if (!xa_is_value(p))
+			return -EEXIST;
+
+		mapping->nrexceptional--;
+		if (shadowp)
+			*shadowp = p;
+	}
+	__radix_tree_replace(&mapping->i_pages, node, slot, page,
+			     workingset_lookup_update(mapping));
+	mapping->nrpages++;
+	return 0;
+}
+
+static void page_cache_tree_delete(struct address_space *mapping,
 				   struct page *page, void *shadow)
 {
 	XA_STATE(xas, &mapping->i_pages, page->index);
@@ -303,6 +332,8 @@ static void page_cache_delete_batch(struct address_space *mapping,
 	xas_for_each(&xas, page, ULONG_MAX) {
 		if (i >= pagevec_count(pvec) && !tail_pages)
 			break;
+		page = radix_tree_deref_slot_protected(slot,
+						       &mapping->i_pages.xa_lock);
 		if (xa_is_value(page))
 			continue;
 		if (!tail_pages) {

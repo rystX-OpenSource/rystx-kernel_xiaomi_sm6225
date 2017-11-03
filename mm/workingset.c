@@ -167,7 +167,7 @@
  * refault distance will immediately activate the refaulting page.
  */
 
-#define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) +  \
+#define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) +	\
 			 1 + NODES_SHIFT + MEM_CGROUP_ID_SHIFT)
 #define EVICTION_MASK	(~0UL >> EVICTION_SHIFT)
 
@@ -479,7 +479,23 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 	 */
 	if (WARN_ON_ONCE(!node->nr_values))
 		goto out_invalid;
-	if (WARN_ON_ONCE(node->count != node->nr_values))
+	if (WARN_ON_ONCE(node->count != node->exceptional))
+		goto out_invalid;
+	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
+		if (node->slots[i]) {
+			if (WARN_ON_ONCE(!xa_is_value(node->slots[i])))
+				goto out_invalid;
+			if (WARN_ON_ONCE(!node->exceptional))
+				goto out_invalid;
+			if (WARN_ON_ONCE(!mapping->nrexceptional))
+				goto out_invalid;
+			node->slots[i] = NULL;
+			node->exceptional--;
+			node->count--;
+			mapping->nrexceptional--;
+		}
+	}
+	if (WARN_ON_ONCE(node->exceptional))
 		goto out_invalid;
 	mapping->nrexceptional -= node->nr_values;
 	xas.xa_node = xa_parent_locked(&mapping->i_pages, node);
