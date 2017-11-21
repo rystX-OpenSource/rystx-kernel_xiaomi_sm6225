@@ -115,7 +115,7 @@ int want_old_faultaround_pte = 1;
  *   ->tasklist_lock            (memory_failure, collect_procs_ao)
  */
 
-static void page_cache_tree_delete(struct address_space *mapping,
+static void page_cache_delete(struct address_space *mapping,
 				   struct page *page, void *shadow)
 {
 	XA_STATE(xas, &mapping->i_pages, page->index);
