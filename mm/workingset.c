@@ -460,7 +460,6 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 	 * to reclaim, take the node off-LRU, and drop the lru_lock.
 	 */
 
-	node = container_of(item, struct xa_node, private_list);
 	mapping = container_of(node->array, struct address_space, i_pages);
 
 	/* Coming from the list, invert the lock order */
@@ -481,22 +480,6 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 	if (WARN_ON_ONCE(!node->nr_values))
 		goto out_invalid;
 	if (WARN_ON_ONCE(node->count != node->nr_values))
-		goto out_invalid;
-	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
-		if (node->slots[i]) {
-			if (WARN_ON_ONCE(!xa_is_value(node->slots[i])))
-				goto out_invalid;
-			if (WARN_ON_ONCE(!node->nr_values))
-				goto out_invalid;
-			if (WARN_ON_ONCE(!mapping->nrexceptional))
-				goto out_invalid;
-			node->slots[i] = NULL;
-			node->nr_values--;
-			node->count--;
-			mapping->nrexceptional--;
-		}
-	}
-	if (WARN_ON_ONCE(node->nr_values))
 		goto out_invalid;
 	mapping->nrexceptional -= node->nr_values;
 	xas.xa_node = xa_parent_locked(&mapping->i_pages, node);
