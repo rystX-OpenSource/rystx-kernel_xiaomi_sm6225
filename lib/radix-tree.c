@@ -815,7 +815,8 @@ static void radix_tree_free_nodes(struct radix_tree_node *node)
 
 	for (;;) {
 		void *entry = rcu_dereference_raw(child->slots[offset]);
-		if (xa_is_node(entry) && child->shift) {
+		if (radix_tree_is_internal_node(entry) && child->shift &&
+				!is_sibling_entry(child, entry)) {
 			child = entry_to_node(entry);
 			offset = 0;
 			continue;
@@ -1061,7 +1062,7 @@ static inline void replace_sibling_entries(struct radix_tree_node *node,
 static void replace_slot(void __rcu **slot, void *item,
 		struct radix_tree_node *node, int count, int values)
 {
-	if (node && (count || values)) {
+	if (node && (count || exceptional)) {
 		node->count += count;
 		node->nr_values += values;
 		replace_sibling_entries(node, slot, count, values);
