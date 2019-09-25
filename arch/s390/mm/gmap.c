@@ -2635,17 +2635,8 @@ static const struct mm_walk_ops reset_cmma_walk_ops = {
 
 void s390_reset_cmma(struct mm_struct *mm)
 {
-<<<<<<< HEAD
-	struct mm_walk walk = { .pte_entry = __s390_reset_cmma };
-
-	mmap_write_lock(mm);
-	walk.mm = mm;
-	walk_page_range(0, TASK_SIZE, &walk);
-	mmap_write_unlock(mm);
-=======
 	down_write(&mm->mmap_sem);
 	walk_page_range(mm, 0, TASK_SIZE, &reset_cmma_walk_ops, NULL);
 	up_write(&mm->mmap_sem);
->>>>>>> 7b86ac3371b7 (pagewalk: separate function pointers from iterator data)
 }
 EXPORT_SYMBOL_GPL(s390_reset_cmma);
