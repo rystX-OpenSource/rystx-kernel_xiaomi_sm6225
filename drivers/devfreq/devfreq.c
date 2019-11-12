@@ -909,7 +909,9 @@ int devfreq_suspend_device(struct devfreq *devfreq)
 	}
 
 	if (devfreq->suspend_freq) {
+		mutex_lock(&devfreq->lock);
 		ret = devfreq_set_target(devfreq, devfreq->suspend_freq, 0);
+		mutex_unlock(&devfreq->lock);
 		if (ret)
 			return ret;
 	}
@@ -938,7 +940,9 @@ int devfreq_resume_device(struct devfreq *devfreq)
 	}
 
 	if (devfreq->resume_freq) {
+		mutex_lock(&devfreq->lock);
 		ret = devfreq_set_target(devfreq, devfreq->resume_freq, 0);
+		mutex_unlock(&devfreq->lock);
 		if (ret)
 			return ret;
 	}
