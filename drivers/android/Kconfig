@@ -70,6 +70,15 @@ config ANDROID_KABI_RESERVE
 
 	  If even slightly unsure, say Y.
 
+config ANDROID_VENDOR_HOOKS
+        bool "Android Vendor Hooks"
+        depends on TRACEPOINTS
+        ---help---
+          Enable vendor hooks implemented as tracepoints
+
+          Allow vendor modules to attach to tracepoint "hooks" defined via
+          DECLARE_HOOK or DECLARE_RESTRICTED_HOOK.
+
 config ANDROID_VENDOR_OEM_DATA
 	bool "Android vendor and OEM data padding"
 	default y
