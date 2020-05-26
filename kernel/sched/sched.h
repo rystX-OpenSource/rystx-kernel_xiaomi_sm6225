@@ -1135,13 +1135,6 @@ struct rq {
 	unsigned int		ttwu_local;
 #endif
 
-#ifdef CONFIG_SMP
-#if SCHED_FEAT_TTWU_QUEUE
-	struct llist_head	wake_list;
-#endif
-        call_single_data_t      wake_csd;
-#endif
-
 #ifdef CONFIG_CPU_IDLE
 	/* Must be inspected within a rcu lock section */
 	struct cpuidle_state	*idle_state;
@@ -1705,7 +1698,6 @@ extern void flush_smp_call_function_from_idle(void);
 
 #else /* !CONFIG_SMP: */
 static inline void flush_smp_call_function_from_idle(void) { }
-static inline void sched_ttwu_pending(void) { }
 #endif
 
 #include "stats.h"
