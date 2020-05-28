@@ -22,6 +22,8 @@
 #include <linux/suspend.h>
 
 #include "smpboot.h"
+#include "sched/features.h"
+#include "sched/smp.h"
 
 enum {
 	CSD_FLAG_LOCK		= 0x01,
@@ -136,8 +138,6 @@ static __always_inline void csd_unlock(struct __call_single_data *csd)
 }
 
 static DEFINE_PER_CPU_SHARED_ALIGNED(call_single_data_t, csd_data);
-
-extern void send_call_function_single_ipi(int cpu);
 
 /*
  * Insert a previously allocated call_single_data_t element
