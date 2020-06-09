@@ -793,7 +793,7 @@ static long madvise_dontneed_free(struct vm_area_struct *vma,
 	if (!userfaultfd_remove(vma, start, end)) {
 		*prev = NULL; /* mmap_sem has been dropped, prev is stale */
 
-		down_read(&mm->mmap_sem);
+		mmap_read_lock(mm);
 		vma = find_vma(mm, start);
 		if (!vma)
 			return -ENOMEM;
@@ -876,13 +876,13 @@ static long madvise_remove(struct vm_area_struct *vma,
 	get_file(f);
 	if (userfaultfd_remove(vma, start, end)) {
 		/* mmap_sem was not released by userfaultfd_remove() */
-		up_read(&mm->mmap_sem);
+		mmap_read_unlock(mm);
 	}
 	error = vfs_fallocate(f,
 				FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
 				offset, end - start);
 	fput(f);
-	down_read(&mm->mmap_sem);
+	mmap_read_lock(mm);
 	return error;
 }
 
@@ -1131,7 +1131,7 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 
 	write = madvise_need_mmap_write(behavior);
 	if (write) {
-		if (down_write_killable(&mm->mmap_sem))
+		if (mmap_write_lock_killable(mm))
 			return -EINTR;
 
 		/*
@@ -1151,7 +1151,7 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 			return -EINTR;
 		}
 	} else {
-		down_read(&mm->mmap_sem);
+		mmap_read_lock(mm);
 	}
 
 	/*
@@ -1201,9 +1201,9 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 out:
 	blk_finish_plug(&plug);
 	if (write)
-		up_write(&mm->mmap_sem);
+		mmap_write_unlock(mm);
 	else
-		up_read(&mm->mmap_sem);
+		mmap_read_unlock(mm);
 
 	return error;
 }
