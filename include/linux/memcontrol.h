@@ -328,24 +328,6 @@ struct mem_cgroup {
 
 extern struct mem_cgroup *root_mem_cgroup;
 
-enum page_memcg_data_flags {
-	/*
-	 * page->memcg_data is a pointer to an objcgs vector.
-	 *
-	 * Reserved but never set in this tree: it predates the 5.9 slab
-	 * memory controller, so slab pages store a plain mem_cgroup pointer
-	 * and there is no objcgs vector sharing page->memcg_data. The bit is
-	 * kept so that flag numbering matches upstream.
-	 */
-	MEMCG_DATA_OBJCGS = (1UL << 0),
-	/* page has been accounted as a non-slab kernel page */
-	MEMCG_DATA_KMEM = (1UL << 1),
-	/* the next bit after the last actual flag */
-	__NR_MEMCG_DATA_FLAGS  = (1UL << 2),
-};
-
-#define MEMCG_DATA_FLAGS_MASK (__NR_MEMCG_DATA_FLAGS - 1)
-
 /*
  * page_memcg - get the memory cgroup associated with a page
  * @page: a pointer to the page struct
@@ -363,12 +345,8 @@ enum page_memcg_data_flags {
  */
 static inline struct mem_cgroup *page_memcg(struct page *page)
 {
-	unsigned long memcg_data = page->memcg_data;
-
 	VM_BUG_ON_PAGE(PageSlab(page), page);
-	VM_BUG_ON_PAGE(memcg_data & MEMCG_DATA_OBJCGS, page);
-
-	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
+	return (struct mem_cgroup *)page->memcg_data;
 }
 
 /*
@@ -385,8 +363,7 @@ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
 	VM_BUG_ON_PAGE(PageSlab(page), page);
 	WARN_ON_ONCE(!rcu_read_lock_held());
 
-	return (struct mem_cgroup *)(READ_ONCE(page->memcg_data) &
-				     ~MEMCG_DATA_FLAGS_MASK);
+	return (struct mem_cgroup *)READ_ONCE(page->memcg_data);
 }
 
 /*
@@ -394,9 +371,9 @@ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
  * @page: a pointer to the page struct
  *
  * Returns a pointer to the memory cgroup associated with the page,
- * or NULL. This function unlike page_memcg() can take any page
+ * or NULL. This function unlike page_memcg() can take any  page
  * as an argument. It has to be used in cases when it's not known if a page
- * has an associated memory cgroup pointer.
+ * has an associated memory cgroup pointer or an object cgroups vector.
  *
  * Any of the following ensures page and memcg binding stability:
  * - the page lock
@@ -412,21 +389,16 @@ static inline struct mem_cgroup *page_memcg_check(struct page *page)
 	 */
 	unsigned long memcg_data = READ_ONCE(page->memcg_data);
 
-	return (struct mem_cgroup *)(memcg_data & ~MEMCG_DATA_FLAGS_MASK);
-}
+	/*
+	 * The lowest bit set means that memcg isn't a valid
+	 * memcg pointer, but a obj_cgroups pointer.
+	 * In this case the page is shared and doesn't belong
+	 * to any specific memory cgroup.
+	 */
+	if (memcg_data & 0x1UL)
+		return NULL;
 
-/*
- * PageMemcgKmem - check if the page has MemcgKmem flag set
- * @page: a pointer to the page struct
- *
- * Checks if the page has MemcgKmem flag set. The caller must ensure that
- * the page has an associated memory cgroup. It's not safe to call this function
- * against some types of pages, e.g. slab pages.
- */
-static inline bool PageMemcgKmem(struct page *page)
-{
-	VM_BUG_ON_PAGE(page->memcg_data & MEMCG_DATA_OBJCGS, page);
-	return page->memcg_data & MEMCG_DATA_KMEM;
+	return (struct mem_cgroup *)memcg_data;
 }
 
 static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)
@@ -816,7 +788,7 @@ static inline void mod_lruvec_state(struct lruvec *lruvec,
 static inline void __mod_lruvec_page_state(struct page *page,
 					   enum node_stat_item idx, int val)
 {
-	struct mem_cgroup *memcg = page_memcg_check(page);
+	struct mem_cgroup *memcg = page_memcg(page);
 	pg_data_t *pgdat = page_pgdat(page);
 	struct lruvec *lruvec;
 
@@ -951,11 +923,6 @@ static inline struct mem_cgroup *page_memcg_rcu(struct page *page)
 static inline struct mem_cgroup *page_memcg_check(struct page *page)
 {
 	return NULL;
-}
-
-static inline bool PageMemcgKmem(struct page *page)
-{
-	return false;
 }
 
 static inline bool mem_cgroup_is_root(struct mem_cgroup *memcg)

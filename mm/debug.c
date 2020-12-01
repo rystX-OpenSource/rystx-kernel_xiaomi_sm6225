@@ -83,7 +83,7 @@ hex_only:
 
 #ifdef CONFIG_MEMCG
 	if (!page_poisoned && page->memcg_data)
-		pr_alert("page->memcg_data:%lx\n", page->memcg_data);
+		pr_alert("page's memcg:%lx\n", page->memcg_data);
 #endif
 }
 

@@ -1036,7 +1036,11 @@ static inline bool page_expected_state(struct page *page,
 	if (unlikely((unsigned long)page->mapping |
 			page_ref_count(page) |
 #ifdef CONFIG_MEMCG
+<<<<<<< HEAD
 			page->memcg_data |
+=======
+			(unsigned long)page_memcg(page) |
+>>>>>>> 579cfa878ec4 (BACKPORT: mm: memcontrol: Use helpers to read page's memcg data)
 #endif
 			(page->flags & check_flags)))
 		return false;
@@ -1063,7 +1067,11 @@ static void free_pages_check_bad(struct page *page)
 		bad_flags = PAGE_FLAGS_CHECK_AT_FREE;
 	}
 #ifdef CONFIG_MEMCG
+<<<<<<< HEAD
 	if (unlikely(page->memcg_data))
+=======
+	if (unlikely(page_memcg(page)))
+>>>>>>> 579cfa878ec4 (BACKPORT: mm: memcontrol: Use helpers to read page's memcg data)
 		bad_reason = "page still charged to cgroup";
 #endif
 	bad_page(page, bad_reason, bad_flags);
@@ -2003,7 +2011,11 @@ static void check_new_page_bad(struct page *page)
 		bad_flags = PAGE_FLAGS_CHECK_AT_PREP;
 	}
 #ifdef CONFIG_MEMCG
+<<<<<<< HEAD
 	if (unlikely(page->memcg_data))
+=======
+	if (unlikely(page_memcg(page)))
+>>>>>>> 579cfa878ec4 (BACKPORT: mm: memcontrol: Use helpers to read page's memcg data)
 		bad_reason = "page still charged to cgroup";
 #endif
 	bad_page(page, bad_reason, bad_flags);
