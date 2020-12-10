@@ -126,19 +126,13 @@ int mb_cache_entry_create(struct mb_cache *cache, gfp_t mask, u32 key,
 		return -ENOMEM;
 	}
 
-	/*
-	 * We create entry with two references. One reference is kept by the
-	 * hash table, the other reference is used to protect us from
-	 * mb_cache_entry_delete_or_get() until the entry is fully setup. This
-	 * avoids nesting of cache->c_list_lock into hash table bit locks which
-	 * is problematic for RT.
-	 */
 	*entry = (typeof(*entry)){
 		.e_list = LIST_HEAD_INIT(entry->e_list),
+		/* One ref for hash, one ref returned */
 		.e_refcnt = ATOMIC_INIT(2),
 		.e_key = key,
 		.e_value = value,
-		.e_flags = reusable ? MBE_REUSABLE_B : 0
+		.e_reusable = reusable
 	};
 
 	hlist_bl_lock(head);
@@ -435,9 +429,8 @@ struct mb_cache *mb_cache_create(int bucket_bits)
 	cache->c_max_entries = bucket_count << 4;
 	INIT_LIST_HEAD(&cache->c_list);
 	spin_lock_init(&cache->c_list_lock);
-	cache->c_bucket = kmalloc_array(bucket_count,
-					sizeof(*cache->c_bucket),
-					GFP_KERNEL);
+	cache->c_bucket = kmalloc_array(bucket_count, sizeof(*cache->c_bucket),
+				        GFP_KERNEL);
 	if (!cache->c_bucket) {
 		kfree(cache);
 		goto err_out;
