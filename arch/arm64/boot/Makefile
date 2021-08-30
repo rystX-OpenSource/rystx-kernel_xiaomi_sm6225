@@ -76,6 +76,9 @@ $(obj)/dtbo.img: $(DTBO_OBJS) FORCE
 $(obj)/dtb.img: $(DTB_OBJS) FORCE
 	$(call if_changed,cat)
 
+$(obj)/dtb.img: $(DTB_OBJS) FORCE
+	$(call if_changed,cat)
+
 install:
 	$(CONFIG_SHELL) $(srctree)/$(src)/install.sh $(KERNELRELEASE) \
 	$(obj)/Image System.map "$(INSTALL_PATH)"
