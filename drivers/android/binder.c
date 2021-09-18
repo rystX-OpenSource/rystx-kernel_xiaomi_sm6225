@@ -2230,7 +2230,6 @@ static void binder_do_fd_close(struct callback_head *twork)
 static void binder_deferred_fd_close(int fd)
 {
 	struct binder_task_work_cb *twcb;
-
 	twcb = kmem_cache_alloc(binder_twcb_pool, GFP_KERNEL);
 	if (!twcb)
 		return;
