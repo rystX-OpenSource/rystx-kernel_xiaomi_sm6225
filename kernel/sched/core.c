@@ -3919,7 +3919,6 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	 */
 	if (!next->mm) {                                // to kernel
 		enter_lazy_tlb(prev->active_mm, next);
-
 		next->active_mm = prev->active_mm;
 		if (prev->mm)                           // from user
 			mmgrab(prev->active_mm);
@@ -3936,6 +3935,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		 */
 
 		switch_mm_irqs_off(prev->active_mm, next->mm, next);
+		lru_gen_use_mm(next->mm);
 
 		if (!prev->mm) {                        // from kernel
 			/* will mmdrop() in finish_task_switch(). */
