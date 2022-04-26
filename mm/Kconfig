@@ -875,22 +875,3 @@ config PROCESS_RECLAIM
 	 (addr, addr + size-bytes) of the process.
 
 	 Any other value is ignored.
-
-config FORCE_ALLOC_FROM_DMA_ZONE
-	bool "Force certain memory allocators to always return ZONE_DMA32 memory"
-	depends on ZONE_DMA32
-	help
-	  Ensure certain memory allocators always return memory from ZONE_DMA32.
-	  This option helps ensure that clients who require ZONE_DMA32 memory are
-	  always using ZONE_DMA32 memory.
-
-	  If unsure, say "n".
-
-config OPLUS_MM_HACKS
-	bool "Enable oplus memory management hacks"
-	default n
-	help
-	  Improves memory management drastically as these hacks are used in Oplus devices.
-	  Tested on devices made by OEMs like Motorola and Samsung.
-
-	  If unsure, say "n".
