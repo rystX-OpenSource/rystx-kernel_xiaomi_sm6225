@@ -130,7 +130,7 @@ static int compute_score(struct sock *sk, struct net *net,
 			 const struct in6_addr *daddr, unsigned short hnum,
 			 int dif, int sdif, bool exact_dif)
 {
-	int score;
+	int bound_dev_if, score;
 	struct inet_sock *inet;
 
 	if (!net_eq(sock_net(sk), net) ||
@@ -159,13 +159,14 @@ static int compute_score(struct sock *sk, struct net *net,
 		score++;
 	}
 
-	if (sk->sk_bound_dev_if || exact_dif) {
-		bool dev_match = (sk->sk_bound_dev_if == dif ||
-				  sk->sk_bound_dev_if == sdif);
+	bound_dev_if = READ_ONCE(sk->sk_bound_dev_if);
+	if (bound_dev_if || exact_dif) {
+		bool dev_match = (bound_dev_if == dif ||
+				  bound_dev_if == sdif);
 
 		if (!dev_match)
 			return -1;
-		if (sk->sk_bound_dev_if)
+		if (bound_dev_if)
 			score++;
 	}
 
@@ -702,7 +703,7 @@ static bool __udp_v6_is_mcast_sock(struct net *net, struct sock *sk,
 	    (inet->inet_dport && inet->inet_dport != rmt_port) ||
 	    (!ipv6_addr_any(&sk->sk_v6_daddr) &&
 		    !ipv6_addr_equal(&sk->sk_v6_daddr, rmt_addr)) ||
-	    (sk->sk_bound_dev_if && sk->sk_bound_dev_if != dif) ||
+	    (sk->sk_bound_dev_if && READ_ONCE(sk->sk_bound_dev_if) != dif) ||
 	    (!ipv6_addr_any(&sk->sk_v6_rcv_saddr) &&
 		    !ipv6_addr_equal(&sk->sk_v6_rcv_saddr, loc_addr)))
 		return false;
@@ -1340,7 +1341,7 @@ do_udp_sendmsg:
 	}
 
 	if (!fl6.flowi6_oif)
-		fl6.flowi6_oif = sk->sk_bound_dev_if;
+		fl6.flowi6_oif = READ_ONCE(sk->sk_bound_dev_if);
 
 	if (!fl6.flowi6_oif)
 		fl6.flowi6_oif = np->sticky_pktinfo.ipi6_ifindex;
