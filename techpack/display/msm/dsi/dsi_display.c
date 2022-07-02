@@ -8,6 +8,7 @@
 #include <linux/of_gpio.h>
 #include <linux/err.h>
 #include <drm/drm_panel.h>
+#include <linux/compaction.h>
 
 #include "msm_drv.h"
 #include "sde_connector.h"
@@ -1202,6 +1203,8 @@ static void _dsi_display_setup_misr(struct dsi_display *display)
 	}
 }
 
+bool dsi_screen_on __read_mostly = false;
+
 int dsi_display_set_power(struct drm_connector *connector,
 		int power_mode, void *disp)
 {
@@ -1242,6 +1245,8 @@ int dsi_display_set_power(struct drm_connector *connector,
 		drm_notifier_call_chain(DRM_EARLY_EVENT_BLANK, &g_notify_data);
 		rc = dsi_panel_set_lp2(display->panel);
 		drm_notifier_call_chain(DRM_EVENT_BLANK, &g_notify_data);
+		WRITE_ONCE(dsi_screen_on, true);
+		wmb();
 		break;
 	case SDE_MODE_DPMS_ON:
 		if ((display->panel->power_mode == SDE_MODE_DPMS_LP1) ||
@@ -1253,6 +1258,10 @@ int dsi_display_set_power(struct drm_connector *connector,
 		}
 		break;
 	case SDE_MODE_DPMS_OFF:
+		WRITE_ONCE(dsi_screen_on, false);
+		wmb();
+		trigger_proactive_compaction(false);
+		break;
 	default:
 		if (dev->pre_state != SDE_MODE_DPMS_LP1 &&
                                         dev->pre_state != SDE_MODE_DPMS_LP2)
