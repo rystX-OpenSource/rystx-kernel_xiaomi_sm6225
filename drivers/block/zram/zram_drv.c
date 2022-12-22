@@ -1470,7 +1470,7 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 {
 	int ret = 0;
 	unsigned long alloced_pages;
-	struct zram_entry *entry = NULL;
+	unsigned long handle = -ENOMEM;
 	unsigned int comp_len = 0;
 	void *src, *dst, *mem;
 	struct zcomp_strm *zstrm;
@@ -1534,22 +1534,21 @@ compress_again:
 	 * if we have a 'non-null' entry here then we are coming
 	 * from the slow path and entry has already been allocated.
 	 */
-	if (!entry)
-		entry = zram_entry_alloc(zram, comp_len,
+	if (IS_ERR((void *)handle))
+		handle = zs_malloc(zram->mem_pool, comp_len,
 				__GFP_KSWAPD_RECLAIM |
 				__GFP_NOWARN |
 				__GFP_HIGHMEM |
 				__GFP_MOVABLE |
 				__GFP_CMA);
-
-	if (!handle) {
+	if (IS_ERR((void *)handle)) {
 		zcomp_stream_put(zram->comp);
 		atomic64_inc(&zram->stats.writestall);
 		entry = zram_entry_alloc(zram, comp_len,
 				GFP_NOIO | __GFP_HIGHMEM |
 				__GFP_MOVABLE | __GFP_CMA);
-		if (!handle)
-			return -ENOMEM;
+		if (IS_ERR((void *)handle))
+			return PTR_ERR((void *)handle);
 
 		if (comp_len != PAGE_SIZE)
 			goto compress_again;
