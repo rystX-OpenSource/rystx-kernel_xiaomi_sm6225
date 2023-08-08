@@ -125,7 +125,7 @@ struct socket {
 
 	struct file		*file;
 	struct sock		*sk;
-	const struct proto_ops	*ops;
+	const struct proto_ops	*ops; /* Might change with IPV6_ADDRFORM or MPTCP. */
 };
 
 struct vm_area_struct;
