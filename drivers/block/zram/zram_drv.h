@@ -163,6 +163,7 @@ struct zram {
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
 #endif
+	atomic_t pp_in_progress;
 };
 
 static inline bool zram_dedup_enabled(struct zram *zram)
