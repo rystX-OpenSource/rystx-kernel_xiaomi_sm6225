@@ -29,6 +29,10 @@ export $(shell sed 's/=.*//' $(srctree)/techpack/audio/config/sdm660auto.conf)
 endif
 
 ifeq ($(CONFIG_ARCH_BENGAL), y)
+ifdef CONFIG_TARGET_PROJECT_C3Q
+        include $(srctree)/techpack/audio/config/fogauto.conf
+        export $(shell sed 's/=.*//' $(srctree)/techpack/audio/config/fogauto.conf)
+    else
         ifdef CONFIG_TARGET_PROJECT_K7T
             include $(srctree)/techpack/audio/config/spesauto.conf
             export $(shell sed 's/=.*//' $(srctree)/techpack/audio/config/spesauto.conf)
@@ -37,7 +41,7 @@ ifeq ($(CONFIG_ARCH_BENGAL), y)
             export $(shell sed 's/=.*//' $(srctree)/techpack/audio/config/bengalauto.conf)
         endif
 endif
-
+endif
 # Use USERINCLUDE when you must reference the UAPI directories only.
 USERINCLUDE     += \
                 -I$(srctree)/techpack/audio/include/uapi \
@@ -82,6 +86,10 @@ LINUXINCLUDE    += \
                 -include $(srctree)/techpack/audio/config/sdm660autoconf.h
 endif
 ifeq ($(CONFIG_ARCH_BENGAL), y)
+    ifdef CONFIG_TARGET_PROJECT_C3Q
+        LINUXINCLUDE    += \
+                -include $(srctree)/techpack/audio/config/fogautoconf.h
+    else
         ifdef CONFIG_TARGET_PROJECT_K7T
             LINUXINCLUDE    += \
                 -include $(srctree)/techpack/audio/config/spesautoconf.h
@@ -89,6 +97,7 @@ ifeq ($(CONFIG_ARCH_BENGAL), y)
             LINUXINCLUDE    += \
                 -include $(srctree)/techpack/audio/config/bengalautoconf.h
         endif
+     endif
 endif
 obj-y += soc/
 obj-y += dsp/
