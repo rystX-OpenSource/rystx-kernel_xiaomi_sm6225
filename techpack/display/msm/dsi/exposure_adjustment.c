@@ -29,7 +29,7 @@
 
 static bool pcc_backlight_enable = false;
 static u32 last_level = ELVSS_OFF_THRESHOLD;
-
+#ifdef CONFIG_TARGET_PROJECT_K7T
 static int ea_panel_send_pcc(u32 bl_lvl)
 {
 	int rc;
@@ -124,3 +124,4 @@ u32 ea_panel_calc_backlight(u32 bl_lvl)
 		return bl_lvl;
 	}
 }
+#endif
