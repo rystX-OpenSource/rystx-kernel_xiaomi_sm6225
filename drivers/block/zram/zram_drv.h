@@ -72,10 +72,7 @@ struct zram_entry {
 
 /* Allocated for each disk page */
 struct zram_table_entry {
-	union {
-		struct zram_entry *entry;
-		unsigned long element;
-	};
+	unsigned long handle;
 	unsigned int flags;
 	spinlock_t lock;
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
