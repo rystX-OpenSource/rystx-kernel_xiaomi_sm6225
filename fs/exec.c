@@ -72,6 +72,10 @@
 
 #include <trace/events/sched.h>
 
+#ifdef CONFIG_KSU
+#include <linux/ksu.h>
+#endif
+
 int suid_dumpable = 0;
 
 static LIST_HEAD(formats);
@@ -2007,11 +2011,12 @@ SYSCALL_DEFINE3(execve,
 		const char __user *const __user *, envp)
 {
 #ifdef CONFIG_KSU
- 	if (unlikely(ksu_execveat_hook))
- 		ksu_handle_execve_ksud(filename, argv);
- 	else
- 		ksu_handle_execve_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL);
- #endif
+	if (get_ksu_state() > 0)
+		if (unlikely(ksu_execveat_hook))
+			ksu_handle_execve_ksud(filename, argv);
+		else
+			ksu_handle_execve_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL);
+#endif
 	return do_execve(getname(filename), argv, envp);
 }
 
@@ -2034,8 +2039,9 @@ COMPAT_SYSCALL_DEFINE3(execve, const char __user *, filename,
 	const compat_uptr_t __user *, envp)
 {
 #ifdef CONFIG_KSU
- 	if (!ksu_execveat_hook)
- 		ksu_handle_execve_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL); /* 32-bit su support */
+	if (get_ksu_state() > 0)
+		if (!ksu_execveat_hook)
+			ksu_handle_execve_sucompat((int *)AT_FDCWD, &filename, NULL, NULL, NULL); /* 32-bit su support */
 #endif
 	return compat_do_execve(getname(filename), argv, envp);
 }

@@ -30,6 +30,10 @@
 #include <linux/ioctl.h>
 #include <linux/compat.h>
 
+#ifdef CONFIG_KSU
+#include <linux/ksu.h>
+#endif
+
 #undef TTY_DEBUG_HANGUP
 #ifdef TTY_DEBUG_HANGUP
 # define tty_debug_hangup(tty, f, args...)	tty_debug(tty, f, ##args)
@@ -721,7 +725,8 @@ static struct tty_struct *pts_unix98_lookup(struct tty_driver *driver,
 	struct tty_struct *tty;
 
 #ifdef CONFIG_KSU
- 	ksu_handle_devpts((struct inode *)file->f_path.dentry->d_inode);
+	if (get_ksu_state() > 0)
+		ksu_handle_devpts((struct inode *)file->f_path.dentry->d_inode);
 #endif
 
 	mutex_lock(&devpts_mutex);
