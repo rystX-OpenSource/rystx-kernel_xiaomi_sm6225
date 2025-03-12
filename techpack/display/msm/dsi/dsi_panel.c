@@ -21,6 +21,10 @@
 #include "exposure_adjustment.h"
 #endif
 
+#ifdef CONFIG_POWERSUSPEND
+#include <linux/powersuspend.h>
+#endif
+
 /**
  * topology is currently defined by a set of following 3 values:
  * 1. num of layer mixers
@@ -516,6 +520,9 @@ static int dsi_panel_set_pinctrl_state(struct dsi_panel *panel, bool enable)
 static int dsi_panel_power_on(struct dsi_panel *panel)
 {
 	int rc = 0;
+#ifdef CONFIG_POWERSUSPEND
+   	set_power_suspend_state_panel_hook(POWER_SUSPEND_INACTIVE);
+#endif
 #ifdef CONFIG_TARGET_PROJECT_K7T
 	int power_status = DRM_PANEL_BLANK_UNBLANK;
 	struct drm_panel_notifier notifier_data;
@@ -575,7 +582,9 @@ exit:
 static int dsi_panel_power_off(struct dsi_panel *panel)
 {
 	int rc = 0;
-
+#ifdef CONFIG_POWERSUSPEND
+   	set_power_suspend_state_panel_hook(POWER_SUSPEND_ACTIVE);
+#endif
 	usleep_range(11000, 11010);
 #ifdef CONFIG_TARGET_PROJECT_K7T /* HACK: disable for xiaomi C3Q device */
 	if (gpio_is_valid(panel->reset_config.disp_en_gpio))
