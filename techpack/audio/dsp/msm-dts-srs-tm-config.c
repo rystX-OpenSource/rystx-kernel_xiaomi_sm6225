@@ -9,6 +9,7 @@
 #include <linux/mutex.h>
 #include <linux/atomic.h>
 #include <sound/asound.h>
+#include <dsp/msm-dts-eagle.h>
 #include <sound/control.h>
 #include <dsp/msm_audio_ion.h>
 #include <dsp/q6adm-v2.h>
