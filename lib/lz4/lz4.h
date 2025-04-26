@@ -315,6 +315,7 @@ LZ4LIB_API int LZ4_compress_fast_extState(void *state, const char *src,
 LZ4LIB_API int LZ4_compress_destSize(const char *src, char *dst,
 				     int *srcSizePtr, int targetDstSize);
 
+#if IS_ENABLED(CONFIG_EROFS_FS)
 /*! LZ4_decompress_safe_partial() :
  *  Decompress an LZ4 compressed block, of size 'srcSize' at position 'src',
  *  into destination buffer 'dst' of size 'dstCapacity'.
@@ -352,6 +353,7 @@ LZ4LIB_API int LZ4_compress_destSize(const char *src, char *dst,
 LZ4LIB_API int LZ4_decompress_safe_partial(const char *src, char *dst,
 					   int srcSize, int targetOutputSize,
 					   int dstCapacity);
+#endif
 
 /*-*********************************************
 *  Streaming Compression Functions
