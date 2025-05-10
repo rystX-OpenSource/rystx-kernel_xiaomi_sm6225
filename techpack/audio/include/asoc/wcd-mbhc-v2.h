@@ -620,6 +620,7 @@ struct wcd_mbhc {
 	struct notifier_block fsa_nb;
 };
 
+void wcd_mbhc_plug_detect_for_debug_mode(struct wcd_mbhc *mbhc, int debug_mode); /* ASUS_BSP Paul +++ */
 void wcd_mbhc_find_plug_and_report(struct wcd_mbhc *mbhc,
 				   enum wcd_mbhc_plug_type plug_type);
 void wcd_mbhc_hs_elec_irq(struct wcd_mbhc *mbhc, int irq_type, bool enable);

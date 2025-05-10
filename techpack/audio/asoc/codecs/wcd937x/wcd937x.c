@@ -29,6 +29,9 @@
 #include <asoc/msm-cdc-pinctrl.h>
 #include <dt-bindings/sound/audio-codec-port-types.h>
 #include <asoc/msm-cdc-supply.h>
+#include <linux/proc_fs.h>
+#include <../drivers/base/regmap/internal.h>
+#include <linux/switch.h>
 
 #define DRV_NAME "wcd937x_codec"
 
@@ -258,6 +261,9 @@ static void rystx_sysfs_deinit(void)
 static int wcd937x_handle_post_irq(void *data);
 static int wcd937x_reset(struct device *dev);
 static int wcd937x_reset_low(struct device *dev);
+
+int g_DebugMode = 1;
+struct switch_dev *g_audiowizard_force_preset_sdev = NULL;
 
 static const struct regmap_irq wcd937x_irqs[WCD937X_NUM_IRQS] = {
 	REGMAP_IRQ_REG(WCD937X_IRQ_MBHC_BUTTON_PRESS_DET, 0, 0x01),
@@ -3194,6 +3200,22 @@ static int wcd937x_soc_codec_probe(struct snd_soc_component *component)
 			return ret;
 		}
 	}
+
+	/* ASUS_BSP Paul +++ */
+        if (!g_audiowizard_force_preset_sdev) {
+		g_audiowizard_force_preset_sdev = kzalloc(sizeof(struct switch_dev), GFP_KERNEL);
+		if (!g_audiowizard_force_preset_sdev) {
+			pr_err("%s: failed to allocate switch_dev\n", __func__);
+			ret = -ENOMEM;
+		}
+		g_audiowizard_force_preset_sdev->name = "audiowizard_force_preset";
+		g_audiowizard_force_preset_sdev->state = 0;
+		ret = switch_dev_register(g_audiowizard_force_preset_sdev);
+		if (ret < 0)
+			pr_err("%s: failed to register switch audiowizard_force_preset\n", __func__);
+	}
+	/* ASUS_BSP Paul --- */
+
 	return ret;
 
 err_hwdep:
