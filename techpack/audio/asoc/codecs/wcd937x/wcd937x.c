@@ -262,7 +262,7 @@ static int wcd937x_handle_post_irq(void *data);
 static int wcd937x_reset(struct device *dev);
 static int wcd937x_reset_low(struct device *dev);
 
-int g_DebugMode = 1;
+int g_DebugMode = 0;
 struct switch_dev *g_audiowizard_force_preset_sdev = NULL;
 
 static const struct regmap_irq wcd937x_irqs[WCD937X_NUM_IRQS] = {
