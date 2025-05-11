@@ -8852,12 +8852,12 @@ int q6asm_dts_eagle_set(struct audio_client *ac, int param_id, uint32_t size,
 		__func__, ac, param_id, size, data, m_id);
 	q6asm_add_hdr_async(ac, &ad->hdr, sz, 1);
 	ad->hdr.opcode = ASM_STREAM_CMD_SET_PP_PARAMS_V2;
-	ad->param.data_payload_addr_lsw = 0;
-	ad->param.data_payload_addr_msw = 0;
+	ad->param.mem_hdr.data_payload_addr_lsw = 0;
+	ad->param.mem_hdr.data_payload_addr_msw = 0;
 
-	ad->param.mem_map_handle = 0;
-	ad->param.data_payload_size = size +
-					sizeof(struct asm_stream_param_data_v2);
+	ad->param.mem_hdr.mem_map_handle = 0;
+	ad->param.payload_size = size +
+					sizeof(struct param_hdr_v1);
 	ad->data.module_id = m_id;
 	ad->data.param_id = param_id;
 	ad->data.param_size = size;
@@ -8869,17 +8869,17 @@ int q6asm_dts_eagle_set(struct audio_client *ac, int param_id, uint32_t size,
 		struct asm_buffer_node *node;
 		pr_debug("DTS_EAGLE_ASM - %s: using out of band memory (virtual %pK, physical %pK)\n",
 			__func__, po->kvaddr, &po->paddr);
-		ad->param.data_payload_addr_lsw = lower_32_bits(po->paddr);
-		ad->param.data_payload_addr_msw =
+		ad->param.mem_hdr.data_payload_addr_lsw = lower_32_bits(po->paddr);
+		ad->param.mem_hdr.data_payload_addr_msw =
 				msm_audio_populate_upper_32_bits(po->paddr);
 		list_for_each_safe(ptr, next, &ac->port[IN].mem_map_handle) {
 			node = list_entry(ptr, struct asm_buffer_node, list);
 			if (node->buf_phys_addr == po->paddr) {
-				ad->param.mem_map_handle = node->mmap_hdl;
+				ad->param.mem_hdr.mem_map_handle = node->mmap_hdl;
 				break;
 			}
 		}
-		if (ad->param.mem_map_handle == 0) {
+		if (ad->param.mem_hdr.mem_map_handle == 0) {
 			pr_err("DTS_EAGLE_ASM - %s: mem map handle not found\n",
 				__func__);
 			rc = -EINVAL;

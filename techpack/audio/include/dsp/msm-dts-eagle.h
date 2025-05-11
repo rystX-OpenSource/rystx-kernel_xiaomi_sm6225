@@ -42,7 +42,7 @@ enum {
 void msm_dts_ion_memmap(struct param_outband *po_);
 int msm_dts_eagle_enable_asm(struct audio_client *ac, u32 enable, int module);
 int msm_dts_eagle_enable_adm(int port_id, int copp_idx, u32 enable);
-void msm_dts_eagle_add_controls(struct snd_soc_platform *platform);
+void msm_dts_eagle_add_controls(struct snd_soc_component *component);
 int msm_dts_eagle_set_stream_gain(struct audio_client *ac,
 				  int lgain, int rgain);
 int msm_dts_eagle_handle_asm(struct dts_eagle_param_desc *depd, char *buf,
@@ -76,7 +76,7 @@ static inline int msm_dts_eagle_enable_adm(int port_id, int copp_idx,
 {
 	return 0;
 }
-static inline void msm_dts_eagle_add_controls(struct snd_soc_platform *platform)
+static inline void msm_dts_eagle_add_controls(struct snd_soc_component *component)
 {
 }
 static inline int msm_dts_eagle_set_stream_gain(struct audio_client *ac,

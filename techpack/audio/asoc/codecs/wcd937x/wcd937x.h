@@ -16,4 +16,8 @@ extern int wcd937x_info_create_codec_entry(struct snd_info_entry *codec_root,
 }
 #endif /* CONFIG_SND_SOC_WCD937X */
 
+/* ASUS_BSP Paul +++ */
+extern int current_wcd_component_id;
+/* ASUS_BSP Paul --- */
+
 #endif

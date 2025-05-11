@@ -694,15 +694,15 @@ int msm_dts_eagle_enable_adm(int port_id, int copp_idx, u32 enable)
 
 /**
  * msm_dts_eagle_add_controls() -  Add mixer control to Enable/Disable DTS HPX
- * @platform:	Add mixer controls to this platform.
+ * @component:	Add mixer controls to this component.
  *
  * Add mixer control to Enable/Disable DTS HPX module in ADM.
  *
  * Return: No return value.
  */
-void msm_dts_eagle_add_controls(struct snd_soc_platform *platform)
+void msm_dts_eagle_add_controls(struct snd_soc_component *component)
 {
-	snd_soc_add_platform_controls(platform, _hpx_enabled_controls,
+	snd_soc_add_component_controls(component, _hpx_enabled_controls,
 				      ARRAY_SIZE(_hpx_enabled_controls));
 }
 
@@ -1636,5 +1636,5 @@ void msm_dts_eagle_pcm_free(struct snd_pcm *pcm)
 	mutex_destroy(&_sec_lock);
 }
 
-MODULE_DESCRIPTION("DTS EAGLE platform driver");
+MODULE_DESCRIPTION("DTS EAGLE component driver");
 MODULE_LICENSE("GPL v2");

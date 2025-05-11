@@ -12,10 +12,10 @@
 #include <dsp/msm_audio_ion.h>
 #include <dsp/audio_calibration.h>
 #include <dsp/audio_cal_utils.h>
-#include <linux/switch.h>
+#include <linux/extcon-provider.h>
 #include <sound/soc.h>
-#include "../../codecs/wcd937x.h"
-#include "../../codecs/wcd-mbhc-v2.h"
+#include <asoc/wcd-mbhc-v2.h>
+#include "../asoc/codecs/wcd937x/wcd937x.h"
 
 struct audio_cal_client_info {
 	struct list_head		list;
@@ -34,7 +34,7 @@ static struct audio_cal_info	audio_cal;
 /* ASUS_BSP */
 int g_audiowizard_force_preset_state = 0;
 int g_skype_state = 0;
-extern struct switch_dev *g_audiowizard_force_preset_sdev;
+extern struct extcon_dev *g_audiowizard_force_preset_edev;
 extern uint32_t g_ZL;
 extern uint32_t g_ZR;
 int audio_mode = -1;
@@ -427,7 +427,7 @@ static long audio_cal_shared_ioctl(struct file *file, unsigned int cmd,
 			pr_err("%s: Could not copy g_audiowizard_force_preset_state from user\n", __func__);
 			ret = -EFAULT;
 		}
-		switch_set_state(g_audiowizard_force_preset_sdev, g_audiowizard_force_preset_state);
+		extcon_set_state_sync(g_audiowizard_force_preset_edev, current_wcd_component_id, g_audiowizard_force_preset_state);
 		mutex_unlock(&audio_cal.cal_mutex[AUDIOWIZARD_FORCE_PRESET_TYPE]);
 		goto done;
 	case AUDIO_GET_HS_IMP:

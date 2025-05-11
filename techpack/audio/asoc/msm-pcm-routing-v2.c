@@ -31597,7 +31597,7 @@ static int msm_routing_probe(struct snd_soc_component *component)
 				device_pp_params_mixer_controls,
 				ARRAY_SIZE(device_pp_params_mixer_controls));
 
-	msm_dts_eagle_add_controls(platform);
+	msm_dts_eagle_add_controls(component);
 
 	snd_soc_add_component_controls(component,
 		msm_routing_be_dai_name_table_mixer_controls,

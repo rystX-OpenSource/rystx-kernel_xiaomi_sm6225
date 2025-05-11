@@ -132,34 +132,6 @@ static void audio_effects_event_handler(uint32_t opcode, uint32_t token,
 			}
 			break;
 		}
-		case DTS_EAGLE_MODULE_ENABLE: {
-			pr_debug("%s: DTS_EAGLE_MODULE_ENABLE\n", __func__);
-			if (msm_audio_effects_is_effmodule_supp_in_top(
-				effects_module, effects->ac->topology)) {
-				/*
-				* HPX->OFF: first disable HPX and then
-				* enable SA+
-				* HPX->ON: first disable SA+ and then
-				* enable HPX
-				*/
-				bool hpx_state = (bool)values[1];
-				if (hpx_state)
-					msm_audio_effects_enable_extn(effects->ac,
-						&(effects->audio_effects),
-						false);
-				msm_dts_eagle_enable_asm(effects->ac,
-					hpx_state,
-					AUDPROC_MODULE_ID_DTS_HPX_PREMIX);
-				msm_dts_eagle_enable_asm(effects->ac,
-					hpx_state,
-					AUDPROC_MODULE_ID_DTS_HPX_POSTMIX);
-				if (!hpx_state)
-					msm_audio_effects_enable_extn(effects->ac,
-						&(effects->audio_effects),
-						true);
-			}
-			break;
-		}
 		default:
 			pr_debug("%s: Unhandled Event 0x%x token = 0x%x\n",
 				__func__, opcode, token);
@@ -456,6 +428,33 @@ static long audio_effects_set_pp_param(struct q6audio_effects *effects,
 			msm_audio_effects_volume_handler_v2(effects->ac,
 			      &(effects->audio_effects.topo_switch_vol),
 			      (long *)&values[1], SOFT_VOLUME_INSTANCE_2);
+		break;
+	case DTS_EAGLE_MODULE_ENABLE:
+		pr_debug("%s: DTS_EAGLE_MODULE_ENABLE\n", __func__);
+		if (msm_audio_effects_is_effmodule_supp_in_top(
+			effects_module, effects->ac->topology)) {
+			/*
+			* HPX->OFF: first disable HPX and then
+			* enable SA+
+			* HPX->ON: first disable SA+ and then
+			* enable HPX
+			*/
+			bool hpx_state = (bool)values[1];
+			if (hpx_state)
+				msm_audio_effects_enable_extn(effects->ac,
+					&(effects->audio_effects),
+					false);
+			msm_dts_eagle_enable_asm(effects->ac,
+				hpx_state,
+				AUDPROC_MODULE_ID_DTS_HPX_PREMIX);
+			msm_dts_eagle_enable_asm(effects->ac,
+				hpx_state,
+				AUDPROC_MODULE_ID_DTS_HPX_POSTMIX);
+			if (!hpx_state)
+				msm_audio_effects_enable_extn(effects->ac,
+					&(effects->audio_effects),
+					true);
+		}
 		break;
 	default:
 		pr_err("%s: Invalid effects config module\n", __func__);

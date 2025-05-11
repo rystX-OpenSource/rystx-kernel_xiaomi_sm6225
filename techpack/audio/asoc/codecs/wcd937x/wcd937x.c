@@ -30,8 +30,10 @@
 #include <dt-bindings/sound/audio-codec-port-types.h>
 #include <asoc/msm-cdc-supply.h>
 #include <linux/proc_fs.h>
-#include <../drivers/base/regmap/internal.h>
-#include <linux/switch.h>
+#include <../../../drivers/base/regmap/internal.h>
+#include <linux/extcon.h>
+#include <linux/extcon-provider.h>
+#include <../../../drivers/extcon/extcon.h>
 
 #define DRV_NAME "wcd937x_codec"
 
@@ -263,7 +265,9 @@ static int wcd937x_reset(struct device *dev);
 static int wcd937x_reset_low(struct device *dev);
 
 int g_DebugMode = 0;
-struct switch_dev *g_audiowizard_force_preset_sdev = NULL;
+struct extcon_dev *g_audiowizard_force_preset_edev = NULL;
+int current_wcd_component_id;
+EXPORT_SYMBOL(current_wcd_component_id);
 
 static const struct regmap_irq wcd937x_irqs[WCD937X_NUM_IRQS] = {
 	REGMAP_IRQ_REG(WCD937X_IRQ_MBHC_BUTTON_PRESS_DET, 0, 0x01),
@@ -3202,17 +3206,21 @@ static int wcd937x_soc_codec_probe(struct snd_soc_component *component)
 	}
 
 	/* ASUS_BSP Paul +++ */
-        if (!g_audiowizard_force_preset_sdev) {
-		g_audiowizard_force_preset_sdev = kzalloc(sizeof(struct switch_dev), GFP_KERNEL);
-		if (!g_audiowizard_force_preset_sdev) {
-			pr_err("%s: failed to allocate switch_dev\n", __func__);
-			ret = -ENOMEM;
+    if (!g_audiowizard_force_preset_edev) {
+		g_audiowizard_force_preset_edev = devm_extcon_dev_allocate(component->dev, NULL);
+		if (IS_ERR(g_audiowizard_force_preset_edev)) {
+			pr_err("%s: failed to allocate extcon device\n", __func__);
+			return PTR_ERR(g_audiowizard_force_preset_edev);
 		}
-		g_audiowizard_force_preset_sdev->name = "audiowizard_force_preset";
-		g_audiowizard_force_preset_sdev->state = 0;
-		ret = switch_dev_register(g_audiowizard_force_preset_sdev);
-		if (ret < 0)
-			pr_err("%s: failed to register switch audiowizard_force_preset\n", __func__);
+		
+		g_audiowizard_force_preset_edev->name = "audiowizard_force_preset";
+		ret = devm_extcon_dev_register(component->dev, g_audiowizard_force_preset_edev);
+		if (ret < 0) {
+			pr_err("%s: failed to register extcon device\n", __func__);
+			return ret;
+		}
+		current_wcd_component_id = component->id;
+    	extcon_set_state_sync(g_audiowizard_force_preset_edev, current_wcd_component_id, 0);
 	}
 	/* ASUS_BSP Paul --- */
 

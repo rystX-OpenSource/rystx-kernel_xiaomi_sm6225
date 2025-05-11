@@ -3,6 +3,7 @@
  * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <sound/soc.h>
 #include <linux/slab.h>
 #include <linux/ratelimit.h>
 #include <sound/compress_params.h>
@@ -288,7 +289,7 @@ int msm_audio_effects_virtualizer_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && !msm_dts_eagle_is_hpx_on() && && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 	else
 		pr_debug("%s: did not send pp params\n", __func__);
