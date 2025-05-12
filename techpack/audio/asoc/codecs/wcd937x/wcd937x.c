@@ -3207,20 +3207,19 @@ static int wcd937x_soc_codec_probe(struct snd_soc_component *component)
 
 	/* ASUS_BSP Paul +++ */
     if (!g_audiowizard_force_preset_edev) {
-		g_audiowizard_force_preset_edev = devm_extcon_dev_allocate(component->dev, NULL);
+		g_audiowizard_force_preset_edev = kzalloc(sizeof(struct extcon_dev), GFP_KERNEL);
 		if (IS_ERR(g_audiowizard_force_preset_edev)) {
 			pr_err("%s: failed to allocate extcon device\n", __func__);
 			return PTR_ERR(g_audiowizard_force_preset_edev);
 		}
 		
 		g_audiowizard_force_preset_edev->name = "audiowizard_force_preset";
-		ret = devm_extcon_dev_register(component->dev, g_audiowizard_force_preset_edev);
+		g_audiowizard_force_preset_edev->state = 0;
+		ret = extcon_dev_register(g_audiowizard_force_preset_edev);
 		if (ret < 0) {
 			pr_err("%s: failed to register extcon device\n", __func__);
 			return ret;
 		}
-		current_wcd_component_id = component->id;
-    	extcon_set_state_sync(g_audiowizard_force_preset_edev, current_wcd_component_id, 0);
 	}
 	/* ASUS_BSP Paul --- */
 

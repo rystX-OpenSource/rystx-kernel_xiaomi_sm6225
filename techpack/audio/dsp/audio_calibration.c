@@ -427,7 +427,7 @@ static long audio_cal_shared_ioctl(struct file *file, unsigned int cmd,
 			pr_err("%s: Could not copy g_audiowizard_force_preset_state from user\n", __func__);
 			ret = -EFAULT;
 		}
-		extcon_set_state_sync(g_audiowizard_force_preset_edev, current_wcd_component_id, g_audiowizard_force_preset_state);
+		extcon_set_state(g_audiowizard_force_preset_edev, g_audiowizard_force_preset_state);
 		mutex_unlock(&audio_cal.cal_mutex[AUDIOWIZARD_FORCE_PRESET_TYPE]);
 		goto done;
 	case AUDIO_GET_HS_IMP:
