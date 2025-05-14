@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0
 config ZRAM
 	tristate "Compressed RAM block device support"
-	depends on BLOCK && SYSFS && ZSMALLOC && CRYPTO
+	depends on BLOCK && SYSFS && MMU
 	depends on CRYPTO_LZO || CRYPTO_ZSTD || CRYPTO_LZ4 || CRYPTO_LZ4HC || CRYPTO_842
+	select ZSMALLOC
 	help
 	  Creates virtual block devices called /dev/zramX (X = 0, 1, ...).
 	  Pages written to these disks are compressed and stored in memory
@@ -54,25 +55,6 @@ config ZRAM_DEF_COMP
 	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
 	default "842" if ZRAM_DEF_COMP_842
 
-config ZRAM_ENTROPY
-	bool "Use entropy optimization for zram"
-	depends on ZRAM
-	default y
-	help
-	  With this feature, entropy will be calculated for each page.
-	  Pages above ZRAM_ENTROPY_THRESHOLD entropy will be
-	  stored uncompressed. Use this feature if you need a performance
-	  boost and a small loss in compression.
-
-config ZRAM_ENTROPY_THRESHOLD
-	int
-	depends on ZRAM && ZRAM_ENTROPY
-	default 100000
-	help
-	  Pages with entropy above ZRAM_ENTROPY_THRESHOLD will be stored
-	  uncompressed. The default value was chosen as a result a lot of
-	  experiments. You can try set your own value.
-
 config ZRAM_WRITEBACK
        bool "Write back incompressible or idle page to backing device"
        depends on ZRAM
@@ -96,3 +78,12 @@ config ZRAM_MEMORY_TRACKING
 	  /sys/kernel/debug/zram/zramX/block_state.
 
 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
+
+config ZRAM_MULTI_COMP
+	bool "Enable multiple compression streams"
+	depends on ZRAM
+	help
+	  This will enable multi-compression streams, so that ZRAM can
+	  re-compress pages using a potentially slower but more effective
+	  compression algorithm. Note, that IDLE page recompression
+	  requires ZRAM_MEMORY_TRACKING.
