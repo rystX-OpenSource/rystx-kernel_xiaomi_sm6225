@@ -205,6 +205,7 @@ struct fts_ts_data {
     struct pinctrl_state *pins_release;
 #endif
     struct notifier_block drm_notif;
+    int double_tap_pressed;
 
 	struct mutex reg_lock;
 	struct device *fts_touch_dev;
