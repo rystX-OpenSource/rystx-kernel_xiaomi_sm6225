@@ -69,6 +69,7 @@
 #define GESTURE_V                               0x54
 #define GESTURE_Z                               0x41
 #define GESTURE_C                               0x34
+#define GESTURE_AOD	                            0x25
 
 /*****************************************************************************
 * Private enumerations, structures and unions using typedef
