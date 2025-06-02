@@ -67,6 +67,10 @@
 #include <linux/pm_runtime.h>
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+#include "../xiaomi/xiaomi_touch.h"
+#endif
+
 /*****************************************************************************
 * Private constant and macro definitions using #define
 *****************************************************************************/
@@ -208,6 +212,11 @@ struct fts_ts_data {
     int double_tap_pressed;
     int single_tap_pressed;
 
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+	//u8 palm_sensor_switch;
+	//bool palm_sensor_changed;
+	bool gamemode_enabled;
+#endif
 	struct mutex reg_lock;
 	struct device *fts_touch_dev;
   	struct class *fts_tp_class;
