@@ -23,7 +23,7 @@
 		novatek,mp-support-dt;
 		interrupt-parent = <&tlmm>;
 		interrupts = <0x0d 0x02>;
-		focaltech,reset-gpio = <&tlmm 86 1>;
+		focaltech,reset-gpio = <&tlmm 86 0>;
 		focaltech,irq-gpio = <&tlmm 80 2>;
 		focaltech,max-touch-number = <0x0a>;
 		focaltech,display-coords = <0x00 0x00 0x2cf 0x671>;
