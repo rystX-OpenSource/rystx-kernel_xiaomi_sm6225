@@ -1397,7 +1397,7 @@ static int ext4_ci_compare(const struct inode *parent, const struct qstr *name,
 		/* Handle invalid character sequence as either an error
 		 * or as an opaque byte sequence.
 		 */
-		if (sb_has_strict_encoding(sb))
+		if (sb_has_enc_strict_mode(sb))
 			ret = -EINVAL;
 		else if (name->len != entry.len)
 			ret = 1;
@@ -2392,12 +2392,8 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
 	if (!dentry->d_name.len)
 		return -EINVAL;
 
-<<<<<<< HEAD
 #if IS_ENABLED(CONFIG_UNICODE)
-=======
-#ifdef CONFIG_UNICODE
->>>>>>> 7d6808d57e8ab843c93af44a4b01cfacb46c350a
-	if (sb_has_strict_encoding(sb) && IS_CASEFOLDED(dir) &&
+	if (sb_has_enc_strict_mode(sb) && IS_CASEFOLDED(dir) &&
 	    sb->s_encoding && utf8_validate(sb->s_encoding, &dentry->d_name))
 		return -EINVAL;
 #endif
