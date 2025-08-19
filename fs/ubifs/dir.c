@@ -1708,19 +1708,3 @@ const struct file_operations ubifs_dir_operations = {
 	.compat_ioctl   = ubifs_compat_ioctl,
 #endif
 };
-
-#ifdef CONFIG_FS_ENCRYPTION
-static const struct dentry_operations ubifs_encrypted_dentry_ops = {
-	.d_revalidate = fscrypt_d_revalidate,
-};
-#endif
-
-static void ubifs_set_d_ops(struct inode *dir, struct dentry *dentry)
-{
-#ifdef CONFIG_FS_ENCRYPTION
-	if (dentry->d_flags & DCACHE_ENCRYPTED_NAME) {
-		d_set_d_op(dentry, &ubifs_encrypted_dentry_ops);
-		return;
-	}
-#endif
-}
