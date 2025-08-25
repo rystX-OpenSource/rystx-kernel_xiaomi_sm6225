@@ -1554,6 +1554,7 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 	u16 sclass;
 	struct dentry *dentry;
 #define INITCONTEXTLEN 255
+	char context_onstack[INITCONTEXTLEN + 1];
 	char *context = NULL;
 	unsigned len = 0;
 	int rc = 0;
@@ -1624,17 +1625,10 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 		}
 
 		len = INITCONTEXTLEN;
-		context = kmalloc(len+1, GFP_NOFS);
-		if (!context) {
-			rc = -ENOMEM;
-			dput(dentry);
-			goto out;
-		}
+		context = context_onstack;
 		context[len] = '\0';
 		rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, context, len);
 		if (rc == -ERANGE) {
-			kfree(context);
-
 			/* Need a larger buffer.  Query for the right size. */
 			rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, NULL, 0);
 			if (rc < 0) {
@@ -1657,7 +1651,8 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 				pr_warn("SELinux: %s:  getxattr returned "
 				       "%d for dev=%s ino=%ld\n", __func__,
 				       -rc, inode->i_sb->s_id, inode->i_ino);
-				kfree(context);
+				if (context != context_onstack)
+					kfree(context);
 				goto out;
 			}
 			/* Map ENODATA to the default file SID */
@@ -1682,13 +1677,15 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 					       "returned %d for dev=%s ino=%ld\n",
 					       __func__, context, -rc, dev, ino);
 				}
-				kfree(context);
+				if (context != context_onstack)
+					kfree(context);
 				/* Leave with the unlabeled SID */
 				rc = 0;
 				break;
 			}
 		}
-		kfree(context);
+		if (context != context_onstack)
+			kfree(context);
 		break;
 	case SECURITY_FS_USE_TASK:
 		sid = task_sid;
@@ -3101,6 +3098,62 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 	}
 
 	return 0;
+}
+
+static int selinux_inode_init_security_anon(struct inode *inode,
+					    const struct qstr *name,
+					    const struct inode *context_inode)
+{
+	const struct task_security_struct *tsec = current_security();
+	struct common_audit_data ad;
+	struct inode_security_struct *isec;
+	int rc;
+
+	if (unlikely(!selinux_state.initialized))
+		return 0;
+
+	isec = inode->i_security;
+
+	/*
+	 * We only get here once per ephemeral inode.  The inode has
+	 * been initialized via inode_alloc_security but is otherwise
+	 * untouched.
+	 */
+
+	if (context_inode) {
+		struct inode_security_struct *context_isec =
+			context_inode->i_security;
+		if (context_isec->initialized != LABEL_INITIALIZED) {
+			pr_err("SELinux:  context_inode is not initialized");
+			return -EACCES;
+		}
+
+		isec->sclass = context_isec->sclass;
+		isec->sid = context_isec->sid;
+	} else {
+		isec->sclass = SECCLASS_ANON_INODE;
+		rc = security_transition_sid(
+			&selinux_state, tsec->sid, tsec->sid,
+			isec->sclass, name, &isec->sid);
+		if (rc)
+			return rc;
+	}
+
+	isec->initialized = LABEL_INITIALIZED;
+	/*
+	 * Now that we've initialized security, check whether we're
+	 * allowed to actually create this type of anonymous inode.
+	 */
+
+	ad.type = LSM_AUDIT_DATA_INODE;
+	ad.u.inode = inode;
+
+	return avc_has_perm(&selinux_state,
+			    tsec->sid,
+			    isec->sid,
+			    isec->sclass,
+			    FILE__CREATE,
+			    &ad);
 }
 
 static int selinux_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode)
@@ -5250,17 +5303,15 @@ out:
 
 static int selinux_sk_alloc_security(struct sock *sk, int family, gfp_t priority)
 {
-	struct sk_security_struct *sksec;
+	struct sk_security_struct *sksec = sk->sk_security;
 
-	sksec = kzalloc(sizeof(*sksec), priority);
-	if (!sksec)
-		return -ENOMEM;
-
+#ifdef CONFIG_NETLABEL
+	memset(sksec, 0, offsetof(struct sk_security_struct, sid));
+#endif
 	sksec->peer_sid = SECINITSID_UNLABELED;
 	sksec->sid = SECINITSID_UNLABELED;
 	sksec->sclass = SECCLASS_SOCKET;
 	selinux_netlbl_sk_security_reset(sksec);
-	sk->sk_security = sksec;
 
 	return 0;
 }
@@ -5269,14 +5320,12 @@ static void selinux_sk_free_security(struct sock *sk)
 {
 	struct sk_security_struct *sksec = sk->sk_security;
 
-	sk->sk_security = NULL;
 	selinux_netlbl_sk_security_free(sksec);
-	kfree(sksec);
 }
 
 static void selinux_sk_clone_security(const struct sock *sk, struct sock *newsk)
 {
-	struct sk_security_struct *sksec = sk->sk_security;
+	const struct sk_security_struct *sksec = sk->sk_security;
 	struct sk_security_struct *newsksec = newsk->sk_security;
 
 	newsksec->sid = sksec->sid;
@@ -7116,6 +7165,7 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(inode_alloc_security, selinux_inode_alloc_security),
 	LSM_HOOK_INIT(inode_free_security, selinux_inode_free_security),
 	LSM_HOOK_INIT(inode_init_security, selinux_inode_init_security),
+	LSM_HOOK_INIT(inode_init_security_anon, selinux_inode_init_security_anon),
 	LSM_HOOK_INIT(inode_create, selinux_inode_create),
 	LSM_HOOK_INIT(inode_link, selinux_inode_link),
 	LSM_HOOK_INIT(inode_unlink, selinux_inode_unlink),

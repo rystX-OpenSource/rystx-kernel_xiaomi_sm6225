@@ -12,10 +12,20 @@
 
 #ifdef CONFIG_SMP
 static int
+#ifdef CONFIG_SCHED_WALT
 select_task_rq_stop(struct task_struct *p, int cpu, int sd_flag, int flags,
 		    int sibling_count_hint)
+#else
+select_task_rq_stop(struct task_struct *p, int cpu, int sd_flag, int flags)
+#endif
 {
 	return task_cpu(p); /* stop tasks as never migrate */
+}
+
+static int
+balance_stop(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	return sched_stop_runnable(rq);
 }
 #endif /* CONFIG_SMP */
 
@@ -25,33 +35,40 @@ check_preempt_curr_stop(struct rq *rq, struct task_struct *p, int flags)
 	/* we're never preempted */
 }
 
-static struct task_struct *
-pick_next_task_stop(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+static void set_next_task_stop(struct rq *rq, struct task_struct *stop, bool first)
 {
-	struct task_struct *stop = rq->stop;
+	stop->se.exec_start = rq_clock_task(rq);
+}
 
-	if (!stop || !task_on_rq_queued(stop))
+static struct task_struct *pick_task_stop(struct rq *rq)
+{
+	if (!sched_stop_runnable(rq))
 		return NULL;
 
-	put_prev_task(rq, prev);
+	return rq->stop;
+}
 
-	stop->se.exec_start = rq_clock_task(rq);
+static struct task_struct *pick_next_task_stop(struct rq *rq)
+{
+	struct task_struct *p = pick_task_stop(rq);
 
-	return stop;
+	if (p)
+		set_next_task_stop(rq, p, true);
+
+	return p;
 }
 
 static void
 enqueue_task_stop(struct rq *rq, struct task_struct *p, int flags)
 {
 	add_nr_running(rq, 1);
-	walt_inc_cumulative_runnable_avg(rq, p);
 }
 
-static void
+static bool
 dequeue_task_stop(struct rq *rq, struct task_struct *p, int flags)
 {
 	sub_nr_running(rq, 1);
-	walt_dec_cumulative_runnable_avg(rq, p);
+	return true;
 }
 
 static void yield_task_stop(struct rq *rq)
@@ -90,13 +107,6 @@ static void task_tick_stop(struct rq *rq, struct task_struct *curr, int queued)
 {
 }
 
-static void set_curr_task_stop(struct rq *rq)
-{
-	struct task_struct *stop = rq->stop;
-
-	stop->se.exec_start = rq_clock_task(rq);
-}
-
 static void switched_to_stop(struct rq *rq, struct task_struct *p)
 {
 	BUG(); /* its impossible to change to this class */
@@ -132,13 +142,15 @@ const struct sched_class stop_sched_class = {
 
 	.pick_next_task		= pick_next_task_stop,
 	.put_prev_task		= put_prev_task_stop,
+	.set_next_task          = set_next_task_stop,
 
 #ifdef CONFIG_SMP
+	.balance		= balance_stop,
+	.pick_task		= pick_task_stop,
 	.select_task_rq		= select_task_rq_stop,
 	.set_cpus_allowed	= set_cpus_allowed_common,
 #endif
 
-	.set_curr_task          = set_curr_task_stop,
 	.task_tick		= task_tick_stop,
 
 	.get_rr_interval	= get_rr_interval_stop,

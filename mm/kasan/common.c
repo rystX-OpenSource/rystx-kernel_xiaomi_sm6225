@@ -330,7 +330,7 @@ void kasan_poison_slab(struct page *page)
 {
 	unsigned long i;
 
-	for (i = 0; i < (1 << compound_order(page)); i++)
+	for (i = 0; i < compound_nr(page); i++)
 		page_kasan_tag_reset(page + i);
 	kasan_poison_shadow(page_address(page),
 			PAGE_SIZE << compound_order(page),
@@ -695,7 +695,7 @@ static int __meminit kasan_mem_notifier(struct notifier_block *nb,
 			return NOTIFY_OK;
 
 		ret = __vmalloc_node_range(shadow_size, PAGE_SIZE, shadow_start,
-					shadow_end, GFP_KERNEL | __GFP_ZERO,
+					shadow_end, GFP_KERNEL,
 					PAGE_KERNEL, VM_NO_GUARD,
 					pfn_to_nid(mem_data->start_pfn),
 					__builtin_return_address(0));

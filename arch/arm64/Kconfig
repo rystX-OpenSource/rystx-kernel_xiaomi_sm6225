@@ -20,6 +20,7 @@ config ARM64
 	select ARCH_HAS_KCOV
 	select ARCH_HAS_MEMBARRIER_SYNC_CORE
 	select ARCH_HAS_PTE_SPECIAL
+	select ARCH_HAS_SET_DIRECT_MAP
 	select ARCH_HAS_SET_MEMORY
 	select ARCH_HAS_SG_CHAIN
 	select ARCH_HAS_STRICT_KERNEL_RWX
@@ -78,6 +79,7 @@ config ARM64
 	select CLONE_BACKWARDS
 	select COMMON_CLK
 	select CPU_PM if (SUSPEND || CPU_IDLE)
+	select CRC32
 	select DCACHE_WORD_ACCESS
 	select DMA_DIRECT_OPS
 	select EDAC_SUPPORT
@@ -89,6 +91,7 @@ config ARM64
 	select GENERIC_CPU_AUTOPROBE
 	select GENERIC_CPU_VULNERABILITIES
 	select GENERIC_EARLY_IOREMAP
+	select GENERIC_FIND_FIRST_BIT
 	select GENERIC_IDLE_POLL_SETUP
 	select GENERIC_IRQ_MULTI_HANDLER
 	select GENERIC_IRQ_PROBE
@@ -103,12 +106,15 @@ config ARM64
 	select GENERIC_GETTIMEOFDAY
 	select HANDLE_DOMAIN_IRQ
 	select HARDIRQS_SW_RESEND
+	select HAVE_MOVE_PMD
+	select HAVE_MOVE_PUD
 	select HAVE_ACPI_APEI if (ACPI && EFI)
 	select HAVE_ALIGNED_STRUCT_PAGE if SLUB
 	select HAVE_ARCH_AUDITSYSCALL
 	select HAVE_ARCH_BITREVERSE
 	select HAVE_ARCH_HUGE_VMAP
 	select HAVE_ARCH_JUMP_LABEL
+	select HAVE_ARCH_JUMP_LABEL_RELATIVE
 	select HAVE_ARCH_KASAN if !(ARM64_16K_PAGES && ARM64_VA_BITS_48)
 	select HAVE_ARCH_KASAN_SW_TAGS if HAVE_ARCH_KASAN
 	select HAVE_ARCH_KGDB
@@ -137,12 +143,12 @@ config ARM64
 	select HAVE_FUNCTION_GRAPH_TRACER if !SHADOW_CALL_STACK
 	select HAVE_GCC_PLUGINS
 	select HAVE_GENERIC_DMA_COHERENT
-	select HAVE_HW_BREAKPOINT if PERF_EVENTS
 	select HAVE_IRQ_TIME_ACCOUNTING
 	select HAVE_KERNEL_GZIP
 	select HAVE_KERNEL_LZ4
 	select HAVE_MEMBLOCK
 	select HAVE_MEMBLOCK_NODE_MAP if NUMA
+	select HAVE_MOVE_PMD
 	select HAVE_NMI
 	select HAVE_PATA_PLATFORM
 	select HAVE_PERF_EVENTS
@@ -168,6 +174,7 @@ config ARM64
 	select OF_EARLY_FLATTREE
 	select OF_RESERVED_MEM
 	select PCI_ECAM if ACPI
+	select PCI_LOCKLESS_CONFIG if PCI && ARCH_QCOM
 	select POWER_RESET
 	select POWER_SUPPLY
 	select REFCOUNT_FULL
@@ -175,7 +182,7 @@ config ARM64
 	select SWIOTLB
 	select SYSCTL_EXCEPTION_TRACE
 	select THREAD_INFO_IN_TASK
-	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
+	select HAVE_ARCH_USERFAULTFD_MINOR if USERFAULTFD
 	help
 	  ARM 64-bit (AArch64) Linux support.
 
@@ -238,9 +245,6 @@ config LOCKDEP_SUPPORT
 	def_bool y
 
 config TRACE_IRQFLAGS_SUPPORT
-	def_bool y
-
-config RWSEM_XCHGADD_ALGORITHM
 	def_bool y
 
 config GENERIC_BUG
@@ -873,6 +877,20 @@ config NR_CPUS
 	# These have to remain sorted largest to smallest
 	default "64"
 
+config LITTLE_CPU_MASK
+	int "Bitmask of available LITTLE CPUs"
+	help
+	  This is a bitmask specifying which of the CPUs are LITTLE in a
+	  heterogeneous system. Use 0 if you are unsure, which just results in
+	  this storing the bitmask of all available CPUs.
+
+config BIG_CPU_MASK
+	int "Bitmask of available big CPUs"
+	help
+	  This is a bitmask specifying which of the CPUs are big in a
+	  heterogeneous system. Use 0 if you are unsure, which just results in
+	  this storing the bitmask of all available CPUs.
+
 config HOTPLUG_CPU
 	bool "Support for hot-pluggable CPUs"
 	select GENERIC_IRQ_MIGRATION
@@ -1237,6 +1255,20 @@ config MITIGATE_SPECTRE_BRANCH_HISTORY
 	  make use of branch history to influence future speculation.
 	  When taking an exception from user-space, a sequence of branches
 	  or a firmware call overwrites the branch history.
+	  
+config RODATA_FULL_DEFAULT_ENABLED
+	bool "Apply r/o permissions of VM areas also to their linear aliases"
+	default y
+	help
+	  Apply read-only attributes of VM areas to the linear alias of
+	  the backing pages as well. This prevents code or read-only data
+	  from being modified (inadvertently or intentionally) via another
+	  mapping of the same memory page. This additional enhancement can
+	  be turned off at runtime by passing rodata=[off|on] (and turned on
+	  with rodata=full if this option is set to 'n')
+
+	  This requires the linear region to be mapped down to pages,
+	  which may adversely affect performance in some cases.
 
 menuconfig ARMV8_DEPRECATED
 	bool "Emulate deprecated/obsolete ARMv8 instructions"
@@ -1398,6 +1430,12 @@ config ARM64_UAO
 	  The feature is detected at runtime, the kernel will use the
 	  regular load/store instructions if the cpu does not implement the
 	  feature.
+
+config AS_HAS_ARMV8_2
+       def_bool $(cc-option,-Wa$(comma)-march=armv8.2-a)
+
+config AS_HAS_SHA3
+       def_bool $(as-instr,.arch armv8.2-a+sha3)
 
 config ARM64_PMEM
 	bool "Enable support for persistent memory"
@@ -1729,6 +1767,10 @@ config KUSER_HELPERS
 config SYSVIPC_COMPAT
 	def_bool y
 	depends on COMPAT && SYSVIPC
+
+config ARCH_ENABLE_HUGEPAGE_MIGRATION
+	def_bool y
+	depends on HUGETLB_PAGE && MIGRATION
 
 menu "Power management options"
 

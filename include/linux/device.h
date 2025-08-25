@@ -1115,6 +1115,9 @@ struct device {
 	bool			of_node_reused:1;
 	bool			state_synced:1;
 
+	struct list_head	iommu_map_list;
+	struct mutex		iommu_map_lock;
+
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
@@ -1328,7 +1331,6 @@ static inline bool device_supports_offline(struct device *dev)
 extern void lock_device_hotplug(void);
 extern void unlock_device_hotplug(void);
 extern int lock_device_hotplug_sysfs(void);
-extern void lock_device_hotplug_assert(void);
 extern int device_offline(struct device *dev);
 extern int device_online(struct device *dev);
 extern void set_primary_fwnode(struct device *dev, struct fwnode_handle *fwnode);

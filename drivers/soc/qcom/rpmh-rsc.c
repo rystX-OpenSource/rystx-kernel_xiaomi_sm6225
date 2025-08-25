@@ -18,6 +18,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/module.h>
 
 #include <soc/qcom/cmd-db.h>
 #include <soc/qcom/tcs.h>
@@ -462,7 +463,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	do {
 		ret = tcs_write(drv, msg);
 		if (ret == -EBUSY) {
-			pr_info_ratelimited("DRV:%s TCS Busy, retrying RPMH message send: addr=%#x\n",
+			pr_debug_ratelimited("DRV:%s TCS Busy, retrying RPMH message send: addr=%#x\n",
 					    drv->name, msg->cmds[0].addr);
 			udelay(10);
 		}

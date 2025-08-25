@@ -29,6 +29,7 @@ descriptions of data structures and algorithms.
    active_mm
    balance
    cleancache
+   damon/index
    frontswap
    highmem
    hmm
@@ -36,6 +37,7 @@ descriptions of data structures and algorithms.
    hugetlbfs_reserv
    ksm
    mmu_notifier
+   multigen_lru
    numa
    overcommit-accounting
    page_migration

@@ -50,6 +50,24 @@ static inline void count_compact_events(enum vm_event_item item, long delta)
 #define pageblock_start_pfn(pfn)	block_start_pfn(pfn, pageblock_order)
 #define pageblock_end_pfn(pfn)		block_end_pfn(pfn, pageblock_order)
 
+/*
+ * Fragmentation score check interval for proactive compaction purposes.
+ */
+static const unsigned int HPAGE_FRAG_CHECK_INTERVAL_MSEC = 500;
+
+/*
+ * Page order with-respect-to which proactive compaction
+ * calculates external fragmentation, which is used as
+ * the "fragmentation score" of a node/zone.
+ */
+#if defined CONFIG_TRANSPARENT_HUGEPAGE
+#define COMPACTION_HPAGE_ORDER	HPAGE_PMD_ORDER
+#elif defined CONFIG_HUGETLBFS
+#define COMPACTION_HPAGE_ORDER	HUGETLB_PAGE_ORDER
+#else
+#define COMPACTION_HPAGE_ORDER	(PMD_SHIFT - PAGE_SHIFT)
+#endif
+
 static unsigned long release_freepages(struct list_head *freelist)
 {
 	struct page *page, *next;
@@ -119,7 +137,6 @@ EXPORT_SYMBOL(__SetPageMovable);
 
 void __ClearPageMovable(struct page *page)
 {
-	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON_PAGE(!PageMovable(page), page);
 	/*
 	 * Clear registered address_space val with keeping PAGE_MAPPING_MOVABLE
@@ -136,10 +153,10 @@ EXPORT_SYMBOL(__ClearPageMovable);
 
 /*
  * Compaction is deferred when compaction fails to result in a page
- * allocation success. 1 << compact_defer_limit compactions are skipped up
+ * allocation success. 1 << compact_defer_shift, compactions are skipped up
  * to a limit of 1 << COMPACT_MAX_DEFER_SHIFT
  */
-void defer_compaction(struct zone *zone, int order)
+static void defer_compaction(struct zone *zone, int order)
 {
 	zone->compact_considered = 0;
 	zone->compact_defer_shift++;
@@ -154,7 +171,7 @@ void defer_compaction(struct zone *zone, int order)
 }
 
 /* Returns true if compaction should be skipped this time */
-bool compaction_deferred(struct zone *zone, int order)
+static bool compaction_deferred(struct zone *zone, int order)
 {
 	unsigned long defer_limit = 1UL << zone->compact_defer_shift;
 
@@ -162,11 +179,10 @@ bool compaction_deferred(struct zone *zone, int order)
 		return false;
 
 	/* Avoid possible overflow */
-	if (++zone->compact_considered > defer_limit)
+	if (++zone->compact_considered >= defer_limit) {
 		zone->compact_considered = defer_limit;
-
-	if (zone->compact_considered >= defer_limit)
 		return false;
+	}
 
 	trace_mm_compaction_deferred(zone, order);
 
@@ -192,7 +208,7 @@ void compaction_defer_reset(struct zone *zone, int order,
 }
 
 /* Returns true if restarting compaction after many failures */
-bool compaction_restarting(struct zone *zone, int order)
+static bool compaction_restarting(struct zone *zone, int order)
 {
 	if (order < zone->compact_order_failed)
 		return false;
@@ -220,7 +236,7 @@ static void reset_cached_positions(struct zone *zone)
 }
 
 /*
- * Compound pages of >= pageblock_order should consistenly be skipped until
+ * Compound pages of >= pageblock_order should consistently be skipped until
  * released. It is always pointless to compact pages of such order (if they are
  * migratable), and the pageblocks they occupy cannot contain any free pages.
  */
@@ -799,6 +815,10 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 	 * delay for some time until fewer pages are isolated
 	 */
 	while (unlikely(too_many_isolated(zone))) {
+		/* stop isolation if there are still pages not migrated */
+		if (cc->nr_migratepages)
+			return 0;
+
 		/* async migration should just abort */
 		if (cc->mode == MIGRATE_ASYNC)
 			return 0;
@@ -868,6 +888,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 		if (!valid_page && IS_ALIGNED(low_pfn, pageblock_nr_pages)) {
 			if (!cc->ignore_skip_hint && get_pageblock_skip(page)) {
 				low_pfn = end_pfn;
+				page = NULL;
 				goto isolate_abort;
 			}
 			valid_page = page;
@@ -948,6 +969,21 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 		if (!(cc->gfp_mask & __GFP_FS) && page_mapping(page))
 			goto isolate_fail;
 
+		/*
+		 * Be careful not to clear PageLRU until after we're
+		 * sure the page is not being freed elsewhere -- the
+		 * page release code relies on it.
+		 */
+		if (unlikely(!get_page_unless_zero(page)))
+			goto isolate_fail;
+
+		if (__isolate_lru_page_prepare(page, isolate_mode) != 0)
+			goto isolate_fail_put;
+
+		/* Try isolate the page */
+		if (!TestClearPageLRU(page))
+			goto isolate_fail_put;
+
 		/* If we already hold the lock, we can skip some rechecking */
 		if (!locked) {
 			locked = compact_lock_irqsave(zone_lru_lock(zone),
@@ -960,38 +996,31 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 					goto isolate_abort;
 			}
 
-			/* Recheck PageLRU and PageCompound under lock */
-			if (!PageLRU(page))
-				goto isolate_fail;
-
 			/*
 			 * Page become compound since the non-locked check,
 			 * and it's on LRU. It can only be a THP so the order
 			 * is safe to read and it's 0 for tail pages.
 			 */
 			if (unlikely(PageCompound(page))) {
-				low_pfn += (1UL << compound_order(page)) - 1;
-				goto isolate_fail;
+				low_pfn += compound_nr(page) - 1;
+				SetPageLRU(page);
+				goto isolate_fail_put;
 			}
 		}
 
 		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
 
-		/* Try isolate the page */
-		if (__isolate_lru_page(page, isolate_mode) != 0)
-			goto isolate_fail;
-
 		VM_BUG_ON_PAGE(PageCompound(page), page);
 
 		/* Successfully isolated */
-		del_page_from_lru_list(page, lruvec, page_lru(page));
+		del_page_from_lru_list(page, lruvec);
 		inc_node_page_state(page,
 				NR_ISOLATED_ANON + page_is_file_cache(page));
 
 isolate_success:
 		list_add(&page->lru, &cc->migratepages);
-		cc->nr_migratepages++;
-		nr_isolated++;
+		cc->nr_migratepages += (1 << compound_order(page));
+		nr_isolated += (1 << compound_order(page));
 
 		/*
 		 * Avoid isolating too much unless this block is being
@@ -999,13 +1028,22 @@ isolate_success:
 		 * or a lock is contended. For contention, isolate quickly to
 		 * potentially remove one source of contention.
 		 */
-		if (cc->nr_migratepages == COMPACT_CLUSTER_MAX &&
+		if (cc->nr_migratepages >= COMPACT_CLUSTER_MAX &&
 		    !cc->rescan && !cc->contended) {
 			++low_pfn;
 			break;
 		}
 
 		continue;
+
+isolate_fail_put:
+		/* Avoid potential deadlock in freeing page under lru_lock */
+		if (locked) {
+			spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+			locked = false;
+		}
+		put_page(page);
+
 isolate_fail:
 		if (!skip_on_failure)
 			continue;
@@ -1042,9 +1080,15 @@ isolate_fail:
 	if (unlikely(low_pfn > end_pfn))
 		low_pfn = end_pfn;
 
+	page = NULL;
+
 isolate_abort:
 	if (locked)
 		spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+	if (page) {
+		SetPageLRU(page);
+		put_page(page);
+	}
 
 	/*
 	 * Updated the cached scanner pfn once the pageblock has been scanned
@@ -1110,7 +1154,7 @@ isolate_migratepages_range(struct compact_control *cc, unsigned long start_pfn,
 		if (!pfn)
 			break;
 
-		if (cc->nr_migratepages == COMPACT_CLUSTER_MAX)
+		if (cc->nr_migratepages >= COMPACT_CLUSTER_MAX)
 			break;
 	}
 
@@ -1168,9 +1212,9 @@ static bool suitable_migration_target(struct compact_control *cc,
 static inline unsigned int
 freelist_scan_limit(struct compact_control *cc)
 {
-	return (COMPACT_CLUSTER_MAX >>
-		min((unsigned short)(BITS_PER_LONG - 1), cc->fast_search_fail))
-		+ 1;
+	unsigned short shift = BITS_PER_LONG - 1;
+
+	return (COMPACT_CLUSTER_MAX >> min(shift, cc->fast_search_fail)) + 1;
 }
 
 /*
@@ -1195,8 +1239,7 @@ move_freelist_head(struct list_head *freelist, struct page *freepage)
 
 	if (!list_is_last(freelist, &freepage->lru)) {
 		list_cut_before(&sublist, freelist, &freepage->lru);
-		if (!list_empty(&sublist))
-			list_splice_tail(&sublist, freelist);
+		list_splice_tail(&sublist, freelist);
 	}
 }
 
@@ -1213,8 +1256,7 @@ move_freelist_tail(struct list_head *freelist, struct page *freepage)
 
 	if (!list_is_first(freelist, &freepage->lru)) {
 		list_cut_position(&sublist, freelist, &freepage->lru);
-		if (!list_empty(&sublist))
-			list_splice_tail(&sublist, freelist);
+		list_splice_tail(&sublist, freelist);
 	}
 }
 
@@ -1274,9 +1316,9 @@ static int next_search_order(struct compact_control *cc, int order)
 static unsigned long
 fast_isolate_freepages(struct compact_control *cc)
 {
-	unsigned int limit = min(1U, freelist_scan_limit(cc) >> 1);
+	unsigned int limit = max(1U, freelist_scan_limit(cc) >> 1);
 	unsigned int nr_scanned = 0;
-	unsigned long low_pfn, min_pfn, high_pfn = 0, highest = 0;
+	unsigned long low_pfn, min_pfn, highest = 0;
 	unsigned long nr_isolated = 0;
 	unsigned long distance;
 	struct page *page = NULL;
@@ -1321,6 +1363,7 @@ fast_isolate_freepages(struct compact_control *cc)
 		struct page *freepage;
 		unsigned long flags;
 		unsigned int order_scanned = 0;
+		unsigned long high_pfn = 0;
 
 		if (!area->nr_free)
 			continue;
@@ -1384,11 +1427,11 @@ fast_isolate_freepages(struct compact_control *cc)
 		spin_unlock_irqrestore(&cc->zone->lock, flags);
 
 		/*
-		 * Smaller scan on next order so the total scan ig related
+		 * Smaller scan on next order so the total scan is related
 		 * to freelist_scan_limit.
 		 */
 		if (order_scanned >= limit)
-			limit = min(1U, limit >> 1);
+			limit = max(1U, limit >> 1);
 	}
 
 	if (!page) {
@@ -1399,7 +1442,7 @@ fast_isolate_freepages(struct compact_control *cc)
 			 * not found, be pessemistic for direct compaction
 			 * and use the min mark.
 			 */
-			if (highest) {
+			if (highest >= min_pfn) {
 				page = pfn_to_page(highest);
 				cc->free_pfn = highest;
 			} else {
@@ -1452,7 +1495,7 @@ static void isolate_freepages(struct compact_control *cc)
 	 * this pfn aligned down to the pageblock boundary, because we do
 	 * block_start_pfn -= pageblock_nr_pages in the for loop.
 	 * For ending point, take care when isolating in last pageblock of a
-	 * a zone which ends in the middle of a pageblock.
+	 * zone which ends in the middle of a pageblock.
 	 * The low boundary is the end of the pageblock the migration scanner
 	 * is using.
 	 */
@@ -1629,6 +1672,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 	unsigned long pfn = cc->migrate_pfn;
 	unsigned long high_pfn;
 	int order;
+	bool found_block = false;
 
 	/* Skip hints are relied on to avoid repeats on the fast search */
 	if (cc->ignore_skip_hint)
@@ -1671,7 +1715,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 	high_pfn = pageblock_start_pfn(cc->migrate_pfn + distance);
 
 	for (order = cc->order - 1;
-	     order >= PAGE_ALLOC_COSTLY_ORDER && pfn == cc->migrate_pfn && nr_scanned < limit;
+	     order >= PAGE_ALLOC_COSTLY_ORDER && !found_block && nr_scanned < limit;
 	     order--) {
 		struct free_area *area = &cc->zone->free_area[order];
 		struct list_head *freelist;
@@ -1686,7 +1730,11 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 		list_for_each_entry(freepage, freelist, lru) {
 			unsigned long free_pfn;
 
-			nr_scanned++;
+			if (nr_scanned++ >= limit) {
+				move_freelist_tail(freelist, freepage);
+				break;
+			}
+
 			free_pfn = page_to_pfn(freepage);
 			if (free_pfn < high_pfn) {
 				/*
@@ -1695,12 +1743,8 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 				 * the list assumes an entry is deleted, not
 				 * reordered.
 				 */
-				if (get_pageblock_skip(freepage)) {
-					if (list_is_last(freelist, &freepage->lru))
-						break;
-
+				if (get_pageblock_skip(freepage))
 					continue;
-				}
 
 				/* Reorder to so a future search skips recent pages */
 				move_freelist_tail(freelist, freepage);
@@ -1708,13 +1752,8 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 				update_fast_start_pfn(cc, free_pfn);
 				pfn = pageblock_start_pfn(free_pfn);
 				cc->fast_search_fail = 0;
+				found_block = true;
 				set_pageblock_skip(freepage);
-				break;
-			}
-
-			if (nr_scanned >= limit) {
-				cc->fast_search_fail++;
-				move_freelist_tail(freelist, freepage);
 				break;
 			}
 		}
@@ -1727,9 +1766,10 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
 	 * If fast scanning failed then use a cached entry for a page block
 	 * that had free pages as the basis for starting a linear scan.
 	 */
-	if (pfn == cc->migrate_pfn)
+	if (!found_block) {
+		cc->fast_search_fail++;
 		pfn = reinit_migrate_pfn(cc);
-
+	}
 	return pfn;
 }
 
@@ -1738,8 +1778,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
  * starting at the block pointed to by the migrate scanner pfn within
  * compact_control.
  */
-static isolate_migrate_t isolate_migratepages(struct zone *zone,
-					struct compact_control *cc)
+static isolate_migrate_t isolate_migratepages(struct compact_control *cc)
 {
 	unsigned long block_start_pfn;
 	unsigned long block_end_pfn;
@@ -1757,8 +1796,8 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
 	 */
 	low_pfn = fast_find_migrateblock(cc);
 	block_start_pfn = pageblock_start_pfn(low_pfn);
-	if (block_start_pfn < zone->zone_start_pfn)
-		block_start_pfn = zone->zone_start_pfn;
+	if (block_start_pfn < cc->zone->zone_start_pfn)
+		block_start_pfn = cc->zone->zone_start_pfn;
 
 	/*
 	 * fast_find_migrateblock marks a pageblock skipped so to avoid
@@ -1788,8 +1827,8 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
 		if (!(low_pfn % (SWAP_CLUSTER_MAX * pageblock_nr_pages)))
 			cond_resched();
 
-		page = pageblock_pfn_to_page(block_start_pfn, block_end_pfn,
-									zone);
+		page = pageblock_pfn_to_page(block_start_pfn,
+						block_end_pfn, cc->zone);
 		if (!page)
 			continue;
 
@@ -1847,6 +1886,90 @@ static inline bool is_via_compact_memory(int order)
 	return order == -1;
 }
 
+static bool kswapd_is_running(pg_data_t *pgdat)
+{
+	return pgdat->kswapd && (pgdat->kswapd->state == TASK_RUNNING);
+}
+
+/*
+ * A zone's fragmentation score is the external fragmentation wrt to the
+ * COMPACTION_HPAGE_ORDER. It returns a value in the range [0, 100].
+ */
+static unsigned int fragmentation_score_zone(struct zone *zone)
+{
+	return extfrag_for_order(zone, COMPACTION_HPAGE_ORDER);
+}
+
+/*
+ * A weighted zone's fragmentation score is the external fragmentation
+ * wrt to the COMPACTION_HPAGE_ORDER scaled by the zone's size. It
+ * returns a value in the range [0, 100].
+ *
+ * The scaling factor ensures that proactive compaction focuses on larger
+ * zones like ZONE_NORMAL, rather than smaller, specialized zones like
+ * ZONE_DMA32. For smaller zones, the score value remains close to zero,
+ * and thus never exceeds the high threshold for proactive compaction.
+ */
+static unsigned int fragmentation_score_zone_weighted(struct zone *zone)
+{
+	unsigned long score;
+
+	score = zone->present_pages * fragmentation_score_zone(zone);
+	return div64_ul(score, zone->zone_pgdat->node_present_pages + 1);
+}
+
+/*
+ * The per-node proactive (background) compaction process is started by its
+ * corresponding kcompactd thread when the node's fragmentation score
+ * exceeds the high threshold. The compaction process remains active till
+ * the node's score falls below the low threshold, or one of the back-off
+ * conditions is met.
+ */
+static unsigned int fragmentation_score_node(pg_data_t *pgdat)
+{
+	unsigned int score = 0;
+	int zoneid;
+
+	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
+		struct zone *zone;
+
+		zone = &pgdat->node_zones[zoneid];
+		score += fragmentation_score_zone_weighted(zone);
+	}
+
+	return score;
+}
+
+extern bool dsi_screen_on;
+
+static unsigned int fragmentation_score_wmark(pg_data_t *pgdat, bool low)
+{
+	unsigned int wmark_low;
+	unsigned int compaction_proactiveness;
+
+	compaction_proactiveness = dsi_screen_on ?
+		sysctl_compaction_proactiveness : sysctl_compaction_proactiveness_screen_off;
+
+	/*
+	 * Cap the low watermak to avoid excessive compaction
+	 * activity in case a user sets the proactivess tunable
+	 * close to 100 (maximum).
+	 */
+	wmark_low = max(100U - compaction_proactiveness, 5U);
+	return low ? wmark_low : min(wmark_low + 10, 100U);
+}
+
+static bool should_proactive_compact_node(pg_data_t *pgdat)
+{
+	int wmark_high;
+
+	if (!sysctl_compaction_proactiveness || kswapd_is_running(pgdat))
+		return false;
+
+	wmark_high = fragmentation_score_wmark(pgdat, false);
+	return fragmentation_score_node(pgdat) > wmark_high;
+}
+
 static enum compact_result __compact_finished(struct compact_control *cc)
 {
 	unsigned int order;
@@ -1871,6 +1994,25 @@ static enum compact_result __compact_finished(struct compact_control *cc)
 			return COMPACT_COMPLETE;
 		else
 			return COMPACT_PARTIAL_SKIPPED;
+	}
+
+	if (cc->proactive_compaction) {
+		int score, wmark_low;
+		pg_data_t *pgdat;
+
+		pgdat = cc->zone->zone_pgdat;
+		if (kswapd_is_running(pgdat))
+			return COMPACT_PARTIAL_SKIPPED;
+
+		score = fragmentation_score_zone(cc->zone);
+		wmark_low = fragmentation_score_wmark(pgdat, true);
+
+		if (score > wmark_low)
+			ret = COMPACT_CONTINUE;
+		else
+			ret = COMPACT_SUCCESS;
+
+		goto out;
 	}
 
 	if (is_via_compact_memory(cc->order))
@@ -1931,6 +2073,7 @@ static enum compact_result __compact_finished(struct compact_control *cc)
 		}
 	}
 
+out:
 	if (cc->contended || fatal_signal_pending(current))
 		ret = COMPACT_CONTENDED;
 
@@ -1949,13 +2092,6 @@ static enum compact_result compact_finished(struct compact_control *cc)
 	return ret;
 }
 
-/*
- * compaction_suitable: Is this suitable to run compaction on this zone now?
- * Returns
- *   COMPACT_SKIPPED  - If there are too few free pages for compaction
- *   COMPACT_SUCCESS  - If the allocation would succeed without compaction
- *   COMPACT_CONTINUE - If compaction should run now
- */
 static enum compact_result __compaction_suitable(struct zone *zone, int order,
 					unsigned int alloc_flags,
 					int classzone_idx,
@@ -1999,6 +2135,13 @@ static enum compact_result __compaction_suitable(struct zone *zone, int order,
 	return COMPACT_CONTINUE;
 }
 
+/*
+ * compaction_suitable: Is this suitable to run compaction on this zone now?
+ * Returns
+ *   COMPACT_SKIPPED  - If there are too few free pages for compaction
+ *   COMPACT_SUCCESS  - If the allocation would succeed without compaction
+ *   COMPACT_CONTINUE - If compaction should run now
+ */
 enum compact_result compaction_suitable(struct zone *zone, int order,
 					unsigned int alloc_flags,
 					int classzone_idx)
@@ -2077,6 +2220,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 	unsigned long end_pfn = zone_end_pfn(cc->zone);
 	unsigned long last_migrated_pfn;
 	const bool sync = cc->mode != MIGRATE_ASYNC;
+	ktime_t event_ts;
 	bool update_cached;
 
 	/*
@@ -2136,6 +2280,8 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 
 	last_migrated_pfn = 0;
 
+	mm_event_start(&event_ts);
+
 	/*
 	 * Migrate has separate cached PFNs for ASYNC and SYNC* migration on
 	 * the basis that some migrations will fail in ASYNC mode. However,
@@ -2154,7 +2300,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 
 	while ((ret = compact_finished(cc)) == COMPACT_CONTINUE) {
 		int err;
-		unsigned long start_pfn = cc->migrate_pfn;
+		unsigned long iteration_start_pfn = cc->migrate_pfn;
 
 		/*
 		 * Avoid multiple rescans which can happen if a page cannot be
@@ -2166,11 +2312,11 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 		 */
 		cc->rescan = false;
 		if (pageblock_start_pfn(last_migrated_pfn) ==
-		    pageblock_start_pfn(start_pfn)) {
+		    pageblock_start_pfn(iteration_start_pfn)) {
 			cc->rescan = true;
 		}
 
-		switch (isolate_migratepages(cc->zone, cc)) {
+		switch (isolate_migratepages(cc)) {
 		case ISOLATE_ABORT:
 			ret = COMPACT_CONTENDED;
 			putback_movable_pages(&cc->migratepages);
@@ -2191,8 +2337,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
 			goto check_drain;
 		case ISOLATE_SUCCESS:
 			update_cached = false;
-			last_migrated_pfn = start_pfn;
-			;
+			last_migrated_pfn = iteration_start_pfn;
 		}
 
 		err = migrate_pages(&cc->migratepages, compaction_alloc,
@@ -2258,6 +2403,7 @@ check_drain:
 	}
 
 out:
+	mm_event_end(MM_COMPACTION, event_ts);
 	/*
 	 * Release free pages and update where the free scanner should restart,
 	 * so we don't leave any returned pages behind in the next attempt.
@@ -2311,16 +2457,26 @@ static enum compact_result compact_zone_order(struct zone *zone, int order,
 		.page = NULL,
 	};
 
-	if (capture)
-		current->capture_control = &capc;
+	/*
+	 * Make sure the structs are really initialized before we expose the
+	 * capture control, in case we are interrupted and the interrupt handler
+	 * frees a page.
+	 */
+	barrier();
+	WRITE_ONCE(current->capture_control, &capc);
 
 	ret = compact_zone(&cc, &capc);
 
 	VM_BUG_ON(!list_empty(&cc.freepages));
 	VM_BUG_ON(!list_empty(&cc.migratepages));
 
-	*capture = capc.page;
-	current->capture_control = NULL;
+	/*
+	 * Make sure we hide capture control first before we read the captured
+	 * page pointer, otherwise an interrupt could free and capture a page
+	 * and we would leak it.
+	 */
+	WRITE_ONCE(current->capture_control, NULL);
+	*capture = READ_ONCE(capc.page);
 
 	return ret;
 }
@@ -2334,6 +2490,7 @@ int sysctl_extfrag_threshold = 500;
  * @alloc_flags: The allocation flags of the current allocation
  * @ac: The context of current allocation
  * @prio: Determines how hard direct compaction should try to succeed
+ * @capture: Pointer to free page created by compaction will be stored here
  *
  * This is the main entry point for direct page compaction.
  */
@@ -2344,10 +2501,12 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 	struct zoneref *z;
 	struct zone *zone;
 	enum compact_result rc = COMPACT_SKIPPED;
+	ktime_t event_ts;
 
 	if (!gfp_compaction_allowed(gfp_mask))
 		return COMPACT_SKIPPED;
 
+	mm_event_start(&event_ts);
 	trace_mm_compaction_try_to_compact_pages(order, gfp_mask, prio);
 
 	/* Compact each zone in the list */
@@ -2397,9 +2556,45 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 			break;
 	}
 
+	mm_event_end(MM_COMPACTION, event_ts);
 	return rc;
 }
 
+/*
+ * Compact all zones within a node till each zone's fragmentation score
+ * reaches within proactive compaction thresholds (as determined by the
+ * proactiveness tunable).
+ *
+ * It is possible that the function returns before reaching score targets
+ * due to various back-off conditions, such as, contention on per-node or
+ * per-zone locks.
+ */
+static void proactive_compact_node(pg_data_t *pgdat)
+{
+	int zoneid;
+	struct zone *zone;
+	struct compact_control cc = {
+		.order = -1,
+		.mode = MIGRATE_SYNC_LIGHT,
+		.ignore_skip_hint = true,
+		.whole_zone = true,
+		.gfp_mask = GFP_KERNEL,
+		.proactive_compaction = true,
+	};
+
+	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
+		zone = &pgdat->node_zones[zoneid];
+		if (!populated_zone(zone))
+			continue;
+
+		cc.zone = zone;
+
+		compact_zone(&cc, NULL);
+
+		VM_BUG_ON(!list_empty(&cc.freepages));
+		VM_BUG_ON(!list_empty(&cc.migratepages));
+	}
+}
 
 /* Compact all zones within a node */
 static void compact_node(int nid)
@@ -2447,6 +2642,46 @@ static void compact_nodes(void)
 int sysctl_compact_memory;
 
 /*
+ * Tunable for proactive compaction. It determines how
+ * aggressively the kernel should compact memory in the
+ * background. It takes values in the range [0, 100].
+ */
+unsigned int __read_mostly sysctl_compaction_proactiveness = 20;
+unsigned int __read_mostly sysctl_compaction_proactiveness_screen_off = 40;
+
+void trigger_proactive_compaction(bool sysctl)
+{
+	int nid;
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+
+		if (sysctl) {
+			if (pgdat->proactive_compact_trigger)
+				continue;
+
+			pgdat->proactive_compact_trigger = true;
+		}
+		wake_up_interruptible(&pgdat->kcompactd_wait);
+	}
+}
+
+int compaction_proactiveness_sysctl_handler(struct ctl_table *table, int write,
+		void *buffer, size_t *length, loff_t *ppos)
+{
+	int rc;
+
+	rc = proc_dointvec_minmax(table, write, buffer, length, ppos);
+	if (rc)
+		return rc;
+
+	if (write && sysctl_compaction_proactiveness)
+		trigger_proactive_compaction(true);
+
+	return 0;
+}
+
+/*
  * This is the entry point for compacting all nodes via
  * /proc/sys/vm/compact_memory
  */
@@ -2455,14 +2690,6 @@ int sysctl_compaction_handler(struct ctl_table *table, int write,
 {
 	if (write)
 		compact_nodes();
-
-	return 0;
-}
-
-int sysctl_extfrag_handler(struct ctl_table *table, int write,
-			void __user *buffer, size_t *length, loff_t *ppos)
-{
-	proc_dointvec_minmax(table, write, buffer, length, ppos);
 
 	return 0;
 }
@@ -2498,7 +2725,8 @@ void compaction_unregister_node(struct node *node)
 
 static inline bool kcompactd_work_requested(pg_data_t *pgdat)
 {
-	return pgdat->kcompactd_max_order > 0 || kthread_should_stop();
+	return pgdat->kcompactd_max_order > 0 || kthread_should_stop() ||
+		pgdat->proactive_compact_trigger;
 }
 
 static bool kcompactd_node_suitable(pg_data_t *pgdat)
@@ -2625,6 +2853,9 @@ void wakeup_kcompactd(pg_data_t *pgdat, int order, int classzone_idx)
 	wake_up_interruptible(&pgdat->kcompactd_wait);
 }
 
+static unsigned int proactively_compacted;
+module_param(proactively_compacted, uint, 0644);
+
 /*
  * The background compaction daemon, started as a kernel thread
  * from the init process.
@@ -2633,6 +2864,8 @@ static int kcompactd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t*)p;
 	struct task_struct *tsk = current;
+	long default_timeout = msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC);
+	long timeout = default_timeout;
 
 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
 
@@ -2647,13 +2880,54 @@ static int kcompactd(void *p)
 	while (!kthread_should_stop()) {
 		unsigned long pflags;
 
+		/*
+		 * Avoid the unnecessary wakeup for proactive compaction
+		 * when it is disabled.
+		 */
+		if (!sysctl_compaction_proactiveness)
+			timeout = MAX_SCHEDULE_TIMEOUT;
 		trace_mm_compaction_kcompactd_sleep(pgdat->node_id);
-		wait_event_freezable(pgdat->kcompactd_wait,
-				kcompactd_work_requested(pgdat));
+		if (wait_event_freezable_timeout(pgdat->kcompactd_wait,
+			kcompactd_work_requested(pgdat), timeout) &&
+			!pgdat->proactive_compact_trigger) {
 
-		psi_memstall_enter(&pflags);
-		kcompactd_do_work(pgdat);
-		psi_memstall_leave(&pflags);
+			psi_memstall_enter(&pflags);
+			kcompactd_do_work(pgdat);
+			psi_memstall_leave(&pflags);
+			/*
+			 * Reset the timeout value. The defer timeout from
+			 * proactive compaction is lost here but that is fine
+			 * as the condition of the zone changing substantionally
+			 * then carrying on with the previous defer interval is
+			 * not useful.
+			 */
+			timeout = default_timeout;
+			continue;
+		}
+
+		/*
+		 * Start the proactive work with default timeout. Based
+		 * on the fragmentation score, this timeout is updated.
+		 */
+		timeout = default_timeout;
+		if (should_proactive_compact_node(pgdat)) {
+			unsigned int prev_score, score;
+
+			prev_score = fragmentation_score_node(pgdat);
+			proactive_compact_node(pgdat);
+			score = fragmentation_score_node(pgdat);
+			/*
+			 * Defer proactive compaction if the fragmentation
+			 * score did not go down i.e. no progress made.
+			 */
+			if (unlikely(score >= prev_score))
+				timeout =
+				   default_timeout << COMPACT_MAX_DEFER_SHIFT;
+			else
+				proactively_compacted++;
+		}
+		if (unlikely(pgdat->proactive_compact_trigger))
+			pgdat->proactive_compact_trigger = false;
 	}
 
 	return 0;

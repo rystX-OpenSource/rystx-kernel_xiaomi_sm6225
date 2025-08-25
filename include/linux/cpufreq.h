@@ -265,7 +265,7 @@ __ATTR(_name, 0644, show_##_name, store_##_name)
 
 struct cpufreq_driver {
 	char		name[CPUFREQ_NAME_LEN];
-	u8		flags;
+	u16		flags;
 	void		*driver_data;
 
 	/* needed by all drivers */
@@ -338,15 +338,14 @@ struct cpufreq_driver {
 };
 
 /* flags */
-#define CPUFREQ_STICKY		(1 << 0)	/* driver isn't removed even if
-						   all ->init() calls failed */
-#define CPUFREQ_CONST_LOOPS	(1 << 1)	/* loops_per_jiffy or other
-						   kernel "constants" aren't
-						   affected by frequency
-						   transitions */
-#define CPUFREQ_PM_NO_WARN	(1 << 2)	/* don't warn on suspend/resume
-						   speed mismatches */
-
+#define CPUFREQ_NEED_UPDATE_LIMITS	(1 << 0)	/* driver isn't removed even if
+							   all ->init() calls failed */
+#define CPUFREQ_CONST_LOOPS		(1 << 1)	/* loops_per_jiffy or other
+							   kernel "constants" aren't
+							   affected by frequency
+							   transitions */
+#define CPUFREQ_PM_NO_WARN		(1 << 2)	/* don't warn on suspend/resume
+							   speed mismatches */
 /*
  * This should be set by platforms having multiple clock-domains, i.e.
  * supporting multiple policies. With this sysfs directories of governor would
@@ -380,6 +379,7 @@ struct cpufreq_driver {
 int cpufreq_register_driver(struct cpufreq_driver *driver_data);
 int cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
 
+bool cpufreq_driver_test_flags(u16 flags);
 const char *cpufreq_get_current_driver(void);
 void *cpufreq_get_driver_data(void);
 
@@ -490,14 +490,6 @@ static inline unsigned long cpufreq_scale(unsigned long old, u_int div,
 #define CPUFREQ_POLICY_POWERSAVE	(1)
 #define CPUFREQ_POLICY_PERFORMANCE	(2)
 
-/*
- * The polling frequency depends on the capability of the processor. Default
- * polling frequency is 1000 times the transition latency of the processor. The
- * ondemand governor will work on any processor with transition latency <= 10ms,
- * using appropriate sampling rate.
- */
-#define LATENCY_MULTIPLIER		(1000)
-
 struct cpufreq_governor {
 	char	name[CPUFREQ_NAME_LEN];
 	int	(*init)(struct cpufreq_policy *policy);
@@ -529,6 +521,20 @@ unsigned int cpufreq_driver_resolve_freq(struct cpufreq_policy *policy,
 unsigned int cpufreq_policy_transition_delay_us(struct cpufreq_policy *policy);
 int cpufreq_register_governor(struct cpufreq_governor *governor);
 void cpufreq_unregister_governor(struct cpufreq_governor *governor);
+
+#define cpufreq_governor_init(__governor)			\
+static int __init __governor##_init(void)			\
+{								\
+	return cpufreq_register_governor(&__governor);	\
+}								\
+core_initcall(__governor##_init)
+
+#define cpufreq_governor_exit(__governor)			\
+static void __exit __governor##_exit(void)			\
+{								\
+	return cpufreq_unregister_governor(&__governor);	\
+}								\
+module_exit(__governor##_exit)
 
 struct cpufreq_governor *cpufreq_default_governor(void);
 struct cpufreq_governor *cpufreq_fallback_governor(void);
@@ -947,6 +953,9 @@ extern void arch_set_freq_scale(struct cpumask *cpus, unsigned long cur_freq,
 				unsigned long max_freq);
 extern void arch_set_max_freq_scale(struct cpumask *cpus,
 				    unsigned long policy_max_freq);
+extern void arch_set_min_freq_scale(const struct cpumask *cpus,
+				    unsigned long min_freq,
+				    unsigned long max_freq);
 
 /* the following are really really optional */
 extern struct freq_attr cpufreq_freq_attr_scaling_available_freqs;
@@ -959,5 +968,4 @@ int cpufreq_generic_init(struct cpufreq_policy *policy,
 		struct cpufreq_frequency_table *table,
 		unsigned int transition_latency);
 
-extern unsigned int cpuinfo_max_freq_cached;
 #endif /* _LINUX_CPUFREQ_H */

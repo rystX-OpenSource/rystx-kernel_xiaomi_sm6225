@@ -109,9 +109,6 @@ struct task_group;
 
 #define task_is_stopped_or_traced(task)	((task->state & (__TASK_STOPPED | __TASK_TRACED)) != 0)
 
-#define task_contributes_to_load(task)	((task->state & TASK_UNINTERRUPTIBLE) != 0 && \
-					 (task->flags & PF_FROZEN) == 0 && \
-					 (task->state & TASK_NOLOAD) == 0)
 
 enum task_boost_type {
 	TASK_BOOST_NONE = 0,
@@ -134,7 +131,6 @@ enum fps {
 	FPS144 = 144,
 };
 
-#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
 
 /*
  * Special states are those that do not use the normal wait-loop pattern. See
@@ -142,6 +138,8 @@ enum fps {
  */
 #define is_special_task_state(state)				\
 	((state) & (__TASK_STOPPED | __TASK_TRACED | TASK_PARKED | TASK_DEAD))
+
+#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
 
 #define __set_current_state(state_value)			\
 	do {							\
@@ -243,41 +241,6 @@ enum migrate_types {
 	GROUP_TO_RQ,
 	RQ_TO_GROUP,
 };
-
-#ifdef CONFIG_HOTPLUG_CPU
-extern int sched_isolate_count(const cpumask_t *mask, bool include_offline);
-extern int sched_isolate_cpu(int cpu);
-extern int sched_unisolate_cpu(int cpu);
-extern int sched_unisolate_cpu_unlocked(int cpu);
-#else
-static inline int sched_isolate_count(const cpumask_t *mask,
-				      bool include_offline)
-{
-	cpumask_t count_mask;
-
-	if (include_offline)
-		cpumask_andnot(&count_mask, mask, cpu_online_mask);
-	else
-		return 0;
-
-	return cpumask_weight(&count_mask);
-}
-
-static inline int sched_isolate_cpu(int cpu)
-{
-	return 0;
-}
-
-static inline int sched_unisolate_cpu(int cpu)
-{
-	return 0;
-}
-
-static inline int sched_unisolate_cpu_unlocked(int cpu)
-{
-	return 0;
-}
-#endif
 
 extern void scheduler_tick(void);
 
@@ -434,32 +397,34 @@ struct load_weight {
 struct util_est {
 	unsigned int			enqueued;
 	unsigned int			ewma;
-#define UTIL_EST_WEIGHT_SHIFT		2
+#define UTIL_EST_WEIGHT_SHIFT		5
 } __attribute__((__aligned__(sizeof(u64))));
 
 /*
- * The load_avg/util_avg accumulates an infinite geometric series
- * (see __update_load_avg() in kernel/sched/fair.c).
+ * The load/runnable/util_avg accumulates an infinite geometric series
+ * (see __update_load_avg_cfs_rq() in kernel/sched/pelt.c).
  *
  * [load_avg definition]
  *
  *   load_avg = runnable% * scale_load_down(load)
  *
- * where runnable% is the time ratio that a sched_entity is runnable.
- * For cfs_rq, it is the aggregated load_avg of all runnable and
- * blocked sched_entities.
+ * [runnable_avg definition]
+ *
+ *   runnable_avg = runnable% * SCHED_CAPACITY_SCALE
  *
  * [util_avg definition]
  *
  *   util_avg = running% * SCHED_CAPACITY_SCALE
  *
- * where running% is the time ratio that a sched_entity is running on
- * a CPU. For cfs_rq, it is the aggregated util_avg of all runnable
- * and blocked sched_entities.
+ * where runnable% is the time ratio that a sched_entity is runnable and
+ * running% the time ratio that a sched_entity is running.
  *
- * load_avg and util_avg don't direcly factor frequency scaling and CPU
- * capacity scaling. The scaling is done through the rq_clock_pelt that
- * is used for computing those signals (see update_rq_clock_pelt())
+ * For cfs_rq, they are the aggregated values of all runnable and blocked
+ * sched_entities.
+ *
+ * The load/runnable/util_avg doesn't direcly factor frequency scaling and CPU
+ * capacity scaling. The scaling is done through the rq_clock_pelt that is used
+ * for computing those signals (see update_rq_clock_pelt())
  *
  * N.B., the above ratios (runnable% and running%) themselves are in the
  * range of [0, 1]. To do fixed point arithmetics, we therefore scale them
@@ -483,11 +448,11 @@ struct util_est {
 struct sched_avg {
 	u64				last_update_time;
 	u64				load_sum;
-	u64				runnable_load_sum;
+	u64				runnable_sum;
 	u32				util_sum;
 	u32				period_contrib;
 	unsigned long			load_avg;
-	unsigned long			runnable_load_avg;
+	unsigned long			runnable_avg;
 	unsigned long			util_avg;
 	struct util_est			util_est;
 } ____cacheline_aligned;
@@ -531,15 +496,24 @@ struct sched_statistics {
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
-	unsigned long			runnable_weight;
 	struct rb_node			run_node;
+	u64				deadline;
+	u64				min_vruntime;
+	u64				min_slice;
+
 	struct list_head		group_node;
-	unsigned int			on_rq;
+	unsigned char			on_rq;
+	unsigned char			sched_delayed;
+	unsigned char			rel_deadline;
+	unsigned char			custom_slice;
+					/* hole */
 
 	u64				exec_start;
 	u64				sum_exec_runtime;
-	u64				vruntime;
 	u64				prev_sum_exec_runtime;
+	u64				vruntime;
+	s64				vlag;
+	u64				slice;
 
 	u64				nr_migrations;
 
@@ -552,6 +526,8 @@ struct sched_entity {
 	struct cfs_rq			*cfs_rq;
 	/* rq "owned" by this entity/group: */
 	struct cfs_rq			*my_q;
+	/* cached value of my_q->h_nr_running */
+	unsigned long			runnable_weight;
 #endif
 
 #ifdef CONFIG_SMP
@@ -595,7 +571,6 @@ extern u32 sched_get_init_task_load(struct task_struct *p);
 extern void sched_update_cpu_freq_min_max(const cpumask_t *cpus, u32 fmin,
 					  u32 fmax);
 extern int sched_set_boost(int enable);
-extern void free_task_load_ptrs(struct task_struct *p);
 extern void sched_set_refresh_rate(enum fps fps);
 
 #define RAVG_HIST_SIZE_MAX 5
@@ -640,7 +615,7 @@ struct ravg {
 	u32 sum, demand;
 	u32 coloc_demand;
 	u32 sum_history[RAVG_HIST_SIZE_MAX];
-	u32 *curr_window_cpu, *prev_window_cpu;
+	u32 curr_window_cpu[CONFIG_NR_CPUS], prev_window_cpu[CONFIG_NR_CPUS];
 	u32 curr_window, prev_window;
 	u32 pred_demand;
 	u8 busy_buckets[NUM_BUSY_BUCKETS];
@@ -662,8 +637,6 @@ static inline int sched_set_boost(int enable)
 {
 	return -EINVAL;
 }
-static inline void free_task_load_ptrs(struct task_struct *p) { }
-
 static inline void sched_update_cpu_freq_min_max(const cpumask_t *cpus,
 					u32 fmin, u32 fmax) { }
 
@@ -874,7 +847,7 @@ struct task_struct {
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
-	u64				 last_sleep_ts;
+	u64				last_sleep_ts;
 
 	int				boost;
 	u64				boost_period;
@@ -903,9 +876,15 @@ struct task_struct {
 	struct sched_dl_entity		dl;
 
 #ifdef CONFIG_UCLAMP_TASK
-	/* Clamp values requested for a scheduling entity */
+	/*
+	 * Clamp values requested for a scheduling entity.
+	 * Must be updated with task_rq_lock() held.
+	 */
 	struct uclamp_se		uclamp_req[UCLAMP_CNT];
-	/* Effective clamp values used for a scheduling entity */
+	/*
+	 * Effective clamp values used for a scheduling entity.
+	 * Must be updated with task_rq_lock() held.
+	 */
 	struct uclamp_se		uclamp[UCLAMP_CNT];
 #endif
 
@@ -991,6 +970,10 @@ struct task_struct {
 #ifdef CONFIG_MEMCG_KMEM
 	unsigned			memcg_kmem_skip_account:1;
 #endif
+#endif
+#ifdef CONFIG_LRU_GEN
+	/* whether the LRU algorithm may apply to this access */
+	unsigned			in_lru_fault:1;
 #endif
 #ifdef CONFIG_COMPAT_BRK
 	unsigned			brk_randomized:1;
@@ -1355,10 +1338,7 @@ struct task_struct {
 
 	struct tlbflush_unmap_batch	tlb_ubc;
 
-	union {
-		refcount_t		rcu_users;
-		struct rcu_head		rcu;
-	};
+	struct rcu_head			rcu;
 
 	/* Cache last used pipe for splice(): */
 	struct pipe_inode_info		*splice_pipe;
@@ -1491,6 +1471,9 @@ struct task_struct {
 #ifdef CONFIG_SECURITY
 	/* Used by LSM modules for access restriction: */
 	void				*security;
+#endif
+#ifdef CONFIG_ANDROID_SIMPLE_LMK
+	struct task_struct		*simple_lmk_next;
 #endif
 	/* task is frozen/stopped (used by the cgroup freezer) */
 	ANDROID_KABI_USE(1, unsigned frozen:1);
@@ -1720,6 +1703,7 @@ extern struct pid *cad_pid;
 #define PF_NO_SETAFFINITY	0x04000000	/* Userland is not allowed to meddle with cpus_allowed */
 #define PF_MCE_EARLY		0x08000000      /* Early kill for mce process policy */
 #define PF_WAKE_UP_IDLE         0x10000000	/* TTWU on an idle CPU */
+#define PF_PERF_CRITICAL	0x10000000	/* Thread is performance-critical */
 #define PF_MUTEX_TESTER		0x20000000	/* Thread belongs to the rt mutex tester */
 #define PF_FREEZER_SKIP		0x40000000	/* Freezer should not count it as freezable */
 #define PF_SUSPEND_TASK		0x80000000      /* This thread called freeze_processes() and should not be frozen */
@@ -1953,7 +1937,15 @@ extern char *__get_task_comm(char *to, size_t len, struct task_struct *tsk);
 })
 
 #ifdef CONFIG_SMP
-void scheduler_ipi(void);
+static __always_inline void scheduler_ipi(void)
+{
+	/*
+	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
+	 * TIF_NEED_RESCHED remotely (for the first time) will also send
+	 * this IPI.
+	 */
+	preempt_fold_need_resched();
+}
 extern unsigned long wait_task_inactive(struct task_struct *, long match_state);
 #else
 static inline void scheduler_ipi(void) { }
@@ -2094,6 +2086,11 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
 
 #endif /* CONFIG_SMP */
 
+static inline bool task_is_runnable(struct task_struct *p)
+{
+	return p->on_rq && !p->se.sched_delayed;
+}
+
 /*
  * In order to reduce various lock holder preemption latencies provide an
  * interface to see if a vCPU is currently running or not.
@@ -2106,6 +2103,7 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
 # define vcpu_is_preempted(cpu)	false
 #endif
 
+extern long msm_sched_setaffinity(pid_t pid, struct cpumask *new_mask);
 extern long sched_setaffinity(pid_t pid, const struct cpumask *new_mask);
 extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 

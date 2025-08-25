@@ -1460,13 +1460,13 @@ static int dwc3_probe(struct platform_device *pdev)
 {
 	struct device		*dev = &pdev->dev;
 	struct resource		*res, dwc_res;
-	struct dwc3		*dwc;
-
-	int			ret;
-
+	struct dwc3			*dwc;
+	int					ret;
 	void __iomem		*regs;
-	int			irq;
-	char			dma_ipc_log_ctx_name[40];
+	int					irq;
+#ifdef CONFIG_IPC_LOGGING
+	char				dma_ipc_log_ctx_name[40];
+#endif
 
 	if (count >= DWC_CTRL_COUNT) {
 		dev_err(dev, "Err dwc instance %d >= %d available\n",
@@ -1601,6 +1601,7 @@ skip_clk_reset:
 		}
 	}
 
+#ifdef CONFIG_IPC_LOGGING
 	dwc->dwc_ipc_log_ctxt = ipc_log_context_create(NUM_LOG_PAGES,
 					dev_name(dwc->dev), 0);
 	if (!dwc->dwc_ipc_log_ctxt)
@@ -1612,6 +1613,7 @@ skip_clk_reset:
 						dma_ipc_log_ctx_name, 0);
 	if (!dwc->dwc_dma_ipc_log_ctxt)
 		dev_err(dwc->dev, "Error getting ipc_log_ctxt for ep_events\n");
+#endif
 
 	dwc3_instance[count] = dwc;
 	dwc->index = count;
@@ -1702,14 +1704,11 @@ assert_reset:
 
 static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 {
-	unsigned long	flags;
 	u32 reg;
 
 	switch (dwc->current_dr_role) {
 	case DWC3_GCTL_PRTCAP_DEVICE:
-		spin_lock_irqsave(&dwc->lock, flags);
 		dwc3_gadget_suspend(dwc);
-		spin_unlock_irqrestore(&dwc->lock, flags);
 		synchronize_irq(dwc->irq_gadget);
 		dwc3_core_exit(dwc);
 		break;
@@ -1740,9 +1739,7 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 			break;
 
 		if (dwc->current_otg_role == DWC3_OTG_ROLE_DEVICE) {
-			spin_lock_irqsave(&dwc->lock, flags);
 			dwc3_gadget_suspend(dwc);
-			spin_unlock_irqrestore(&dwc->lock, flags);
 			synchronize_irq(dwc->irq_gadget);
 		}
 
@@ -1759,7 +1756,6 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 
 static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 {
-	unsigned long	flags;
 	int		ret;
 	u32		reg;
 
@@ -1770,9 +1766,7 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 			return ret;
 
 		dwc3_set_prtcap(dwc, DWC3_GCTL_PRTCAP_DEVICE);
-		spin_lock_irqsave(&dwc->lock, flags);
 		dwc3_gadget_resume(dwc);
-		spin_unlock_irqrestore(&dwc->lock, flags);
 		break;
 	case DWC3_GCTL_PRTCAP_HOST:
 		if (!PMSG_IS_AUTO(msg)) {
@@ -1810,9 +1804,7 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 		if (dwc->current_otg_role == DWC3_OTG_ROLE_HOST) {
 			dwc3_otg_host_init(dwc);
 		} else if (dwc->current_otg_role == DWC3_OTG_ROLE_DEVICE) {
-			spin_lock_irqsave(&dwc->lock, flags);
 			dwc3_gadget_resume(dwc);
-			spin_unlock_irqrestore(&dwc->lock, flags);
 		}
 
 		break;

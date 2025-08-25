@@ -145,6 +145,7 @@ static ssize_t write_irq_affinity(int type, struct file *file,
 	cpumask_var_t new_value;
 	int err;
 
+	return count;
 	if (!irq_can_set_affinity_usr(irq) || no_irq_affinity)
 		return -EIO;
 
@@ -159,11 +160,6 @@ static ssize_t write_irq_affinity(int type, struct file *file,
 		goto free_cpumask;
 
 	if (!is_affinity_mask_valid(new_value)) {
-		err = -EINVAL;
-		goto free_cpumask;
-	}
-
-	if (cpumask_subset(new_value, cpu_isolated_mask)) {
 		err = -EINVAL;
 		goto free_cpumask;
 	}

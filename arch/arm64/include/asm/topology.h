@@ -12,7 +12,9 @@ struct cpu_topology {
 	int llc_id;
 	cpumask_t thread_sibling;
 	cpumask_t core_sibling;
+#ifdef CONFIG_SCHED_WALT
 	cpumask_t core_possible_sibling;
+#endif
 	cpumask_t llc_sibling;
 };
 
@@ -24,8 +26,10 @@ extern struct cpu_topology cpu_topology[NR_CPUS];
 #define topology_core_cpumask(cpu)	(&cpu_topology[cpu].core_sibling)
 #define topology_sibling_cpumask(cpu)	(&cpu_topology[cpu].thread_sibling)
 #define topology_llc_cpumask(cpu)	(&cpu_topology[cpu].llc_sibling)
+#ifdef CONFIG_SCHED_WALT
 #define topology_possible_sibling_cpumask(cpu)		\
 				(&cpu_topology[cpu].core_possible_sibling)
+#endif
 
 void init_cpu_topology(void);
 void store_cpu_topology(unsigned int cpuid);
@@ -50,11 +54,17 @@ int pcibus_to_node(struct pci_bus *bus);
 /* Replace task scheduler's default max-frequency-invariant accounting */
 #define arch_scale_max_freq_capacity topology_get_max_freq_scale
 
+/* Replace task scheduler's default min-frequency-invariant accounting */
+#define arch_scale_min_freq_capacity topology_get_min_freq_scale
+
 /* Replace task scheduler's default cpu-invariant accounting */
 #define arch_scale_cpu_capacity topology_get_cpu_scale
 
 /* Enable topology flag updates */
 #define arch_update_cpu_topology topology_update_cpu_topology
+
+/* Replace task scheduler's default thermal pressure retrieve API */
+#define arch_scale_thermal_pressure topology_get_thermal_pressure
 
 #include <asm-generic/topology.h>
 

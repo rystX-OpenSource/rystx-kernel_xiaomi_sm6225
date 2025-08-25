@@ -56,17 +56,21 @@ static inline void cond_synchronize_sched(unsigned long oldstate)
 	might_sleep();
 }
 
-extern void rcu_barrier_bh(void);
-extern void rcu_barrier_sched(void);
-
 static inline void synchronize_rcu_expedited(void)
 {
 	synchronize_sched();	/* Only one CPU, so pretty fast anyway!!! */
 }
 
+extern void rcu_barrier_sched(void);
+
 static inline void rcu_barrier(void)
 {
 	rcu_barrier_sched();  /* Only one CPU, so only one list of callbacks! */
+}
+
+static inline void rcu_barrier_bh(void)
+{
+	rcu_barrier();
 }
 
 static inline void synchronize_rcu_bh(void)
@@ -88,6 +92,11 @@ static inline void kfree_call_rcu(struct rcu_head *head,
 				  rcu_callback_t func)
 {
 	call_rcu(head, func);
+}
+
+static inline void rcu_softirq_qs(void)
+{
+	rcu_sched_qs();
 }
 
 #define rcu_note_context_switch(preempt) \
@@ -115,6 +124,11 @@ static inline void rcu_irq_exit_irqson(void) { }
 static inline void rcu_irq_enter_irqson(void) { }
 static inline void rcu_irq_exit(void) { }
 static inline void exit_rcu(void) { }
+static inline bool rcu_preempt_need_deferred_qs(struct task_struct *t)
+{
+	return false;
+}
+static inline void rcu_preempt_deferred_qs(struct task_struct *t) { }
 #ifdef CONFIG_SRCU
 void rcu_scheduler_starting(void);
 #else /* #ifndef CONFIG_SRCU */

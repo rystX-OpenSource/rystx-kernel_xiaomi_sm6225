@@ -262,6 +262,8 @@ struct workqueue_struct {
 	struct wq_device	*wq_dev;	/* I: for sysfs interface */
 #endif
 #ifdef CONFIG_LOCKDEP
+	char			*lock_name;
+	struct lock_class_key	key;
 	struct lockdep_map	lockdep_map;
 #endif
 	char			name[WQ_NAME_LEN]; /* I: workqueue name */
@@ -845,43 +847,32 @@ static void wake_up_worker(struct worker_pool *pool)
 }
 
 /**
- * wq_worker_waking_up - a worker is waking up
+ * wq_worker_running - a worker is running again
  * @task: task waking up
- * @cpu: CPU @task is waking up to
  *
- * This function is called during try_to_wake_up() when a worker is
- * being awoken.
- *
- * CONTEXT:
- * spin_lock_irq(rq->lock)
+ * This function is called when a worker returns from schedule()
  */
-void wq_worker_waking_up(struct task_struct *task, int cpu)
+void wq_worker_running(struct task_struct *task)
 {
 	struct worker *worker = kthread_data(task);
 
-	if (!(worker->flags & WORKER_NOT_RUNNING)) {
-		WARN_ON_ONCE(worker->pool->cpu != cpu);
+	if (!worker->sleeping)
+		return;
+	if (!(worker->flags & WORKER_NOT_RUNNING))
 		atomic_inc(&worker->pool->nr_running);
-	}
+	worker->sleeping = 0;
 }
 
 /**
  * wq_worker_sleeping - a worker is going to sleep
  * @task: task going to sleep
  *
- * This function is called during schedule() when a busy worker is
- * going to sleep.  Worker on the same cpu can be woken up by
- * returning pointer to its task.
- *
- * CONTEXT:
- * spin_lock_irq(rq->lock)
- *
- * Return:
- * Worker task on @cpu to wake up, %NULL if none.
+ * This function is called from schedule() when a busy worker is
+ * going to sleep.
  */
-struct task_struct *wq_worker_sleeping(struct task_struct *task)
+void wq_worker_sleeping(struct task_struct *task)
 {
-	struct worker *worker = kthread_data(task), *to_wakeup = NULL;
+	struct worker *next, *worker = kthread_data(task);
 	struct worker_pool *pool;
 
 	/*
@@ -890,13 +881,15 @@ struct task_struct *wq_worker_sleeping(struct task_struct *task)
 	 * checking NOT_RUNNING.
 	 */
 	if (worker->flags & WORKER_NOT_RUNNING)
-		return NULL;
+		return;
 
 	pool = worker->pool;
 
-	/* this can only happen on the local cpu */
-	if (WARN_ON_ONCE(pool->cpu != raw_smp_processor_id()))
-		return NULL;
+	if (WARN_ON_ONCE(worker->sleeping))
+		return;
+
+	worker->sleeping = 1;
+	spin_lock_irq(&pool->lock);
 
 	/*
 	 * The counterpart of the following dec_and_test, implied mb,
@@ -910,9 +903,12 @@ struct task_struct *wq_worker_sleeping(struct task_struct *task)
 	 * lock is safe.
 	 */
 	if (atomic_dec_and_test(&pool->nr_running) &&
-	    !list_empty(&pool->worklist))
-		to_wakeup = first_idle_worker(pool);
-	return to_wakeup ? to_wakeup->task : NULL;
+	    !list_empty(&pool->worklist)) {
+		next = first_idle_worker(pool);
+		if (next)
+			wake_up_process(next->task);
+	}
+	spin_unlock_irq(&pool->lock);
 }
 
 /**
@@ -3367,10 +3363,48 @@ static int init_worker_pool(struct worker_pool *pool)
 	return 0;
 }
 
+#ifdef CONFIG_LOCKDEP
+static void wq_init_lockdep(struct workqueue_struct *wq)
+{
+	char *lock_name;
+
+	lockdep_register_key(&wq->key);
+	lock_name = kasprintf(GFP_KERNEL, "%s%s", "(wq_completion)", wq->name);
+	if (!lock_name)
+		lock_name = wq->name;
+	lockdep_init_map(&wq->lockdep_map, lock_name, &wq->key, 0);
+}
+
+static void wq_unregister_lockdep(struct workqueue_struct *wq)
+{
+	lockdep_unregister_key(&wq->key);
+}
+
+static void wq_free_lockdep(struct workqueue_struct *wq)
+{
+	if (wq->lock_name != wq->name)
+		kfree(wq->lock_name);
+}
+#else
+static void wq_init_lockdep(struct workqueue_struct *wq)
+{
+}
+
+static void wq_unregister_lockdep(struct workqueue_struct *wq)
+{
+}
+
+static void wq_free_lockdep(struct workqueue_struct *wq)
+{
+}
+#endif
+
 static void rcu_free_wq(struct rcu_head *rcu)
 {
 	struct workqueue_struct *wq =
 		container_of(rcu, struct workqueue_struct, rcu);
+
+	wq_free_lockdep(wq);
 
 	if (!(wq->flags & WQ_UNBOUND))
 		free_percpu(wq->cpu_pwqs);
@@ -3568,8 +3602,10 @@ static void pwq_unbound_release_workfn(struct work_struct *work)
 	 * If we're the last pwq going away, @wq is already dead and no one
 	 * is gonna access it anymore.  Schedule RCU free.
 	 */
-	if (is_last)
+	if (is_last) {
+		wq_unregister_lockdep(wq);
 		call_rcu_sched(&wq->rcu, rcu_free_wq);
+	}
 }
 
 /**
@@ -4110,11 +4146,9 @@ static int init_rescuer(struct workqueue_struct *wq)
 	return 0;
 }
 
-struct workqueue_struct *__alloc_workqueue_key(const char *fmt,
-					       unsigned int flags,
-					       int max_active,
-					       struct lock_class_key *key,
-					       const char *lock_name, ...)
+struct workqueue_struct *alloc_workqueue(const char *fmt,
+					 unsigned int flags,
+					 int max_active, ...)
 {
 	size_t tbl_size = 0;
 	va_list args;
@@ -4149,7 +4183,7 @@ struct workqueue_struct *__alloc_workqueue_key(const char *fmt,
 			goto err_free_wq;
 	}
 
-	va_start(args, lock_name);
+	va_start(args, max_active);
 	vsnprintf(wq->name, sizeof(wq->name), fmt, args);
 	va_end(args);
 
@@ -4166,7 +4200,7 @@ struct workqueue_struct *__alloc_workqueue_key(const char *fmt,
 	INIT_LIST_HEAD(&wq->flusher_overflow);
 	INIT_LIST_HEAD(&wq->maydays);
 
-	lockdep_init_map(&wq->lockdep_map, lock_name, key, 0);
+	wq_init_lockdep(wq);
 	INIT_LIST_HEAD(&wq->list);
 
 	if (alloc_and_link_pwqs(wq) < 0)
@@ -4204,7 +4238,7 @@ err_destroy:
 	destroy_workqueue(wq);
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(__alloc_workqueue_key);
+EXPORT_SYMBOL_GPL(alloc_workqueue);
 
 /**
  * destroy_workqueue - safely terminate a workqueue
@@ -4272,6 +4306,7 @@ void destroy_workqueue(struct workqueue_struct *wq)
 	mutex_unlock(&wq_pool_mutex);
 
 	if (!(wq->flags & WQ_UNBOUND)) {
+		wq_unregister_lockdep(wq);
 		/*
 		 * The base ref is never dropped on per-cpu pwqs.  Directly
 		 * schedule RCU free.
@@ -4845,7 +4880,7 @@ static void rebind_workers(struct worker_pool *pool)
 		 *
 		 * WRITE_ONCE() is necessary because @worker->flags may be
 		 * tested without holding any lock in
-		 * wq_worker_waking_up().  Without it, NOT_RUNNING test may
+		 * wq_worker_running().  Without it, NOT_RUNNING test may
 		 * fail incorrectly leading to premature concurrency
 		 * management operations.
 		 */

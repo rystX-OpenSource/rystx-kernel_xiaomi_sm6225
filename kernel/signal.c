@@ -43,8 +43,6 @@
 #include <linux/compiler.h>
 #include <linux/posix-timers.h>
 #include <linux/livepatch.h>
-#include <linux/oom.h>
-#include <linux/capability.h>
 #include <linux/cgroup.h>
 
 #define CREATE_TRACE_POINTS
@@ -1387,15 +1385,8 @@ int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p,
 	ret = check_kill_permission(sig, info, p);
 	rcu_read_unlock();
 
-	if (!ret && sig) {
-		check_panic_on_foreground_kill(p);
+	if (!ret && sig)
 		ret = do_send_sig_info(sig, info, p, type);
-		if (capable(CAP_KILL) && sig == SIGKILL) {
-			if (!strcmp(current->comm, ULMK_MAGIC))
-				add_to_oom_reaper(p);
-			ulmk_update_last_kill();
-		}
-	}
 
 	return ret;
 }
@@ -2508,22 +2499,22 @@ relock:
 		goto relock;
 	}
 
-	/* Has this task already been marked for death? */
-	if (signal_group_exit(signal)) {
-		ksig->info.si_signo = signr = SIGKILL;
-		sigdelset(&current->pending.signal, SIGKILL);
-		trace_signal_deliver(SIGKILL, SEND_SIG_NOINFO,
-				&sighand->action[SIGKILL - 1]);
-		recalc_sigpending();
-		current->jobctl &= ~JOBCTL_TRAP_FREEZE;
-		spin_unlock_irq(&sighand->siglock);
-		if (unlikely(cgroup_task_frozen(current)))
-			cgroup_leave_frozen(true);
-		goto fatal;
-	}
-
 	for (;;) {
 		struct k_sigaction *ka;
+
+		/* Has this task already been marked for death? */
+		if (signal_group_exit(signal)) {
+			ksig->info.si_signo = signr = SIGKILL;
+			sigdelset(&current->pending.signal, SIGKILL);
+			trace_signal_deliver(SIGKILL, SEND_SIG_NOINFO,
+					&sighand->action[SIGKILL - 1]);
+			recalc_sigpending();
+			current->jobctl &= ~JOBCTL_TRAP_FREEZE;
+			spin_unlock_irq(&sighand->siglock);
+			if (unlikely(cgroup_task_frozen(current)))
+				cgroup_leave_frozen(true);
+			goto fatal;
+		}
 
 		if (unlikely(current->jobctl & JOBCTL_STOP_PENDING) &&
 		    do_signal_stop(0))
@@ -3420,8 +3411,11 @@ static int copy_siginfo_from_user_any(siginfo_t *kinfo, siginfo_t __user *info)
 
 static struct pid *pidfd_to_pid(const struct file *file)
 {
-	if (file->f_op == &pidfd_fops)
-		return file->private_data;
+	struct pid *pid;
+
+	pid = pidfd_pid(file);
+	if (!IS_ERR(pid))
+		return pid;
 
 	return tgid_pidfd_to_pid(file);
 }

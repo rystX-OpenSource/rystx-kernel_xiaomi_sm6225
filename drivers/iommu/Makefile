@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 obj-$(CONFIG_IOMMU_API) += iommu.o
-obj-$(CONFIG_IOMMU_API) += iommu-traces.o
 obj-$(CONFIG_IOMMU_API) += iommu-sysfs.o
+obj-$(CONFIG_DEBUG_KERNEL) += iommu-traces.o
 obj-$(CONFIG_IOMMU_DEBUGFS) += iommu-debugfs.o
 obj-$(CONFIG_IOMMU_DMA) += dma-iommu.o
 obj-$(CONFIG_QCOM_LAZY_MAPPING) += msm_dma_iommu_mapping.o
@@ -12,12 +12,15 @@ obj-$(CONFIG_IOMMU_IOVA) += iova.o
 obj-$(CONFIG_MSM_TZ_SMMU) += io-pgtable-msm-secure.o
 obj-$(CONFIG_IOMMU_IO_PGTABLE_FAST) += io-pgtable-fast.o dma-mapping-fast.o
 obj-$(CONFIG_OF_IOMMU)	+= of_iommu.o
+ifdef CONFIG_DEBUG_KERNEL
 obj-$(CONFIG_IOMMU_DEBUG) += iommu-debug.o
+endif
 obj-$(CONFIG_MSM_IOMMU) += msm_iommu.o
 obj-$(CONFIG_AMD_IOMMU) += amd_iommu.o amd_iommu_init.o amd_iommu_quirks.o
 obj-$(CONFIG_AMD_IOMMU_DEBUGFS) += amd_iommu_debugfs.o
 obj-$(CONFIG_AMD_IOMMU_V2) += amd_iommu_v2.o
-obj-$(CONFIG_ARM_SMMU) += arm-smmu.o arm-smmu-debug.o
+obj-$(CONFIG_ARM_SMMU) += arm-smmu.o
+obj-$(CONFIG_DEBUG_KERNEL) += arm-smmu-debug.o
 obj-$(CONFIG_ARM_SMMU_V3) += arm-smmu-v3.o
 obj-$(CONFIG_DMAR_TABLE) += dmar.o
 obj-$(CONFIG_INTEL_IOMMU) += intel-iommu.o intel-pasid.o

@@ -23,19 +23,6 @@
 #include <asm/pgalloc.h>
 #include "internal.h"
 
-/* gross hack for <=4.19 stable */
-#if defined(CONFIG_S390) || defined(CONFIG_ARM)
-static void tlb_remove_table_smp_sync(void *arg)
-{
-        /* Simply deliver the interrupt */
-}
-
-static void tlb_remove_table_sync_one(void)
-{
-        smp_call_function(tlb_remove_table_smp_sync, NULL, 1);
-}
-#endif
-
 enum scan_result {
 	SCAN_FAIL,
 	SCAN_SUCCEED,
@@ -317,8 +304,6 @@ struct attribute_group khugepaged_attr_group = {
 };
 #endif /* CONFIG_SYSFS */
 
-#define VM_NO_KHUGEPAGED (VM_SPECIAL | VM_HUGETLB)
-
 int hugepage_madvise(struct vm_area_struct *vma,
 		     unsigned long *vm_flags, int advice)
 {
@@ -428,7 +413,7 @@ static bool hugepage_vma_check(struct vm_area_struct *vma,
 	}
 	if (!vma->anon_vma || vma->vm_ops)
 		return false;
-	if (is_vma_temporary_stack(vma))
+	if (vma_is_temporary_stack(vma))
 		return false;
 	return !(vm_flags & VM_NO_KHUGEPAGED);
 }
@@ -916,8 +901,6 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
 		.flags = FAULT_FLAG_ALLOW_RETRY,
 		.pmd = pmd,
 		.pgoff = linear_page_index(vma, address),
-		.vma_flags = vma->vm_flags,
-		.vma_page_prot = vma->vm_page_prot,
 	};
 
 	/* we only decide to swapin, if there is enough young ptes */
@@ -1042,7 +1025,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	if (mm_find_pmd(mm, address) != pmd)
 		goto out;
 
-	vm_write_begin(vma);
 	anon_vma_lock_write(vma->anon_vma);
 
 	pte = pte_offset_map(pmd, address);
@@ -1061,7 +1043,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	_pmd = pmdp_collapse_flush(vma, address, pmd);
 	spin_unlock(pmd_ptl);
 	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
-	tlb_remove_table_sync_one();
 
 	spin_lock(pte_ptl);
 	isolated = __collapse_huge_page_isolate(vma, address, pte);
@@ -1079,7 +1060,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 		pmd_populate(mm, pmd, pmd_pgtable(_pmd));
 		spin_unlock(pmd_ptl);
 		anon_vma_unlock_write(vma->anon_vma);
-		vm_write_end(vma);
 		result = SCAN_FAIL;
 		goto out;
 	}
@@ -1114,7 +1094,6 @@ static void collapse_huge_page(struct mm_struct *mm,
 	set_pmd_at(mm, address, pmd, _pmd);
 	update_mmu_cache_pmd(vma, address, pmd);
 	spin_unlock(pmd_ptl);
-	vm_write_end(vma);
 
 	*hpage = NULL;
 
@@ -1320,7 +1299,6 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 				spin_unlock(ptl);
 				vm_write_end(vma);
 				mm_dec_nr_ptes(mm);
-				tlb_remove_table_sync_one();
 				pte_free(mm, pmd_pgtable(_pmd));
 				mmu_notifier_invalidate_range_end(mm, addr,
 								  end);

@@ -23,6 +23,7 @@
 #include <linux/kthread.h>
 #include <linux/mailbox_client.h>
 #include <linux/ipc_logging.h>
+#include <linux/suspend.h>
 #include <soc/qcom/subsystem_notif.h>
 
 #include "rpmsg_internal.h"
@@ -63,6 +64,8 @@ do {									     \
 
 #define RPM_GLINK_CID_MIN	1
 #define RPM_GLINK_CID_MAX	65536
+
+static int should_wake;
 
 struct glink_msg {
 	__le16 cmd;
@@ -1262,6 +1265,11 @@ static irqreturn_t qcom_glink_native_intr(int irq, void *data)
 	unsigned int cmd;
 	int ret = 0;
 
+	if (should_wake) {
+		pr_info("%s: %d triggered %s\n", __func__, irq, glink->irqname);
+		should_wake = false;
+		pm_system_wakeup();
+	}
 	/* To wakeup any blocking writers */
 	wake_up_all(&glink->tx_avail_notify);
 
@@ -2137,18 +2145,20 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 
 	glink->irq = irq;
 
-	size = of_property_count_u32_elems(dev->of_node, "cpu-affinity");
-	if (size > 0) {
-		arr = kmalloc_array(size, sizeof(u32), GFP_KERNEL);
-		if (!arr) {
-			ret = -ENOMEM;
-			goto unregister;
+	if (!IS_ENABLED(CONFIG_IRQ_SBALANCE)) {
+		size = of_property_count_u32_elems(dev->of_node, "cpu-affinity");
+		if (size > 0) {
+			arr = kmalloc_array(size, sizeof(u32), GFP_KERNEL);
+			if (!arr) {
+				ret = -ENOMEM;
+				goto unregister;
+			}
+			ret = of_property_read_u32_array(dev->of_node, "cpu-affinity",
+							 arr, size);
+			if (!ret)
+				qcom_glink_set_affinity(glink, arr, size);
+			kfree(arr);
 		}
-		ret = of_property_read_u32_array(dev->of_node, "cpu-affinity",
-						 arr, size);
-		if (!ret)
-			qcom_glink_set_affinity(glink, arr, size);
-		kfree(arr);
 	}
 
 	ret = qcom_glink_send_version(glink);
@@ -2224,6 +2234,26 @@ void qcom_glink_native_unregister(struct qcom_glink *glink)
 	device_unregister(glink->dev);
 }
 EXPORT_SYMBOL_GPL(qcom_glink_native_unregister);
+
+static int qcom_glink_suspend_no_irq(struct device *dev)
+{
+	should_wake = true;
+
+	return 0;
+}
+
+static int qcom_glink_resume_no_irq(struct device *dev)
+{
+	should_wake = false;
+
+	return 0;
+}
+
+const struct dev_pm_ops glink_native_pm_ops = {
+	.suspend_noirq = qcom_glink_suspend_no_irq,
+	.resume_noirq = qcom_glink_resume_no_irq,
+};
+EXPORT_SYMBOL(glink_native_pm_ops);
 
 MODULE_DESCRIPTION("Qualcomm GLINK driver");
 MODULE_LICENSE("GPL v2");

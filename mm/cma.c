@@ -18,6 +18,11 @@
 
 #define pr_fmt(fmt) "cma: " fmt
 
+#ifdef CONFIG_CMA_DEBUG
+#ifndef DEBUG
+#  define DEBUG
+#endif
+#endif
 #define CREATE_TRACE_POINTS
 
 #include <linux/memblock.h>
@@ -31,8 +36,9 @@
 #include <linux/highmem.h>
 #include <linux/io.h>
 #include <linux/kmemleak.h>
-#include <linux/delay.h>
 #include <linux/show_mem_notifier.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
 #include <trace/events/cma.h>
 
 #include "cma.h"
@@ -85,7 +91,7 @@ static unsigned long cma_bitmap_pages_to_bits(const struct cma *cma,
 }
 
 static void cma_clear_bitmap(struct cma *cma, unsigned long pfn,
-			     unsigned int count)
+			     unsigned long count)
 {
 	unsigned long bitmap_no, bitmap_count;
 
@@ -440,33 +446,37 @@ static inline void cma_debug_show_areas(struct cma *cma) { }
 #endif
 
 /**
- * cma_alloc() - allocate pages from contiguous area
+ * __cma_alloc() - allocate pages from contiguous area
  * @cma:   Contiguous memory region for which the allocation is performed.
  * @count: Requested number of pages.
  * @align: Requested alignment of pages (in PAGE_SIZE order).
- * @no_warn: Avoid printing message about failed allocation
+ * @gfp_mask: GFP mask to use during the cma allocation.
  *
- * This function allocates part of contiguous memory on specific
- * contiguous memory area.
+ * This function is same with cma_alloc but supports gfp_mask.
+ * Currently, the gfp_mask supports only __GFP_NOWARN and __GFP_NORETRY.
+ * If user passes other flags, it fails the allocation.
  */
-struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
-		       bool no_warn)
+struct page *__cma_alloc(struct cma *cma, unsigned long count,
+		       unsigned int align, gfp_t gfp_mask)
 {
 	unsigned long mask, offset;
 	unsigned long pfn = -1;
 	unsigned long start = 0;
 	unsigned long bitmap_maxno, bitmap_no, bitmap_count;
-	size_t i;
+	unsigned long i;
 	struct page *page = NULL;
 	int ret = -ENOMEM;
-	int retry_after_sleep = 0;
-	int max_retries = 20;
-	int available_regions = 0;
+	int num_attempts = 0;
+	int max_retries = 5;
 
-	if (!cma || !cma->count)
+	if (WARN_ON_ONCE((gfp_mask & GFP_KERNEL) == 0 ||
+		(gfp_mask & ~(GFP_KERNEL|__GFP_NOWARN|__GFP_NORETRY)) != 0))
 		return NULL;
 
-	pr_debug("%s(cma %p, count %zu, align %d)\n", __func__, (void *)cma,
+	if (!cma || !cma->count || !cma->bitmap)
+		return NULL;
+
+	pr_debug("%s(cma %p, count %lu, align %d)\n", __func__, (void *)cma,
 		 count, align);
 
 	if (!count)
@@ -488,35 +498,30 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 				bitmap_maxno, start, bitmap_count, mask,
 				offset);
 		if (bitmap_no >= bitmap_maxno) {
-			if ((retry_after_sleep < max_retries) &&
-						(ret == -EBUSY)) {
-				start = 0;
-				/*
-				 * update max retries if available free regions
-				 * are less.
-				 */
-				if (available_regions < 3)
-					max_retries = 25;
-				available_regions = 0;
+			if ((num_attempts < max_retries) && (ret == -EBUSY)) {
+				mutex_unlock(&cma->lock);
+
+				if (fatal_signal_pending(current) ||
+				    (gfp_mask & __GFP_NORETRY))
+					break;
+
 				/*
 				 * Page may be momentarily pinned by some other
-				 * process which has been scheduled out, eg.
+				 * process which has been scheduled out, e.g.
 				 * in exit path, during unmap call, or process
 				 * fork and so cannot be freed there. Sleep
-				 * for 100ms and retry twice to see if it has
-				 * been freed later.
+				 * for 100ms and retry the allocation.
 				 */
-				mutex_unlock(&cma->lock);
-				msleep(100);
-				retry_after_sleep++;
+				start = 0;
+				ret = -ENOMEM;
+				schedule_timeout_killable(msecs_to_jiffies(100));
+				num_attempts++;
 				continue;
 			} else {
 				mutex_unlock(&cma->lock);
 				break;
 			}
 		}
-
-		available_regions++;
 		bitmap_set(cma->bitmap, bitmap_no, bitmap_count);
 		/*
 		 * It's safe to drop the lock here. We've marked this region for
@@ -527,8 +532,7 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 
 		pfn = cma->base_pfn + (bitmap_no << cma->order_per_bit);
 		mutex_lock(&cma_mutex);
-		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA,
-				     GFP_KERNEL | (no_warn ? __GFP_NOWARN : 0));
+		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA, gfp_mask);
 		mutex_unlock(&cma_mutex);
 		if (ret == 0) {
 			page = pfn_to_page(pfn);
@@ -559,14 +563,32 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 			page_kasan_tag_reset(nth_page(page, i));
 	}
 
-	if (ret && !no_warn) {
-		pr_err("%s: %s: alloc failed, req-size: %zu pages, ret: %d\n",
-			__func__, cma->name, count, ret);
+	if (ret && !(gfp_mask & __GFP_NOWARN)) {
+		pr_err("%s: alloc failed, req-size: %lu pages, ret: %d\n",
+			__func__, count, ret);
 		cma_debug_show_areas(cma);
 	}
 
 	pr_debug("%s(): returned %p\n", __func__, page);
 	return page;
+}
+EXPORT_SYMBOL_GPL(__cma_alloc);
+
+/**
+ * cma_alloc() - allocate pages from contiguous area
+ * @cma:   Contiguous memory region for which the allocation is performed.
+ * @count: Requested number of pages.
+ * @align: Requested alignment of pages (in PAGE_SIZE order).
+ * @no_warn: Avoid printing message about failed allocation
+ *
+ * This function allocates part of contiguous memory on specific
+ * contiguous memory area.
+ */
+struct page *cma_alloc(struct cma *cma, unsigned long count,
+		       unsigned int align, bool no_warn)
+{
+	return __cma_alloc(cma, count, align, GFP_KERNEL |
+				(no_warn ? __GFP_NOWARN : 0));
 }
 EXPORT_SYMBOL_GPL(cma_alloc);
 
@@ -580,7 +602,8 @@ EXPORT_SYMBOL_GPL(cma_alloc);
  * It returns false when provided pages do not belong to contiguous area and
  * true otherwise.
  */
-bool cma_release(struct cma *cma, const struct page *pages, unsigned int count)
+bool cma_release(struct cma *cma, const struct page *pages,
+		 unsigned long count)
 {
 	unsigned long pfn;
 

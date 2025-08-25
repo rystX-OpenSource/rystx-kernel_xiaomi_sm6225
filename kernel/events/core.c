@@ -4032,8 +4032,8 @@ int perf_event_read_local(struct perf_event *event, u64 *value,
 {
 	unsigned long flags;
 	int ret = 0;
-	int local_cpu = smp_processor_id();
-	bool readable = cpumask_test_cpu(local_cpu, &event->readable_on_cpus);
+	int local_cpu;
+	bool readable;
 	/*
 	 * Disabling interrupts avoids all counter scheduling (context
 	 * switches, timer based rotation and IPIs).
@@ -4057,6 +4057,8 @@ int perf_event_read_local(struct perf_event *event, u64 *value,
 	}
 
 	/* If this is a per-CPU event, it must be for this CPU */
+	local_cpu = raw_smp_processor_id();
+	readable = cpumask_test_cpu(local_cpu, &event->readable_on_cpus);
 	if (!(event->attach_state & PERF_ATTACH_TASK) &&
 	    event->cpu != local_cpu &&
 	    !readable) {
@@ -4124,8 +4126,7 @@ static int perf_event_read(struct perf_event *event, bool group)
 			preempt_enable();
 			return 0;
 		}
-		if (cpu_isolated(event_cpu) ||
-			(event->attr.exclude_idle &&
+		if ((event->attr.exclude_idle &&
 				per_cpu(is_idle, event_cpu) && !readable) ||
 				per_cpu(is_hotplugging, event_cpu))
 			active_event_skip_read = true;
@@ -7974,13 +7975,12 @@ static void perf_event_switch(struct task_struct *task,
 		},
 	};
 
-	if (!sched_in && task->state == TASK_RUNNING)
+	if (!sched_in && task_is_runnable(task)) {
 		switch_event.event_id.header.misc |=
 				PERF_RECORD_MISC_SWITCH_OUT_PREEMPT;
+	}
 
-	perf_iterate_sb(perf_event_switch_output,
-		       &switch_event,
-		       NULL);
+	perf_iterate_sb(perf_event_switch_output, &switch_event, NULL);
 }
 
 /*

@@ -16,10 +16,9 @@ extern char __cpuidle_text_start[], __cpuidle_text_end[];
  * sched_idle_set_state - Record idle state for the current CPU.
  * @idle_state: State to record.
  */
-void sched_idle_set_state(struct cpuidle_state *idle_state, int index)
+void sched_idle_set_state(struct cpuidle_state *idle_state)
 {
 	idle_set_state(this_rq(), idle_state);
-	idle_set_state_idx(this_rq(), index);
 }
 
 static int __read_mostly cpu_idle_force_poll;
@@ -60,8 +59,7 @@ static noinline int __cpuidle cpu_idle_poll(void)
 	local_irq_enable();
 
 	while (!tif_need_resched() &&
-	       (cpu_idle_force_poll || tick_check_broadcast_expired() ||
-		is_reserved(smp_processor_id())))
+	       (cpu_idle_force_poll || tick_check_broadcast_expired()))
 		cpu_relax();
 
 	rcu_idle_exit();
@@ -161,7 +159,7 @@ static void cpuidle_idle_call(void)
 	/*
 	 * Suspend-to-idle ("s2idle") is a system state in which all user space
 	 * has been frozen, all I/O devices have been suspended and the only
-	 * activity happens here and in iterrupts (if any).  In that case bypass
+	 * activity happens here and in interrupts (if any). In that case bypass
 	 * the cpuidle governor and go stratight for the deepest idle state
 	 * available.  Possibly also suspend the local tick and the entire
 	 * timekeeping to prevent timer interrupts from kicking us out of idle
@@ -220,6 +218,12 @@ exit_idle:
 static void do_idle(void)
 {
 	int cpu = smp_processor_id();
+
+	/*
+	 * Check if we need to update blocked load
+	 */
+	nohz_run_idle_balance(cpu);
+
 	/*
 	 * If the arch has a polling bit, we maintain an invariant:
 	 *
@@ -234,8 +238,6 @@ static void do_idle(void)
 
 	while (!need_resched()) {
 		check_pgt_cache();
-		rmb();
-
 		local_irq_disable();
 
 		if (cpu_is_offline(cpu)) {
@@ -252,8 +254,7 @@ static void do_idle(void)
 		 * broadcast device expired for us, we don't want to go deep
 		 * idle as we know that the IPI is going to arrive right away.
 		 */
-		if (cpu_idle_force_poll || tick_check_broadcast_expired() ||
-				is_reserved(smp_processor_id())) {
+		if (cpu_idle_force_poll || tick_check_broadcast_expired()) {
 			tick_nohz_idle_restart_tick();
 			cpu_idle_poll();
 		} else {
@@ -280,6 +281,11 @@ static void do_idle(void)
 	 */
 	smp_mb__after_atomic();
 
+	/*
+	 * RCU relies on this call to be done outside of an RCU read-side
+	 * critical section.
+	 */
+	flush_smp_call_function_from_idle();
 	sched_ttwu_pending();
 	schedule_idle();
 
@@ -372,10 +378,20 @@ void cpu_startup_entry(enum cpuhp_state state)
 
 #ifdef CONFIG_SMP
 static int
+#ifdef CONFIG_SCHED_WALT
 select_task_rq_idle(struct task_struct *p, int cpu, int sd_flag, int flags,
 		    int sibling_count_hint)
+#else
+select_task_rq_idle(struct task_struct *p, int cpu, int sd_flag, int flags)
+#endif
 {
 	return task_cpu(p); /* IDLE tasks as never migrated */
+}
+
+static int
+balance_idle(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	return WARN_ON_ONCE(1);
 }
 #endif
 
@@ -387,31 +403,44 @@ static void check_preempt_curr_idle(struct rq *rq, struct task_struct *p, int fl
 	resched_curr(rq);
 }
 
-static struct task_struct *
-pick_next_task_idle(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+static void put_prev_task_idle(struct rq *rq, struct task_struct *prev)
 {
-	put_prev_task(rq, prev);
+}
+
+static void set_next_task_idle(struct rq *rq, struct task_struct *next, bool first)
+{
 	update_idle_core(rq);
 	schedstat_inc(rq->sched_goidle);
+}
 
+#ifdef CONFIG_SMP
+static struct task_struct *pick_task_idle(struct rq *rq)
+{
 	return rq->idle;
+}
+#endif
+
+struct task_struct *pick_next_task_idle(struct rq *rq)
+{
+	struct task_struct *next = rq->idle;
+
+	set_next_task_idle(rq, next, true);
+
+	return next;
 }
 
 /*
  * It is not legal to sleep in the idle task - print a warning
  * message if some code attempts to do it:
  */
-static void
+static bool
 dequeue_task_idle(struct rq *rq, struct task_struct *p, int flags)
 {
 	raw_spin_unlock_irq(&rq->lock);
 	printk(KERN_ERR "bad: scheduling from the idle thread!\n");
 	dump_stack();
 	raw_spin_lock_irq(&rq->lock);
-}
-
-static void put_prev_task_idle(struct rq *rq, struct task_struct *prev)
-{
+	return true;
 }
 
 /*
@@ -423,10 +452,6 @@ static void put_prev_task_idle(struct rq *rq, struct task_struct *prev)
  * parameters.
  */
 static void task_tick_idle(struct rq *rq, struct task_struct *curr, int queued)
-{
-}
-
-static void set_curr_task_idle(struct rq *rq)
 {
 }
 
@@ -464,13 +489,15 @@ const struct sched_class idle_sched_class = {
 
 	.pick_next_task		= pick_next_task_idle,
 	.put_prev_task		= put_prev_task_idle,
+	.set_next_task          = set_next_task_idle,
 
 #ifdef CONFIG_SMP
+	.balance		= balance_idle,
+	.pick_task		= pick_task_idle,
 	.select_task_rq		= select_task_rq_idle,
 	.set_cpus_allowed	= set_cpus_allowed_common,
 #endif
 
-	.set_curr_task          = set_curr_task_idle,
 	.task_tick		= task_tick_idle,
 
 	.get_rr_interval	= get_rr_interval_idle,

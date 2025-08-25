@@ -800,10 +800,8 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	buf[len] = '\0';
-	if (!copy_from_iter_full(buf, len, from)) {
-		kfree(buf);
+	if (!copy_from_iter_full(buf, len, from))
 		return -EFAULT;
-	}
 
 	/*
 	 * Extract and skip the syslog prefix <[0-9]*>. Coming from userspace
@@ -827,6 +825,9 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 			endp++;
 			len -= endp - line;
 			line = endp;
+			if (strstr(line, "healthd") ||
+				strncmp(line, "logd: Skipping", sizeof("logd: Skipping")))
+				return ret;
 		}
 	}
 
@@ -2210,7 +2211,7 @@ int add_preferred_console(char *name, int idx, char *options)
 	return __add_preferred_console(name, idx, options, NULL);
 }
 
-bool console_suspend_enabled = true;
+bool console_suspend_enabled = false;
 EXPORT_SYMBOL(console_suspend_enabled);
 
 static int __init console_suspend_disable(char *str)

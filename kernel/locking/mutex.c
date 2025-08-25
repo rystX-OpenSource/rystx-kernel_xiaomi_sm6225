@@ -28,7 +28,6 @@
 #include <linux/interrupt.h>
 #include <linux/debug_locks.h>
 #include <linux/osq_lock.h>
-#include <linux/delay.h>
 
 #ifdef CONFIG_DEBUG_MUTEXES
 # include "mutex-debug.h"
@@ -65,10 +64,36 @@ EXPORT_SYMBOL(__mutex_init);
 
 #define MUTEX_FLAGS		0x07
 
+/*
+ * Internal helper function; C doesn't allow us to hide it :/
+ *
+ * DO NOT USE (outside of mutex code).
+ */
+static inline struct task_struct *__mutex_owner(struct mutex *lock)
+{
+	return (struct task_struct *)(atomic_long_read(&lock->owner) & ~MUTEX_FLAGS);
+}
+
 static inline struct task_struct *__owner_task(unsigned long owner)
 {
 	return (struct task_struct *)(owner & ~MUTEX_FLAGS);
 }
+
+bool mutex_is_locked(struct mutex *lock)
+{
+	return __mutex_owner(lock) != NULL;
+}
+EXPORT_SYMBOL(mutex_is_locked);
+
+__must_check enum mutex_trylock_recursive_enum
+mutex_trylock_recursive(struct mutex *lock)
+{
+	if (unlikely(__mutex_owner(lock) == current))
+		return MUTEX_TRYLOCK_RECURSIVE;
+
+	return mutex_trylock(lock);
+}
+EXPORT_SYMBOL(mutex_trylock_recursive);
 
 static inline unsigned long __owner_flags(unsigned long owner)
 {
@@ -536,21 +561,31 @@ bool mutex_spin_on_owner(struct mutex *lock, struct task_struct *owner,
 {
 	bool ret = true;
 
-	rcu_read_lock();
-	while (__mutex_owner(lock) == owner) {
+	for (;;) {
+		unsigned int cpu;
+		bool same_owner;
+
 		/*
-		 * Ensure we emit the owner->on_cpu, dereference _after_
-		 * checking lock->owner still matches owner. If that fails,
+		 * Ensure lock->owner still matches owner. If that fails,
 		 * owner might point to freed memory. If it still matches,
 		 * the rcu_read_lock() ensures the memory stays valid.
 		 */
-		barrier();
+		rcu_read_lock();
+		same_owner = __mutex_owner(lock) == owner;
+		if (same_owner) {
+			ret = owner->on_cpu;
+			if (ret)
+				cpu = task_cpu(owner);
+		}
+		rcu_read_unlock();
+
+		if (!ret || !same_owner)
+			break;
 
 		/*
 		 * Use vcpu_is_preempted to detect lock holder preemption issue.
 		 */
-		if (!owner->on_cpu || need_resched() ||
-				vcpu_is_preempted(task_cpu(owner))) {
+		if (need_resched() || vcpu_is_preempted(cpu)) {
 			ret = false;
 			break;
 		}
@@ -562,7 +597,6 @@ bool mutex_spin_on_owner(struct mutex *lock, struct task_struct *owner,
 
 		cpu_relax();
 	}
-	rcu_read_unlock();
 
 	return ret;
 }
@@ -664,17 +698,6 @@ mutex_optimistic_spin(struct mutex *lock, struct ww_acquire_ctx *ww_ctx,
 		 * values at the cost of a few extra spins.
 		 */
 		cpu_relax();
-
-		/*
-		 * On arm systems, we must slow down the waiter's repeated
-		 * aquisition of spin_mlock and atomics on the lock count, or
-		 * we risk starving out a thread attempting to release the
-		 * mutex. The mutex slowpath release must take spin lock
-		 * wait_lock. This spin lock can share a monitor with the
-		 * other waiter atomics in the mutex data structure, so must
-		 * take care to rate limit the waiters.
-		 */
-		udelay(1);
 	}
 
 	if (!waiter)
@@ -931,6 +954,10 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 
 	might_sleep();
 
+#ifdef CONFIG_DEBUG_MUTEXES
+	DEBUG_LOCKS_WARN_ON(lock->magic != lock);
+#endif
+
 	ww = container_of(lock, struct ww_mutex, base);
 	if (ww_ctx) {
 		if (unlikely(ww_ctx == READ_ONCE(ww->ctx)))
@@ -1013,7 +1040,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 		 * wait_lock. This ensures the lock cancellation is ordered
 		 * against mutex_unlock() and wake-ups do not go missing.
 		 */
-		if (unlikely(signal_pending_state(state, current))) {
+		if (signal_pending_state(state, current)) {
 			ret = -EINTR;
 			goto err;
 		}
@@ -1396,8 +1423,13 @@ __ww_mutex_lock_interruptible_slowpath(struct ww_mutex *lock,
  */
 int __sched mutex_trylock(struct mutex *lock)
 {
-	bool locked = __mutex_trylock(lock);
+	bool locked;
 
+#ifdef CONFIG_DEBUG_MUTEXES
+	DEBUG_LOCKS_WARN_ON(lock->magic != lock);
+#endif
+
+	locked = __mutex_trylock(lock);
 	if (locked)
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
 

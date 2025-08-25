@@ -12,7 +12,6 @@
 #include <linux/interrupt.h>
 #include <linux/ratelimit.h>
 #include <linux/irq.h>
-#include <linux/cpumask.h>
 
 #include "internals.h"
 
@@ -58,7 +57,6 @@ static bool migrate_one_irq(struct irq_desc *desc)
 	const struct cpumask *affinity;
 	bool brokeaff = false;
 	int err;
-	struct cpumask available_cpus;
 
 	/*
 	 * IRQ chip might be already torn down, but the irq descriptor is
@@ -69,6 +67,9 @@ static bool migrate_one_irq(struct irq_desc *desc)
 		pr_debug("IRQ %u: Unable to migrate away\n", d->irq);
 		return false;
 	}
+
+	if (irqd_has_set(d, IRQD_PERF_CRITICAL))
+		return false;
 
 	/*
 	 * Complete an eventually pending irq move cleanup. If this
@@ -111,10 +112,6 @@ static bool migrate_one_irq(struct irq_desc *desc)
 	if (maskchip && chip->irq_mask)
 		chip->irq_mask(d);
 
-	cpumask_copy(&available_cpus, affinity);
-	cpumask_andnot(&available_cpus, &available_cpus, cpu_isolated_mask);
-	affinity = &available_cpus;
-
 	if (cpumask_any_and(affinity, cpu_online_mask) >= nr_cpu_ids) {
 		const struct cpumask *default_affinity;
 
@@ -129,41 +126,16 @@ static bool migrate_one_irq(struct irq_desc *desc)
 		}
 
 		default_affinity = desc->affinity_hint ? : irq_default_affinity;
-		/*
-		 * The order of preference for selecting a fallback CPU is
-		 *
-		 * (1) online and un-isolated CPU from default affinity
-		 * (2) online and un-isolated CPU
-		 * (3) online CPU
-		 */
-		cpumask_andnot(&available_cpus, cpu_online_mask,
-							cpu_isolated_mask);
-		if (cpumask_intersects(&available_cpus, default_affinity))
-			cpumask_and(&available_cpus, &available_cpus,
-							default_affinity);
-		else if (cpumask_empty(&available_cpus))
-			affinity = cpu_online_mask;
-
-		/*
-		 * We are overriding the affinity with all online and
-		 * un-isolated cpus. irq_set_affinity_locked() call
-		 * below notify this mask to PM QOS affinity listener.
-		 * That results in applying the CPU_DMA_LATENCY QOS
-		 * to all the CPUs specified in the mask. But the low
-		 * level irqchip driver sets the affinity of an irq
-		 * to only one CPU. So pick only one CPU from the
-		 * prepared mask while overriding the user affinity.
-		 */
-		affinity = cpumask_of(cpumask_any(affinity));
+		affinity = cpu_online_mask;
 		brokeaff = true;
 	}
 	/*
-	 * Do not set the force argument of irq_set_affinity_locked() as this
+	 * Do not set the force argument of irq_do_set_affinity() as this
 	 * disables the masking of offline CPUs from the supplied affinity
 	 * mask and therefore might keep/reassign the irq to the outgoing
 	 * CPU.
 	 */
-	err = irq_set_affinity_locked(d, affinity, false);
+	err = irq_do_set_affinity(d, affinity, false);
 	if (err) {
 		pr_warn_ratelimited("IRQ%u: set affinity failed(%d).\n",
 				    d->irq, err);
@@ -200,16 +172,22 @@ void irq_migrate_all_off_this_cpu(void)
 		raw_spin_unlock(&desc->lock);
 
 		if (affinity_broken) {
-			pr_info_ratelimited("IRQ %u: no longer affine to CPU%u\n",
+			pr_debug_ratelimited("IRQ %u: no longer affine to CPU%u\n",
 					    irq, smp_processor_id());
 		}
 	}
+
+	if (!cpumask_test_cpu(smp_processor_id(), cpu_lp_mask))
+		reaffine_perf_irqs(true);
 }
 
 static void irq_restore_affinity_of_irq(struct irq_desc *desc, unsigned int cpu)
 {
 	struct irq_data *data = irq_desc_get_irq_data(desc);
 	const struct cpumask *affinity = irq_data_get_affinity_mask(data);
+
+	if (irqd_has_set(data, IRQD_PERF_CRITICAL))
+		return;
 
 	if (!irqd_affinity_is_managed(data) || !desc->action ||
 	    !irq_data_get_irq_chip(data) || !cpumask_test_cpu(cpu, affinity))
@@ -246,6 +224,9 @@ int irq_affinity_online_cpu(unsigned int cpu)
 		raw_spin_unlock_irq(&desc->lock);
 	}
 	irq_unlock_sparse();
+
+	if (!cpumask_test_cpu(cpu, cpu_lp_mask))
+		reaffine_perf_irqs(true);
 
 	return 0;
 }

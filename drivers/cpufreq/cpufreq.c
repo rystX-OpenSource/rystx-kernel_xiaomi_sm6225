@@ -168,6 +168,13 @@ __weak void arch_set_max_freq_scale(struct cpumask *cpus,
 }
 EXPORT_SYMBOL_GPL(arch_set_max_freq_scale);
 
+__weak void arch_set_min_freq_scale(const struct cpumask *cpus,
+				    unsigned long min_freq,
+				    unsigned long max_freq)
+{
+}
+EXPORT_SYMBOL_GPL(arch_set_min_freq_scale);
+
 /*
  * This is a generic cpufreq init() routine which can be used by cpufreq
  * drivers of SMP systems. It will do following:
@@ -534,21 +541,11 @@ unsigned int cpufreq_policy_transition_delay_us(struct cpufreq_policy *policy)
 		return policy->transition_delay_us;
 
 	latency = policy->cpuinfo.transition_latency / NSEC_PER_USEC;
-	if (latency) {
-		/*
-		 * For platforms that can change the frequency very fast (< 10
-		 * us), the above formula gives a decent transition delay. But
-		 * for platforms where transition_latency is in milliseconds, it
-		 * ends up giving unrealistic values.
-		 *
-		 * Cap the default transition delay to 10 ms, which seems to be
-		 * a reasonable amount of time after which we should reevaluate
-		 * the frequency.
-		 */
-		return min(latency * LATENCY_MULTIPLIER, (unsigned int)10000);
-	}
+	if (latency)
+		/* Give a 50% breathing room between updates */
+		return latency + (latency >> 1);
 
-	return LATENCY_MULTIPLIER;
+	return USEC_PER_MSEC;
 }
 EXPORT_SYMBOL_GPL(cpufreq_policy_transition_delay_us);
 
@@ -659,34 +656,10 @@ static ssize_t show_##file_name				\
 }
 
 show_one(cpuinfo_min_freq, cpuinfo.min_freq);
+show_one(cpuinfo_max_freq, cpuinfo.max_freq);
 show_one(cpuinfo_transition_latency, cpuinfo.transition_latency);
 show_one(scaling_min_freq, min);
 show_one(scaling_max_freq, max);
-
-unsigned int cpuinfo_max_freq_cached;
-
-static bool should_use_cached_freq(int cpu)
-{
-	if (!cpuinfo_max_freq_cached)
-		return false;
-
-	if (!(BIT(cpu) & sched_lib_mask_force))
-		return false;
-
-	return is_sched_lib_based_app(current->pid);
-}
-
-static ssize_t show_cpuinfo_max_freq(struct cpufreq_policy *policy, char *buf)
-{
-	unsigned int freq = policy->cpuinfo.max_freq;
-
-	if (should_use_cached_freq(policy->cpu))
-		freq = cpuinfo_max_freq_cached << 1;
-	else
-		freq = policy->cpuinfo.max_freq;
-
-	return scnprintf(buf, PAGE_SIZE, "%u\n", freq);
-}
 
 __weak unsigned int arch_freq_get_on_cpu(int cpu)
 {
@@ -1750,6 +1723,18 @@ void cpufreq_resume(void)
 }
 
 /**
+ * cpufreq_driver_test_flags - Test cpufreq driver's flags against given ones.
+ * @flags: Flags to test against the current cpufreq driver's flags.
+ *
+ * Assumes that the driver is there, so callers must ensure that this is the
+ * case.
+ */
+bool cpufreq_driver_test_flags(u16 flags)
+{
+	return !!(cpufreq_driver->flags & flags);
+}
+
+/**
  *	cpufreq_get_current_driver - return current driver's name
  *
  *	Return the name string of the currently loaded cpufreq driver
@@ -2013,6 +1998,10 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 
 	pr_debug("target for CPU %u: %u kHz, relation %u, requested %u kHz\n",
 		 policy->cpu, target_freq, relation, old_target_freq);
+
+	if (target_freq == policy->cur &&
+	    !(cpufreq_driver->flags & CPUFREQ_NEED_UPDATE_LIMITS))
+		return 0;
 
 	/* Save last value to restore later on errors */
 	policy->restore_freq = policy->cur;
@@ -2287,6 +2276,8 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	trace_cpu_frequency_limits(policy);
 
 	arch_set_max_freq_scale(policy->cpus, policy->max);
+	arch_set_min_freq_scale(policy->related_cpus, policy->min,
+				policy->cpuinfo.max_freq);
 
 	policy->cached_target_freq = UINT_MAX;
 
@@ -2564,8 +2555,7 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 	if (ret)
 		goto err_boost_unreg;
 
-	if (!(cpufreq_driver->flags & CPUFREQ_STICKY) &&
-	    list_empty(&cpufreq_policy_list)) {
+	if (unlikely(list_empty(&cpufreq_policy_list))) {
 		/* if all ->init() calls failed, unregister */
 		ret = -ENODEV;
 		pr_debug("%s: No CPU initialized for driver %s\n", __func__,

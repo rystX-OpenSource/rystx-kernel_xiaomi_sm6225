@@ -137,6 +137,8 @@ static __always_inline void csd_unlock(struct __call_single_data *csd)
 
 static DEFINE_PER_CPU_SHARED_ALIGNED(call_single_data_t, csd_data);
 
+extern void send_call_function_single_ipi(int cpu);
+
 /*
  * Insert a previously allocated call_single_data_t element
  * for execution on the given CPU. data must already have
@@ -180,7 +182,7 @@ static int generic_exec_single(int cpu, struct __call_single_data *csd,
 	 * equipped to do the right thing...
 	 */
 	if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
-		arch_send_call_function_single_ipi(cpu);
+		send_call_function_single_ipi(cpu);
 
 	return 0;
 }
@@ -259,6 +261,18 @@ static void flush_smp_call_function_queue(bool warn_cpu_offline)
 	 * for them.
 	 */
 	irq_work_run();
+}
+
+void flush_smp_call_function_from_idle(void)
+{
+	unsigned long flags;
+
+	if (llist_empty(this_cpu_ptr(&call_single_queue)))
+		return;
+
+	local_irq_save(flags);
+	flush_smp_call_function_queue(true);
+	local_irq_restore(flags);
 }
 
 /*
@@ -528,6 +542,7 @@ static int __init nosmp(char *str)
 
 early_param("nosmp", nosmp);
 
+#if NR_CPUS > BITS_PER_LONG
 /* this is hard limit */
 static int __init nrcpus(char *str)
 {
@@ -541,6 +556,7 @@ static int __init nrcpus(char *str)
 }
 
 early_param("nr_cpus", nrcpus);
+#endif
 
 static int __init maxcpus(char *str)
 {
@@ -566,14 +582,18 @@ static int __init boot_cpus(char *str)
 
 early_param("boot_cpus", boot_cpus);
 
+#if NR_CPUS > BITS_PER_LONG
 /* Setup number of possible processor ids */
 unsigned int nr_cpu_ids __read_mostly = NR_CPUS;
 EXPORT_SYMBOL(nr_cpu_ids);
+#endif
 
 /* An arch may set nr_cpu_ids earlier if needed, so this would be redundant */
 void __init setup_nr_cpu_ids(void)
 {
+#if NR_CPUS > BITS_PER_LONG
 	nr_cpu_ids = find_last_bit(cpumask_bits(cpu_possible_mask),NR_CPUS) + 1;
+#endif
 }
 
 static inline bool boot_cpu(int cpu)
@@ -766,15 +786,12 @@ void wake_up_all_idle_cpus(void)
 {
 	int cpu;
 
-	preempt_disable();
-	for_each_online_cpu(cpu) {
-		if (cpu == smp_processor_id())
-			continue;
-		if (s2idle_state == S2IDLE_STATE_ENTER ||
-		    !cpu_isolated(cpu))
+	for_each_possible_cpu(cpu) {
+		preempt_disable();
+		if (cpu != smp_processor_id() && cpu_online(cpu))
 			wake_up_if_idle(cpu);
+		preempt_enable();
 	}
-	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(wake_up_all_idle_cpus);
 

@@ -40,6 +40,13 @@
 #define BIO_BUG_ON
 #endif
 
+#define UPSTREAM_BIO_MAX_PAGES		256U
+
+static inline unsigned int bio_max_segs(unsigned int nr_segs)
+{
+	return min(nr_segs, UPSTREAM_BIO_MAX_PAGES);
+}
+
 #ifdef CONFIG_THP_SWAP
 #if HPAGE_PMD_NR > 256
 #define BIO_MAX_PAGES		HPAGE_PMD_NR
@@ -97,7 +104,7 @@ static inline bool bio_has_data(struct bio *bio)
 	return false;
 }
 
-static inline bool bio_no_advance_iter(struct bio *bio)
+static inline bool bio_no_advance_iter(const struct bio *bio)
 {
 	return bio_op(bio) == REQ_OP_DISCARD ||
 	       bio_op(bio) == REQ_OP_SECURE_ERASE ||
@@ -167,8 +174,8 @@ static inline bool bio_full(struct bio *bio)
 #define bio_for_each_segment_all(bvl, bio, i)				\
 	for (i = 0, bvl = (bio)->bi_io_vec; i < (bio)->bi_vcnt; i++, bvl++)
 
-static inline void bio_advance_iter(struct bio *bio, struct bvec_iter *iter,
-				    unsigned bytes)
+static inline void bio_advance_iter(const struct bio *bio,
+				    struct bvec_iter *iter, unsigned int bytes)
 {
 	iter->bi_sector += bytes >> 9;
 
@@ -195,14 +202,37 @@ static inline bool bio_rewind_iter(struct bio *bio, struct bvec_iter *iter,
 	return bvec_iter_rewind(bio->bi_io_vec, iter, bytes);
 }
 
+/* @bytes should be less or equal to bvec[i->bi_idx].bv_len */
+static inline void bio_advance_iter_single(const struct bio *bio,
+					   struct bvec_iter *iter,
+					   unsigned int bytes)
+{
+	iter->bi_sector += bytes >> 9;
+
+	if (bio_no_advance_iter(bio))
+		iter->bi_size -= bytes;
+	else
+		bvec_iter_advance_single(bio->bi_io_vec, iter, bytes);
+}
+
 #define __bio_for_each_segment(bvl, bio, iter, start)			\
 	for (iter = (start);						\
 	     (iter).bi_size &&						\
 		((bvl = bio_iter_iovec((bio), (iter))), 1);		\
-	     bio_advance_iter((bio), &(iter), (bvl).bv_len))
+	     bio_advance_iter_single((bio), &(iter), (bvl).bv_len))
 
 #define bio_for_each_segment(bvl, bio, iter)				\
 	__bio_for_each_segment(bvl, bio, iter, (bio)->bi_iter)
+
+#define __bio_for_each_bvec(bvl, bio, iter, start)		\
+	for (iter = (start);						\
+	     (iter).bi_size &&						\
+		((bvl = mp_bvec_iter_bvec((bio)->bi_io_vec, (iter))), 1); \
+	     bio_advance_iter_single((bio), &(iter), (bvl).bv_len))
+
+/* iterate over multi-page bvec */
+#define bio_for_each_bvec(bvl, bio, iter)			\
+	__bio_for_each_bvec(bvl, bio, iter, (bio)->bi_iter)
 
 #define bio_iter_last(bvec, iter) ((iter).bi_size == (bvec).bv_len)
 

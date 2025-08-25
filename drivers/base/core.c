@@ -460,7 +460,7 @@ reorder:
 	 */
 	device_reorder_to_tail(consumer, NULL);
 
-	dev_info(consumer, "Linked as a consumer to %s\n", dev_name(supplier));
+	dev_dbg(consumer, "Linked as a consumer to %s\n", dev_name(supplier));
 
 out:
 	device_pm_unlock();
@@ -561,7 +561,7 @@ static void __device_link_del(struct kref *kref)
 {
 	struct device_link *link = container_of(kref, struct device_link, kref);
 
-	dev_info(link->consumer, "Dropping the link to %s\n",
+	dev_dbg(link->consumer, "Dropping the link to %s\n",
 		 dev_name(link->supplier));
 
 	if (link->flags & DL_FLAG_PM_RUNTIME)
@@ -576,7 +576,7 @@ static void __device_link_del(struct kref *kref)
 {
 	struct device_link *link = container_of(kref, struct device_link, kref);
 
-	dev_info(link->consumer, "Dropping the link to %s\n",
+	dev_dbg(link->consumer, "Dropping the link to %s\n",
 		 dev_name(link->supplier));
 
 	if (link->flags & DL_FLAG_PM_RUNTIME)
@@ -1342,11 +1342,6 @@ int lock_device_hotplug_sysfs(void)
 	/* Avoid busy looping (5 ms of sleep should do). */
 	msleep(5);
 	return restart_syscall();
-}
-
-void lock_device_hotplug_assert(void)
-{
-	lockdep_assert_held(&device_hotplug_lock);
 }
 
 #ifdef CONFIG_BLOCK
@@ -2140,6 +2135,8 @@ void device_initialize(struct device *dev)
 	INIT_LIST_HEAD(&dev->links.needs_suppliers);
 	INIT_LIST_HEAD(&dev->links.defer_hook);
 	dev->links.status = DL_DEV_NO_DRIVER;
+	INIT_LIST_HEAD(&dev->iommu_map_list);
+	mutex_init(&dev->iommu_map_lock);
 }
 EXPORT_SYMBOL_GPL(device_initialize);
 

@@ -43,7 +43,7 @@ static void __init init_irq_default_affinity(void)
 	if (!cpumask_available(irq_default_affinity))
 		zalloc_cpumask_var(&irq_default_affinity, GFP_NOWAIT);
 	if (cpumask_empty(irq_default_affinity))
-		cpumask_setall(irq_default_affinity);
+		cpumask_set_cpu(0, irq_default_affinity);
 }
 #else
 static void __init init_irq_default_affinity(void)
@@ -409,6 +409,7 @@ static struct irq_desc *alloc_desc(int irq, int node, unsigned int flags,
 	desc_set_defaults(irq, desc, node, affinity, owner);
 	irqd_set(&desc->irq_data, flags);
 	kobject_init(&desc->kobj, &irq_kobj_type);
+	sbalance_desc_add(desc);
 
 	return desc;
 
@@ -439,6 +440,7 @@ static void free_desc(unsigned int irq)
 {
 	struct irq_desc *desc = irq_to_desc(irq);
 
+	sbalance_desc_del(desc);
 	irq_remove_debugfs_entry(desc);
 	unregister_irq_proc(irq, desc);
 
@@ -642,6 +644,29 @@ int generic_handle_irq(unsigned int irq)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(generic_handle_irq);
+
+/**
+ * generic_handle_irq_safe - Invoke the handler for a particular irq from any
+ *			     context.
+ * @irq:	The irq number to handle
+ *
+ * Returns:	0 on success, a negative value on error.
+ *
+ * This function can be called from any context (IRQ or process context). It
+ * will report an error if not invoked from IRQ context and the irq has been
+ * marked to enforce IRQ-context only.
+ */
+int generic_handle_irq_safe(unsigned int irq)
+{
+	unsigned long flags;
+	int ret;
+
+	local_irq_save(flags);
+	ret = generic_handle_irq(irq);
+	local_irq_restore(flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(generic_handle_irq_safe);
 
 #ifdef CONFIG_HANDLE_DOMAIN_IRQ
 /**

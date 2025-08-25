@@ -95,6 +95,7 @@
 #include <linux/thread_info.h>
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
+#include <linux/simple_lmk.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -334,7 +335,7 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
 
 	if (new) {
 		*new = *orig;
-		INIT_VMA(new);
+		INIT_LIST_HEAD(&new->anon_vma_chain);
 	}
 	return new;
 }
@@ -433,7 +434,7 @@ EXPORT_SYMBOL(free_task);
 static __latent_entropy int dup_mmap(struct mm_struct *mm,
 					struct mm_struct *oldmm)
 {
-	struct vm_area_struct *mpnt, *tmp, *prev, **pprev, *last = NULL;
+	struct vm_area_struct *mpnt, *tmp, *prev, **pprev;
 	struct rb_node **rb_link, *rb_parent;
 	int retval;
 	unsigned long charge;
@@ -552,18 +553,8 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		rb_parent = &tmp->vm_rb;
 
 		mm->map_count++;
-		if (!(tmp->vm_flags & VM_WIPEONFORK)) {
-			if (IS_ENABLED(CONFIG_SPECULATIVE_PAGE_FAULT)) {
-				/*
-				 * Mark this VMA as changing to prevent the
-				 * speculative page fault hanlder to process
-				 * it until the TLB are flushed below.
-				 */
-				last = mpnt;
-				vm_write_begin(mpnt);
-			}
+		if (!(tmp->vm_flags & VM_WIPEONFORK))
 			retval = copy_page_range(mm, oldmm, mpnt);
-		}
 
 		if (tmp->vm_ops && tmp->vm_ops->open)
 			tmp->vm_ops->open(tmp);
@@ -576,22 +567,6 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 out:
 	up_write(&mm->mmap_sem);
 	flush_tlb_mm(oldmm);
-
-	if (IS_ENABLED(CONFIG_SPECULATIVE_PAGE_FAULT)) {
-		/*
-		 * Since the TLB has been flush, we can safely unmark the
-		 * copied VMAs and allows the speculative page fault handler to
-		 * process them again.
-		 * Walk back the VMA list from the last marked VMA.
-		 */
-		for (; last; last = last->vm_prev) {
-			if (last->vm_flags & VM_DONTCOPY)
-				continue;
-			if (!(last->vm_flags & VM_WIPEONFORK))
-				vm_write_end(last);
-		}
-	}
-
 	up_write(&oldmm->mmap_sem);
 	dup_userfaultfd_complete(&uf);
 fail_uprobe_end:
@@ -897,12 +872,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #endif
 
 	/*
-	 * One for the user space visible state that goes away when reaped.
-	 * One for the scheduler.
+	 * One for us, one for whoever does the "release_task()" (usually
+	 * parent)
 	 */
-	refcount_set(&tsk->rcu_users, 2);
-	/* One for the rcu users */
-	atomic_set(&tsk->usage, 1);
+	atomic_set(&tsk->usage, 2);
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	tsk->btrace_seq = 0;
 #endif
@@ -988,9 +961,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm->mmap = NULL;
 	mm->mm_rb = RB_ROOT;
 	mm->vmacache_seqnum = 0;
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-	rwlock_init(&mm->mm_rb_lock);
-#endif
 	atomic_set(&mm->mm_users, 1);
 	atomic_set(&mm->mm_count, 1);
 	init_rwsem(&mm->mmap_sem);
@@ -1031,6 +1001,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		goto fail_nocontext;
 
 	mm->user_ns = get_user_ns(user_ns);
+	lru_gen_init_mm(mm);
 	return mm;
 
 fail_nocontext:
@@ -1064,6 +1035,7 @@ static inline void __mmput(struct mm_struct *mm)
 	ksm_exit(mm);
 	khugepaged_exit(mm); /* must run before exit_mmap */
 	exit_mmap(mm);
+	simple_lmk_mm_freed(mm);
 	mm_put_huge_zero_page(mm);
 	set_mm_exe_file(mm, NULL);
 	if (!list_empty(&mm->mmlist)) {
@@ -1073,6 +1045,7 @@ static inline void __mmput(struct mm_struct *mm)
 	}
 	if (mm->binfmt)
 		module_put(mm->binfmt->module);
+	lru_gen_del_mm(mm);
 	mmdrop(mm);
 }
 
@@ -1363,6 +1336,7 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 
 	tsk->min_flt = tsk->maj_flt = 0;
 	tsk->nvcsw = tsk->nivcsw = 0;
+	mm_event_task_init(tsk);
 #ifdef CONFIG_DETECT_HUNG_TASK
 	tsk->last_switch_count = tsk->nvcsw + tsk->nivcsw;
 	tsk->last_switch_time = 0;
@@ -1696,6 +1670,14 @@ static __always_inline void delayed_free_task(struct task_struct *tsk)
 		free_task(tsk);
 }
 
+struct pid *pidfd_pid(const struct file *file)
+{
+	if (file->f_op == &pidfd_fops)
+		return file->private_data;
+
+	return ERR_PTR(-EBADF);
+}
+
 static int pidfd_release(struct inode *inode, struct file *file)
 {
 	struct pid *pid = file->private_data;
@@ -1991,9 +1973,6 @@ static __latent_entropy struct task_struct *copy_process(
 	p->pagefault_disabled = 0;
 
 #ifdef CONFIG_LOCKDEP
-	p->lockdep_depth = 0; /* no locks held yet */
-	p->curr_chain_key = 0;
-	p->lockdep_recursion = 0;
 	lockdep_init_task(p);
 #endif
 
@@ -2241,6 +2220,7 @@ static __latent_entropy struct task_struct *copy_process(
 		fd_install(pidfd, pidfile);
 
 	proc_fork_connector(p);
+	sched_post_fork(p);
 	cgroup_post_fork(p);
 	cgroup_threadgroup_change_end(current);
 	perf_event_fork(p);
@@ -2297,7 +2277,6 @@ bad_fork_cleanup_perf:
 	perf_event_free_task(p);
 bad_fork_cleanup_policy:
 	lockdep_free_task(p);
-	free_task_load_ptrs(p);
 #ifdef CONFIG_NUMA
 	mpol_put(p->mempolicy);
 bad_fork_cleanup_threadgroup_lock:
@@ -2384,8 +2363,6 @@ long _do_fork(unsigned long clone_flags,
 	if (IS_ERR(p))
 		return PTR_ERR(p);
 
-	cpufreq_task_times_alloc(p);
-
 	/*
 	 * Do this prior waking up the new thread - the thread pointer
 	 * might get invalid after that point, if the thread exits quickly.
@@ -2402,6 +2379,13 @@ long _do_fork(unsigned long clone_flags,
 		p->vfork_done = &vfork;
 		init_completion(&vfork);
 		get_task_struct(p);
+	}
+
+	if (IS_ENABLED(CONFIG_LRU_GEN) && !(clone_flags & CLONE_VM)) {
+		/* lock the task to synchronize with memcg migration */
+		task_lock(p);
+		lru_gen_add_mm(p->mm);
+		task_unlock(p);
 	}
 
 	wake_up_new_task(p);
