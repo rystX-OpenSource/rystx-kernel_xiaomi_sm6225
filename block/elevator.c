@@ -33,6 +33,7 @@
 #include <linux/compiler.h>
 #include <linux/blktrace_api.h>
 #include <linux/hash.h>
+#include <linux/blk-mq.h>
 #include <linux/uaccess.h>
 #include <linux/pm_runtime.h>
 #include <linux/blk-cgroup.h>
@@ -40,6 +41,7 @@
 #include <trace/events/block.h>
 
 #include "blk.h"
+#include "blk-mq.h"
 #include "blk-mq-sched.h"
 #include "blk-wbt.h"
 
@@ -216,6 +218,14 @@ int elevator_init(struct request_queue *q)
 	mutex_lock(&q->sysfs_lock);
 	if (unlikely(q->elevator))
 		goto out_unlock;
+
+#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
+	e = elevator_get(q, "adios", false);
+#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
+	bool is_sq = q->nr_hw_queues == 1 || q->tag_set->flags == BLK_MQ_F_TAG_SHARED;
+	if (!is_sq)
+		return;
+#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 
 	if (*chosen_elevator) {
 		e = elevator_get(q, chosen_elevator, false);
