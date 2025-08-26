@@ -416,7 +416,8 @@ struct z_erofs_decompress_frontend {
 	struct z_erofs_pcluster *pcl, *tailpcl;
 	z_erofs_next_pcluster_t owned_head;
 	enum z_erofs_pclustermode mode;
-
+	
+	bool readahead;
 	/* used for applying cache strategy on the fly */
 	bool backmost;
 	erofs_off_t headoffset;

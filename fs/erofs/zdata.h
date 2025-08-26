@@ -181,37 +181,39 @@ static inline void z_erofs_onlinepage_endio(struct page *page)
  * attach_page_private - Attach private data to a page.
  * @page: Page to attach data to.
  * @data: Data to attach to page.
+ * Defined in include/linux/pagemap.h
  *
  * Attaching private data to a page increments the page's reference count.
  * The data must be detached before the page will be freed.
  */
-static inline void attach_page_private(struct page *page, void *data)
-{
-	get_page(page);
-	set_page_private(page, (unsigned long)data);
-	SetPagePrivate(page);
-}
+// static inline void attach_page_private(struct page *page, void *data)
+// {
+// 	get_page(page);
+// 	set_page_private(page, (unsigned long)data);
+// 	SetPagePrivate(page);
+// }
 
 /**
  * detach_page_private - Detach private data from a page.
  * @page: Page to detach data from.
+ * Defined in include/linux/pagemap.h
  *
  * Removes the data that was previously attached to the page and decrements
  * the refcount on the page.
  *
  * Return: Data that was attached to the page.
  */
-static inline void *detach_page_private(struct page *page)
-{
-	void *data = (void *)page_private(page);
+// static inline void *detach_page_private(struct page *page)
+// {
+// 	void *data = (void *)page_private(page);
 
-	if (!PagePrivate(page))
-		return NULL;
-	ClearPagePrivate(page);
-	set_page_private(page, 0);
-	put_page(page);
+// 	if (!PagePrivate(page))
+// 		return NULL;
+// 	ClearPagePrivate(page);
+// 	set_page_private(page, 0);
+// 	put_page(page);
 
-	return data;
-}
+// 	return data;
+// }
 
 #endif

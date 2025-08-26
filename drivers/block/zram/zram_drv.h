@@ -143,3 +143,4 @@ struct zram {
 };
 
 void zram_entry_free(struct zram *zram, struct zram_entry *entry);
+#endif

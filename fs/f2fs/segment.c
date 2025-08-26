@@ -2528,12 +2528,6 @@ got_it:
 	__set_inuse(sbi, segno);
 	*newseg = segno;
 	spin_unlock(&free_i->segmap_lock);
-
-	if (ret) {
-		f2fs_stop_checkpoint(sbi, false, STOP_CP_REASON_FLUSH_FAIL);
-		f2fs_bug_on(sbi, 1);
-	}
-	return ret;
 }
 
 static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
@@ -3270,9 +3264,6 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	mutex_lock(&curseg->curseg_mutex);
 	down_write(&sit_i->sentry_lock);
 
-	if (curseg->segno == NULL_SEGNO)
-		goto out_err;
-
 	if (from_gc) {
 		f2fs_bug_on(sbi, GET_SEGNO(sbi, old_blkaddr) == NULL_SEGNO);
 		se = get_seg_entry(sbi, GET_SEGNO(sbi, old_blkaddr));
@@ -3325,9 +3316,6 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 				change_curseg(sbi, type);
 			stat_inc_seg_type(sbi, curseg);
 		}
-
-		if (curseg->segno == NULL_SEGNO)
-			goto out_err;
 	}
 
 	/*
@@ -3365,14 +3353,6 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 
 	mutex_unlock(&curseg->curseg_mutex);
 	f2fs_up_read(&SM_I(sbi)->curseg_lock);
-	return 0;
-out_err:
-	*new_blkaddr = NULL_ADDR;
-
-	up_write(&sit_i->sentry_lock);
-	mutex_unlock(&curseg->curseg_mutex);
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
-	return -ENOSPC;
 }
 
 void f2fs_update_device_state(struct f2fs_sb_info *sbi, nid_t ino,
