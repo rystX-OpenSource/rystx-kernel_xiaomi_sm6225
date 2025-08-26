@@ -9,8 +9,11 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/math.h>
 #include <linux/module.h>
+#include <linux/math64.h>
+#include <linux/seqlock.h>
+#include <linux/blk-mq.h>
+#include <linux/timer.h>
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
 #include <linux/slab.h>
@@ -709,8 +712,7 @@ static void adios_merged_requests(struct request_queue *q, struct request *req,
 }
 
 // Try to merge a bio into an existing rq before associating it with an rq
-static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
-		unsigned int nr_segs) {
+static bool adios_bio_merge(struct request_queue *q, struct bio *bio) {
 	unsigned long flags;
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct request *free = NULL;
@@ -719,7 +721,7 @@ static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 	if (!spin_trylock_irqsave(&ad->lock, flags))
 		return false;
 
-	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
+	ret = blk_mq_sched_try_merge(q, bio, &free);
 	spin_unlock_irqrestore(&ad->lock, flags);
 
 	if (free)
@@ -730,7 +732,7 @@ static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 
 // Insert a request into the scheduler (before Read & Write models stabilizes)
 static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
-		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
+		struct request *rq, blk_insert_t insert_flags) {
 	struct adios_data *ad = hctx->queue->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
 	u8 optype = adios_optype(rq);
@@ -742,7 +744,7 @@ static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
 
 	atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 	scoped_guard(spinlock_irqsave, &ad->pq_lock)
-		list_add_tail(&rq->queuelist, &ad->prio_queue[idx]);
+	list_add_tail(&rq->queuelist, &ad->prio_queue[idx]);
 
 	if (ad->latency_model[ADIOS_READ].base > 0 &&
 		ad->latency_model[ADIOS_WRITE].base > 0)
@@ -751,7 +753,7 @@ static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
 
 // Insert a request into the scheduler (after Read & Write models stabilized)
 static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
-		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
+		struct request *rq, blk_insert_t insert_flags) {
 	struct request_queue *q = hctx->queue;
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
@@ -779,7 +781,7 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 		return;
 	}
 
-	if (blk_mq_sched_try_insert_merge(q, rq, free))
+	if (blk_mq_sched_try_insert_merge(q, rq))
 		return;
 
 	add_to_dl_tree(ad, dl_idx, rq);
@@ -988,7 +990,7 @@ found:
 
 // Timer callback function to periodically update latency models
 static void update_timer_callback(struct timer_list *t) {
-	struct adios_data *ad = timer_container_of(ad, t, update_timer);
+	struct adios_data *ad = from_timer(ad, t, update_timer);
 
 	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 		latency_model_update(ad, &ad->latency_model[optype]);
