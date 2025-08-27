@@ -8,7 +8,6 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/version.h>
-#include <linux/init.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 #include <linux/compiler_types.h>
 #endif
@@ -34,17 +33,6 @@ static struct non_root_profile default_non_root_profile;
 
 static int allow_list_arr[PAGE_SIZE / sizeof(int)] __read_mostly __aligned(PAGE_SIZE);
 static int allow_list_pointer __read_mostly = 0;
-
-unsigned int nethunter_mode = 0;
-
-static int __init read_nethunter_state(char *s)
-{
-	if (s)
-		nethunter_mode = simple_strtoul(s, NULL, 0);
-
-	return 1;
-}
-__setup("nh_mode=", read_nethunter_state);
 
 static void remove_uid_from_arr(uid_t uid)
 {
@@ -107,7 +95,7 @@ static uint8_t allow_list_bitmap[PAGE_SIZE] __read_mostly __aligned(PAGE_SIZE);
 static struct work_struct ksu_save_work;
 static struct work_struct ksu_load_work;
 
-bool persistent_allow_list(void);
+static bool persistent_allow_list(void);
 
 void ksu_show_allow_list(void)
 {
@@ -134,30 +122,6 @@ static void ksu_grant_root_to_shell()
 	ksu_set_app_profile(&profile, false);
 }
 #endif
-
-// Inject allowlist with NetHunter packages
-static void ksu_inject_nethunter_allowlist()
-{
-	struct app_profile profile = {
-		.version = KSU_APP_PROFILE_VER,
-		.allow_su = true,
-		.current_uid = 0,
-	};
-	// NetHunter Terminal
-	strcpy(profile.key, "com.kali.nethunter.term");
-	strcpy(profile.rp_config.profile.selinux_domain, KSU_DEFAULT_SELINUX_DOMAIN);
-	ksu_set_app_profile(&profile, false);
-
-	// NetHunter Store ( sometimes unused)
-	strcpy(profile.key, "com.kali.nethunter.store");
-	strcpy(profile.rp_config.profile.selinux_domain, KSU_DEFAULT_SELINUX_DOMAIN);
-	ksu_set_app_profile(&profile, false);
-
-	// NetHunter Manager
-	strcpy(profile.key, "com.offsec.nethunter");
-	strcpy(profile.rp_config.profile.selinux_domain, KSU_DEFAULT_SELINUX_DOMAIN);
-	ksu_set_app_profile(&profile, false);
-}
 
 bool ksu_get_app_profile(struct app_profile *profile)
 {
@@ -302,7 +266,7 @@ bool __ksu_is_allow_uid(uid_t uid)
 
 	if (unlikely(uid == 0)) {
 		// already root, but only allow our domain.
-		return is_ksu_domain();
+		return ksu_is_ksu_domain();
 	}
 
 	if (forbid_system_uid(uid)) {
@@ -387,7 +351,7 @@ bool ksu_get_allow_list(int *array, int *length, bool allow)
 	return true;
 }
 
-void do_save_allow_list(struct work_struct *work)
+static void do_save_allow_list(struct work_struct *work)
 {
 	u32 magic = FILE_MAGIC;
 	u32 version = FILE_FORMAT_VERSION;
@@ -429,7 +393,7 @@ exit:
 	filp_close(fp, 0);
 }
 
-void do_load_allow_list(struct work_struct *work)
+static void do_load_allow_list(struct work_struct *work)
 {
 	loff_t off = 0;
 	ssize_t ret = 0;
@@ -442,13 +406,6 @@ void do_load_allow_list(struct work_struct *work)
 	ksu_grant_root_to_shell();
 #endif
 
-	// check if nethunter cmdline is 1
-        if (nethunter_mode){
-		// inject allowlist
-		pr_info("NetHunter mode enabled. Injecting allowlist...");
-		ksu_inject_nethunter_allowlist();
-	}
-	
 	// load allowlist now!
 	fp = ksu_filp_open_compat(KERNEL_SU_ALLOWLIST, O_RDONLY, 0);
 	if (IS_ERR(fp)) {
@@ -526,7 +483,7 @@ void ksu_prune_allowlist(bool (*is_uid_valid)(uid_t, char *, void *), void *data
 }
 
 // make sure allow list works cross boot
-bool persistent_allow_list(void)
+static bool persistent_allow_list(void)
 {
 	return ksu_queue_work(&ksu_save_work);
 }
