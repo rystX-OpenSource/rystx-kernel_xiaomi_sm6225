@@ -64,6 +64,10 @@ static unsigned int ignoreled;
 module_param_named(ignoreled, ignoreled, uint, 0644);
 MODULE_PARM_DESC(ignoreled, "Autosuspend with active leds");
 
+static unsigned int hid_poll_interval;
+module_param_named(poll, hid_poll_interval, uint, 0644);
+MODULE_PARM_DESC(poll, "Polling interval of any device");
+
 /* Quirks specified at module load time */
 static char *quirks_param[MAX_USBHID_BOOT_QUIRKS];
 module_param_array_named(quirks, quirks_param, charp, NULL, 0444);
@@ -1111,6 +1115,10 @@ static int usbhid_start(struct hid_device *hid)
 			pr_info("%s: Fixing fullspeed to highspeed interval: %d -> %d\n",
 				hid->name, endpoint->bInterval, interval);
 		}
+
+		/* First set polling interval for all devices */
+		if (hid_poll_interval > 0)
+			interval = hid_poll_interval;
 
 		/* Change the polling interval of mice, joysticks
 		 * and keyboards.
