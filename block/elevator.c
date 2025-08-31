@@ -219,14 +219,6 @@ int elevator_init(struct request_queue *q)
 	if (unlikely(q->elevator))
 		goto out_unlock;
 
-#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-	e = elevator_get(q, "adios", false);
-#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-	bool is_sq = q->nr_hw_queues == 1 || q->tag_set->flags == BLK_MQ_F_TAG_SHARED;
-	if (!is_sq)
-		return;
-#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-
 	if (*chosen_elevator) {
 		e = elevator_get(q, chosen_elevator, false);
 		if (!e)
@@ -234,6 +226,9 @@ int elevator_init(struct request_queue *q)
 							chosen_elevator);
 	}
 
+#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
+	e = elevator_get(q, "adios", false);
+#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 	if (!e)
 		e = elevator_get(q, CONFIG_DEFAULT_IOSCHED, false);
 	if (!e) {
@@ -241,6 +236,7 @@ int elevator_init(struct request_queue *q)
 			"Default I/O scheduler not found. Using noop.\n");
 		e = elevator_get(q, "noop", false);
 	}
+#endif
 
 	err = e->ops.sq.elevator_init_fn(q, e);
 	if (err)
