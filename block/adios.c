@@ -20,8 +20,8 @@
 #include <linux/timekeeping.h>
 #include <linux/percpu.h>
 #include <linux/string.h>
+#include <linux/elevator.h>
 
-#include "elevator.h"
 #include "blk.h"
 #include "blk-mq.h"
 #include "blk-mq-sched.h"
