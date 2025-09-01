@@ -141,6 +141,7 @@ static unsigned long zero_ul;
 static unsigned long one_ul = 1;
 static unsigned long long_max = LONG_MAX;
 static int one_hundred = 100;
+static int two_hundred = 200;
 static int one_thousand = 1000;
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
@@ -1842,7 +1843,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_background_bytes",
 		.data		= &dirty_background_bytes,
 		.maxlen		= sizeof(dirty_background_bytes),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_background_bytes_handler,
 		.extra1		= &one_ul,
 	},
@@ -1859,7 +1860,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_bytes",
 		.data		= &vm_dirty_bytes,
 		.maxlen		= sizeof(vm_dirty_bytes),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_bytes_handler,
 		.extra1		= &dirty_bytes_min,
 	},
@@ -1893,7 +1894,7 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
-		.extra2		= &one_hundred
+		.extra2		= &two_hundred
 	},
 	{
 		.procname       = "want_old_faultaround_pte",
@@ -2223,27 +2224,21 @@ static struct ctl_table vm_table[] = {
 		.data		= &sysctl_anon_min_ratio,
 		.maxlen		= sizeof(sysctl_anon_min_ratio),
 		.mode		= 0644,
-		.proc_handler	= &vm_workingset_protection_update_handler,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.proc_handler	= &vm_workingset_protection_update_handler
 	},
 	{
 		.procname	= "clean_low_ratio",
 		.data		= &sysctl_clean_low_ratio,
 		.maxlen		= sizeof(sysctl_clean_low_ratio),
 		.mode		= 0644,
-		.proc_handler	= &vm_workingset_protection_update_handler,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.proc_handler	= &vm_workingset_protection_update_handler
 	},
 	{
 		.procname	= "clean_min_ratio",
 		.data		= &sysctl_clean_min_ratio,
 		.maxlen		= sizeof(sysctl_clean_min_ratio),
 		.mode		= 0644,
-		.proc_handler	= &vm_workingset_protection_update_handler,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.proc_handler	= &vm_workingset_protection_update_handler
 	},
 	{
 		.procname	= "user_reserve_kbytes",
