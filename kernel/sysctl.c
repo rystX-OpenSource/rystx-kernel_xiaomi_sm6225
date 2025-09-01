@@ -2119,27 +2119,21 @@ static struct ctl_table vm_table[] = {
 		.data		= &sysctl_anon_min_ratio,
 		.maxlen		= sizeof(sysctl_anon_min_ratio),
 		.mode		= 0644,
-		.proc_handler	= &vm_workingset_protection_update_handler,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.proc_handler	= &vm_workingset_protection_update_handler
 	},
 	{
 		.procname	= "clean_low_ratio",
 		.data		= &sysctl_clean_low_ratio,
 		.maxlen		= sizeof(sysctl_clean_low_ratio),
 		.mode		= 0644,
-		.proc_handler	= &vm_workingset_protection_update_handler,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.proc_handler	= &vm_workingset_protection_update_handler
 	},
 	{
 		.procname	= "clean_min_ratio",
 		.data		= &sysctl_clean_min_ratio,
 		.maxlen		= sizeof(sysctl_clean_min_ratio),
 		.mode		= 0644,
-		.proc_handler	= &vm_workingset_protection_update_handler,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.proc_handler	= &vm_workingset_protection_update_handler
 	},
 	{
 		.procname	= "user_reserve_kbytes",
