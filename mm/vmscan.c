@@ -190,7 +190,7 @@ static u64 sysctl_clean_min_ratio_kb __read_mostly = 0;
 static u64 workingset_protection_prev_totalram __read_mostly = 0;
 
 /*
- * From 0 .. 100.  Higher means more swappy.
+ * From 0 .. 200.  Higher means more swappy.
  */
 int vm_swappiness = 100;
 
