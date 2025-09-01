@@ -1624,7 +1624,7 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler = sched_bore_update_handler,
-		.extra1		= &one,
+		.extra1		= &zero,
 		.extra2		= &one,
 	},
 	{
