@@ -6541,6 +6541,9 @@ static const char *const binder_command_strings[] = {
 	"BC_TRANSACTION_SG",
 	"BC_REPLY_SG",
 };
+#else
+static const char *const binder_command_strings[] = { "unknown" };
+static const char *const binder_return_strings[] = { "unknown" };
 #endif
 
 #ifdef CONFIG_ANDROID_BINDER_LOGS
