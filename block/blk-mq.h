@@ -30,6 +30,9 @@ struct blk_mq_ctx {
 	struct kobject		kobj;
 } ____cacheline_aligned_in_smp;
 
+typedef unsigned int __bitwise blk_insert_t;
+#define BLK_MQ_INSERT_AT_HEAD		((__force blk_insert_t)0x01)
+
 void blk_mq_freeze_queue(struct request_queue *q);
 void blk_mq_exit_queue(struct request_queue *q);
 int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
@@ -223,6 +226,17 @@ static inline void blk_mq_clear_mq_map(struct blk_mq_tag_set *set)
 
 	for_each_possible_cpu(cpu)
 		set->mq_map[cpu] = 0;
+}
+
+/* Free all requests on the list */
+static inline void blk_mq_free_requests(struct list_head *list)
+{
+	while (!list_empty(list)) {
+		struct request *rq = list_entry_rq(list->next);
+
+		list_del_init(&rq->queuelist);
+		blk_mq_free_request(rq);
+	}
 }
 
 #endif
