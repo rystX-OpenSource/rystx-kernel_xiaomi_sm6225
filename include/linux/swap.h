@@ -400,6 +400,8 @@ int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 int generic_swapfile_activate(struct swap_info_struct *, struct file *,
 		sector_t *);
 
+int kcompressd(void *p);
+
 /* linux/mm/swap_state.c */
 /* One swap address space for each 64M swap space */
 #define SWAP_ADDRESS_SPACE_SHIFT	14
@@ -610,6 +612,10 @@ static inline swp_entry_t get_swap_page(struct page *page)
 	return entry;
 }
 
+static inline int kcompressd(void *p)
+{
+	return 0;
+}
 #endif /* CONFIG_SWAP */
 
 #ifdef CONFIG_THP_SWAP
