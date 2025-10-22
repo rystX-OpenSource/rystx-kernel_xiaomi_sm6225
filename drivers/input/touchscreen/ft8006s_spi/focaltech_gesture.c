@@ -98,6 +98,7 @@ static struct fts_gesture_st fts_gesture_data;
 /*****************************************************************************
 * Global variable or extern global variabls/functions
 *****************************************************************************/
+extern void set_lcd_reset_gpio_keep_high(bool en);
 
 /*****************************************************************************
 * Static function prototypes
@@ -156,9 +157,11 @@ static ssize_t fts_gesture_store(
     if (FTS_SYSFS_ECHO_ON(buf)) {
         FTS_DEBUG("enable gesture");
         ts_data->gesture_mode = ENABLE;
+        set_lcd_reset_gpio_keep_high(true);
     } else if (FTS_SYSFS_ECHO_OFF(buf)) {
         FTS_DEBUG("disable gesture");
         ts_data->gesture_mode = DISABLE;
+        set_lcd_reset_gpio_keep_high(false);
     }
     mutex_unlock(&ts_data->input_dev->mutex);
 
@@ -379,6 +382,8 @@ int fts_gesture_suspend(struct fts_ts_data *ts_data)
 {
     int i = 0;
     u8 state = 0xFF;
+
+    set_lcd_reset_gpio_keep_high(true);
 
     FTS_FUNC_ENTER();
     if (enable_irq_wake(ts_data->irq)) {
