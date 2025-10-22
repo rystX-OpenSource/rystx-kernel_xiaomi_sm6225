@@ -18,7 +18,9 @@
 #include "sde_crtc.h"
 #include "sde_rm.h"
 
+#ifdef CONFIG_TARGET_PROJECT_K7T
 static int lcd_esd_irq = 0;
+#endif
 
 #define BL_NODE_NAME_SIZE 32
 #define HDR10_PLUS_VSIF_TYPE_CODE      0x81
@@ -2340,7 +2342,7 @@ static int sde_connector_atomic_check(struct drm_connector *connector,
 
 	return 0;
 }
-
+#ifdef CONFIG_TARGET_PROJECT_K7T
 void lcd_esd_enable(bool on)
 {
   if(on)
@@ -2390,7 +2392,7 @@ static irqreturn_t esd_err_irq_handle(int irq, void *data)
 	esd_recovery(irq, data);
 	return IRQ_HANDLED;
 }
-
+#endif
 static void _sde_connector_report_panel_dead(struct sde_connector *conn,
 	bool skip_pre_kickoff)
 {
@@ -2717,7 +2719,7 @@ static int _sde_connector_install_properties(struct drm_device *dev,
 				sizeof(dsi_display->panel->hdr_props),
 				CONNECTOR_PROP_HDR_INFO);
 		}
-
+#ifdef CONFIG_TARGET_PROJECT_K7T
 			/* register esd irq and enable it after panel enabled */
 		if (dsi_display && dsi_display->panel &&
 			dsi_display->panel->esd_config.esd_err_irq_gpio > 0) {
@@ -2732,7 +2734,7 @@ static int _sde_connector_install_properties(struct drm_device *dev,
 			} else
 				pr_debug("%s: Request esd irq succeed!\n", __func__);
 		}
-
+#endif
 	}
 
 	msm_property_install_volatile_range(

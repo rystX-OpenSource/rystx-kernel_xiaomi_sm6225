@@ -71,7 +71,6 @@ extern touchscreen_usb_plugin_data_t g_touchscreen_usb_pulgin;
 *****************************************************************************/
 struct fts_ts_data *fts_data;
 static bool delay_gesture = false;
-static bool g_regulator_status;
 
 #if LCT_TP_USB_PLUGIN
 void fts_ts_usb_event_callback(void)
@@ -1310,7 +1309,7 @@ static int drm_notifier_callback(struct notifier_block *self,
     struct drm_notify_data *evdata = data;
     struct fts_ts_data *ts_data = container_of(self, struct fts_ts_data, drm_notif);
     int *blank = NULL;
-    
+
     if (!evdata) {
         FTS_ERROR("evdata is null");
         return 0;
