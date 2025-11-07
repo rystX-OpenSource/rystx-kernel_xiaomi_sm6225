@@ -146,3 +146,8 @@
  * RT class.
  */
 #define SCHED_FEAT_SCHEDTUNE_BOOST_HOLD_ALL 0
+
+/*
+ * Do newidle balancing proportional to its success rate using randomization.
+ */
+#define SCHED_FEAT_NI_RANDOM 1
