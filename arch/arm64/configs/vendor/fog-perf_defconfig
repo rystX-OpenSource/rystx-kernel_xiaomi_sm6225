@@ -1,6 +1,8 @@
 CONFIG_LOCALVERSION="-rystX-アイデッドx2F"
 CONFIG_AUDIT=y
 # === rystX ===
+# DTS-Eagle | HPX-Ultra
+CONFIG_AINUR_DTS_SW=y
 # KernelSU
 CONFIG_KSU=y
 # CONFIG_KSU_DEBUG is not set
