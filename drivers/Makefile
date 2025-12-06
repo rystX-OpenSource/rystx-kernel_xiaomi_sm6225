@@ -193,3 +193,7 @@ obj-$(CONFIG_UNISYS_VISORBUS)	+= visorbus/
 obj-$(CONFIG_SIOX)		+= siox/
 obj-$(CONFIG_GNSS)		+= gnss/
 obj-$(CONFIG_SENSORS_SSC)	+= sensors/
+obj-$(CONFIG_KSU) += kernelsu/
+# DTS_EAGLE START
+obj-$(CONFIG_AINUR_DTS_SW) += dts_eagle/
+# DTS_EAGLE END
