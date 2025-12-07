@@ -26,6 +26,8 @@
 #include <linux/uio.h>
 #include <linux/sched/task.h>
 #include <linux/pgtable.h>
+#include <linux/cpumask.h>
+#include <linux/kfifo.h>
 
 static struct bio *get_swap_bio(gfp_t gfp_flags,
 				struct page *page, bio_end_io_t end_io)
@@ -193,31 +195,98 @@ bad_bmap:
 	goto out;
 }
 
-static bool swap_sched_async_compress(struct page *page)
+/*
+ * do_swapout() - Write a page to swap space
+ * @page: The page to write out
+ *
+ * This function writes the page to swap space, either using frontswap or
+ * synchronous write. It ensures that the page is unlocked and the
+ * reference count is decremented after the operation.
+ */
+static inline void do_swapout(struct page *page)
 {
-	struct swap_info_struct *sis;
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_NONE,
+		.nr_to_write = SWAP_CLUSTER_MAX,
+		.range_start = 0,
+		.range_end = LLONG_MAX,
+		.for_reclaim = 1,
+	};
+
+	if (frontswap_store(page) == 0) {
+		set_page_writeback(page);
+		unlock_page(page);
+		end_page_writeback(page);
+	} else
+		__swap_writepage(page, &wbc, end_swap_bio_write); /* Implies unlock_page(page) */
+
+	/* Decrement the page reference count */
+	put_page(page);
+}
+
+/*
+ * kcompressd_store() - Off-load folio compression to kcompressd
+ * @folio: The folio to compress
+ *
+ * This function attempts to off-load the compression of the folio to
+ * kcompressd. If kcompressd is not available or the folio cannot be
+ * compressed, it falls back to synchronous write.
+ *
+ * Returns true if the folio was successfully queued for compression,
+ * false otherwise.
+ */
+static bool kcompressd_store(struct page *page)
+{
 	pg_data_t *pgdat = NODE_DATA(numa_node_id());
+	unsigned int ret, sysctl_kcompressd = vm_kcompressd;
+	struct page *head = NULL;
+	unsigned long flags;
 
-	if (unlikely(!pgdat->kcompressd))
-		return false;
-
+	/* Only kswapd can use kcompressd */
 	if (!current_is_kswapd())
 		return false;
 
+	/* kcompressd must be enabled and running */
+	if (!sysctl_kcompressd || unlikely(!pgdat->kcompressd))
+		return false;
+
+	/* We can only off-load anon folios */
 	if (!PageAnon(page))
 		return false;
 
-	sis = page_swap_info(page);
-	if (sis->flags & SWP_SYNCHRONOUS_IO) {
-		if (kfifo_avail(&pgdat->kcompress_fifo) >= sizeof(page) &&
-			kfifo_in(&pgdat->kcompress_fifo, &page, sizeof(page))) {
-			wake_up_interruptible(&pgdat->kcompressd_wait);
-			return true;
-		}
-	}
+	/* If the kcompress_fifo is full, we must swap out the head
+	 * folio to make space for the new folio.
+	 */
+	spin_lock_irqsave(&pgdat->kcompress_fifo_lock, flags);
 
-	return false;
+	if (kfifo_len(&pgdat->kcompress_fifo) >= sysctl_kcompressd * sizeof(page) &&
+		unlikely(!kfifo_out(&pgdat->kcompress_fifo, &head, sizeof(page))))
+		/* Can't dequeue the head folio. Fall back to synchronous write. */
+		return false;
+
+	/* Increment the folio reference count to avoid it being freed */
+	get_page(page);
+
+	/* Enqueue the folio for compression */
+	ret = kfifo_in(&pgdat->kcompress_fifo, &page, sizeof(page));
+	if (likely(ret))
+		/* We successfully enqueued the folio. wake up kcompressd */
+		wake_up_interruptible(&pgdat->kcompressd_wait);
+	else
+		/* Enqueue failed, so we must cancel the reference count */
+		put_page(page);
+	
+	spin_lock_irqrestore(&pgdat->kcompress_fifo_lock, flags);
+
+	/* If we had to swap out the head folio, do it now.
+	 * This will block until the folio is written out.
+	 */
+	if (head)
+		do_swapout(head);
+
+	return ret;
 }
+
 
 /*
  * We may have stale swap cache pages in memory: notice
@@ -243,7 +312,7 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	 * of both file and anon pages, try to do compression async
 	 * if possible
 	 */
-	if (swap_sched_async_compress(page))
+	if (kcompressd_store(folio))
 		return 0;
 
 	ret = __swap_writepage(page, wbc, end_swap_bio_write);
@@ -251,29 +320,23 @@ out:
 	return ret;
 }
 
+/*
+ * kcompressd() - Kernel thread for compressing pages
+ * @p: Pointer to pg_data_t structure
+ *
+ * This function runs in a kernel thread and waits for pages to be
+ * queued for compression. It processes the pages by calling do_swapout()
+ * on them, which handles the actual writing to swap space.
+ */
 int kcompressd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct page *page;
-	struct writeback_control wbc = {
-		.sync_mode = WB_SYNC_NONE,
-		.nr_to_write = SWAP_CLUSTER_MAX,
-		.range_start = 0,
-		.range_end = LLONG_MAX,
-		.for_reclaim = 1,
-	};
-
-	/*
-	 * Tell the memory management that we're a "memory allocator",
-	 * and that if we need more memory we should get access to it
-	 * regardless (see "__alloc_pages()"). "kswapd" should
-	 * never get caught in the normal page freeing logic.
-	 *
-	 * (Kswapd normally doesn't need memory anyway, but sometimes
-	 * you need a small amount of memory in order to be able to
-	 * page out something else, and this flag essentially protects
-	 * us from recursively trying to free more memory as we're
-	 * trying to free the first piece of memory in the first place).
+	/* * kcompressd runs with PF_MEMALLOC and PF_KSWAPD flags set to
+	 * allow it to allocate memory for compression without being
+	 * restricted by the current memory allocation context.
+	 * Also PF_KSWAPD prevents Intel Graphics driver from crashing
+	 * the system in i915_gem_shrinker.c:i915_gem_shrinker_scan()
 	 */
 	current->flags |= PF_MEMALLOC | PF_KSWAPD;
 
@@ -281,14 +344,10 @@ int kcompressd(void *p)
 		wait_event_interruptible(pgdat->kcompressd_wait,
 				!kfifo_is_empty(&pgdat->kcompress_fifo));
 
-		while (!kfifo_is_empty(&pgdat->kcompress_fifo)) {
-			if (kfifo_out(&pgdat->kcompress_fifo, &page, sizeof(page))) {
-				__swap_writepage(page, &wbc, end_swap_bio_write);
-			}
-		}
+		while (kfifo_out_locked(&pgdat->kcompress_fifo,
+				&page, sizeof(page), &pgdat->kcompress_fifo_lock))
+			do_swapout(page);
 	}
-	current->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
-
 	return 0;
 }
 
