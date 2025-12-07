@@ -6735,6 +6735,7 @@ int kswapd_run(int nid)
 		return ret;
 	}
 
+	printk(KERN_INFO "[BACKPORT] Kcompressd-Unofficial 0.5 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)");
 	pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
 			"kcompressd%d", nid);
 	if (IS_ERR(pgdat->kcompressd)) {
