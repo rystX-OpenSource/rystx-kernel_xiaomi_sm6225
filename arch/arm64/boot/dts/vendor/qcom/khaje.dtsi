@@ -441,7 +441,7 @@
 	};
 
 	chosen {
-		bootargs = "noirqdebug nodebugmon rcupdate.rcu_expedited=1 rcu_nocbs=0-7 kpti=off";
+		bootargs = "noirqdebug nodebugmon rcupdate.rcu_expedited=1 rcu_nocbs=0-7 kpti=off boot_cpus=0,1,2,3,4,5,6,7";
 	};
 
 	soc: soc { };
