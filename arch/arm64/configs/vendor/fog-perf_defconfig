@@ -1,6 +1,8 @@
 CONFIG_LOCALVERSION="-rystX-アイデッドx2F"
 CONFIG_AUDIT=y
 # === rystX ===
+# Xiaomi Touch for FTS panel
+CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE=y
 # DTS-Eagle | HPX-Ultra
 CONFIG_AINUR_DTS_SW=y
 # KernelSU
