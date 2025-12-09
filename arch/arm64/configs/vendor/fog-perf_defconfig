@@ -1,4 +1,4 @@
-CONFIG_LOCALVERSION="-rystX-アイデッドx2F"
+CONFIG_LOCALVERSION="-rystX-アイデッド"
 CONFIG_AUDIT=y
 # === rystX ===
 # DTS-Eagle | HPX-Ultra
