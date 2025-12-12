@@ -1097,6 +1097,7 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	struct adios_data *ad;
 	struct elevator_queue *eq;
 	int ret = -ENOMEM;
+	u8 optype = 0;
 
 	eq = elevator_alloc(q, e);
 	if (!eq)
@@ -1133,12 +1134,12 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 
 	for (int i = 0; i < 2; i++)
 		INIT_LIST_HEAD(&ad->prio_queue[i]);
-	for (u8 i = 0; i < 2; i++)
-		ad->dl_tree[i] = RB_ROOT_CACHED;
+	for (u8 j = 0; j < 2; j++)
+		ad->dl_tree[j] = RB_ROOT_CACHED;
 	ad->dl_bias = 0;
 	ad->dl_queued = 0x0;
-	for (u8 j = 0; j < 2; j++)
-		ad->dl_prio[j] = default_dl_prio[j];
+	for (u8 k = 0; k < 2; k++)
+		ad->dl_prio[k] = default_dl_prio[k];
 
 	ad->aggr_buckets = kzalloc(sizeof(*ad->aggr_buckets), GFP_KERNEL);
 	if (!ad->aggr_buckets) {
@@ -1146,8 +1147,8 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 		goto destroy_dl_group_pool;
 	}
 
-	for (u8 optype1 = 0; optype1 < ADIOS_OPTYPES; optype1++) {
-		struct latency_model *model = &ad->latency_model[optype1];
+	for (optype = 0; optype < ADIOS_OPTYPES; optype++) {
+		struct latency_model *model = &ad->latency_model[optype];
 		seqlock_init(&model->lock);
 
 		model->pcpu_buckets = alloc_percpu(struct lm_buckets);
@@ -1165,8 +1166,8 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	timer_setup(&ad->update_timer, update_timer_callback, 0);
 
 	for (u8 page = 0; page < ADIOS_BQ_PAGES; page++)
-		for (u8 optype2 = 0; optype2 < ADIOS_OPTYPES; optype2++)
-			INIT_LIST_HEAD(&ad->batch_queue[page][optype2]);
+		for (optype = 0; optype < ADIOS_OPTYPES; optype++)
+			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
 
 	spin_lock_init(&ad->lock);
 	spin_lock_init(&ad->pq_lock);
