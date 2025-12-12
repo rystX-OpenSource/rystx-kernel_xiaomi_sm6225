@@ -175,7 +175,7 @@ struct adios_data {
 	s32 dl_prio[2];
 
 	void (*insert_request_fn)(struct blk_mq_hw_ctx *, struct request *,
-								blk_insert_t, struct list_head *);
+								bool at_head, struct list_head *);
 
 	u64 global_latency_window;
 	u64 latency_target[ADIOS_OPTYPES];
@@ -663,11 +663,11 @@ static int to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth) {
 }
 
 // Limit the depth of request allocation for asynchronous and write requests
-static void adios_limit_depth(struct bio *bio, struct blk_mq_alloc_data *data) {
+static void adios_limit_depth(unsigned int op, struct blk_mq_alloc_data *data) {
 	struct adios_data *ad = data->q->elevator->elevator_data;
 
 	// Do not throttle synchronous reads
-	if (op_is_sync(bio->bi_opf) && !op_is_write(bio->bi_opf))
+	if (op_is_sync(on) && !op_is_write(op))
 		return;
 
 	data->shallow_depth = to_word_depth(data->hctx, ad->async_depth);
@@ -707,8 +707,9 @@ static void adios_merged_requests(struct request_queue *q, struct request *req,
 }
 
 // Try to merge a bio into an existing rq before associating it with an rq
-static bool adios_bio_merge(struct request_queue *q, struct bio *bio) {
+static bool adios_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio) {
 	unsigned long flags;
+	struct request_queue *q = hctx->queue;
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct request *free = NULL;
 	bool ret;
@@ -727,7 +728,7 @@ static bool adios_bio_merge(struct request_queue *q, struct bio *bio) {
 
 // Insert a request into the scheduler (after Read & Write models stabilized)
 static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
-		struct request *rq, blk_insert_t insert_flags) {
+		struct request *rq, bool at_head) {
 	struct request_queue *q = hctx->queue;
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
@@ -741,7 +742,7 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 
 	/* Tier-0: BLK_MQ_INSERT_AT_HEAD Requests
 	 * - Needs to be processed ASAP at all costs in any case */
-	if (insert_flags & BLK_MQ_INSERT_AT_HEAD) {
+	if (at_head) {
 		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 		spin_lock_irqsave(&ad->pq_lock, flags);
 		list_add_tail(&rq->queuelist, &ad->prio_queue[0]);
@@ -772,11 +773,10 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 
 // Insert a request into the scheduler (before Read & Write models stabilizes)
 static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
-		struct request *rq, blk_insert_t insert_flags) {
+		struct request *rq, bool at_head) {
 	struct adios_data *ad = hctx->queue->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
 	u8 optype = adios_optype(rq);
-	u8 idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
 	unsigned long flags;
 
 	rd->block_size = blk_rq_bytes(rq);
@@ -785,7 +785,10 @@ static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
 
 	atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 	spin_lock_irqsave(&ad->pq_lock, flags);
-	list_add_tail(&rq->queuelist, &ad->prio_queue[idx]);
+	if (at_head)
+			list_add_tail(&rq->queuelist, &ad->prio_queue[0]);
+		else
+			list_add_tail(&rq->queuelist, &ad->prio_queue[1]);
 	spin_unlock_irqrestore(&ad->pq_lock, flags);
 
 	if (ad->latency_model[ADIOS_READ].base > 0 &&
@@ -796,7 +799,7 @@ static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
 // Insert multiple requests into the scheduler
 static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 				   struct list_head *list,
-				   blk_insert_t insert_flags) {
+				   bool at_head) {
 	struct request_queue *q = hctx->queue;
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct request *rq;
@@ -813,7 +816,7 @@ static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 			}
 			rq = list_first_entry(list, struct request, queuelist);
 			list_del_init(&rq->queuelist);
-			ad->insert_request_fn(hctx, rq, insert_flags, &free);
+			ad->insert_request_fn(hctx, rq, at_head, &free);
 		}
 		spin_unlock_irqrestore(&ad->lock, flags);
 	} while (!stop);
@@ -822,7 +825,7 @@ static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 }
 
 // Prepare a request before it is inserted into the scheduler
-static void adios_prepare_request(struct request *rq) {
+static void adios_prepare_request(struct request *rq, struct bio *bio) {
 	struct adios_data *ad = rq->q->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
 
@@ -1008,10 +1011,12 @@ static void update_timer_callback(struct timer_list *t) {
 }
 
 // Handle the completion of a request
-static void adios_completed_request(struct request *rq, u64 now) {
+static void adios_completed_request(struct request *rq) {
 	struct adios_data *ad = rq->q->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
+	u64 now;
 
+	now = ktime_get_ns();
 	u64 tpl_after = atomic64_sub_return(rd->pred_lat, &ad->total_pred_lat);
 	u64 lct = ad->last_completed_time ?: rq->io_start_time_ns;
 	ad->last_completed_time = (tpl_after) ? now : 0;
@@ -1141,8 +1146,8 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 		goto destroy_dl_group_pool;
 	}
 
-	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++) {
-		struct latency_model *model = &ad->latency_model[optype];
+	for (u8 optype1 = 0; optype1 < ADIOS_OPTYPES; optype1++) {
+		struct latency_model *model = &ad->latency_model[optype1];
 		seqlock_init(&model->lock);
 
 		model->pcpu_buckets = alloc_percpu(struct lm_buckets);
@@ -1160,8 +1165,8 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	timer_setup(&ad->update_timer, update_timer_callback, 0);
 
 	for (u8 page = 0; page < ADIOS_BQ_PAGES; page++)
-		for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
-			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
+		for (u8 optype2 = 0; optype2 < ADIOS_OPTYPES; optype2++)
+			INIT_LIST_HEAD(&ad->batch_queue[page][optype2]);
 
 	spin_lock_init(&ad->lock);
 	spin_lock_init(&ad->pq_lock);
