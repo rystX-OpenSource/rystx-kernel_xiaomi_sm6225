@@ -733,6 +733,7 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 	struct adios_rq_data *rd = get_rq_data(rq);
 	bool dl_idx = adios_optype_not_read(rq);
 	u8 optype = adios_optype(rq);
+	unsigned long flags;
 
 	rd->block_size = blk_rq_bytes(rq);
 	rd->pred_lat =
@@ -742,16 +743,18 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 	 * - Needs to be processed ASAP at all costs in any case */
 	if (insert_flags & BLK_MQ_INSERT_AT_HEAD) {
 		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
-		spin_lock_irqsave(&ad->pq_lock);
+		spin_lock_irqsave(&ad->pq_lock, flags);
 		list_add_tail(&rq->queuelist, &ad->prio_queue[0]);
+		spin_unlock_irqrestore(&ad->pq_lock, flags);
 		return;
 	}
 	/* Tier-1: Integrity-sensitive Requests
 	 * - Needs to be FIFO across all optypes */
 	if (rq->cmd_flags & (REQ_FUA | REQ_PREFLUSH)) {
 		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
-		spin_lock_irqsave(&ad->pq_lock);
+		spin_lock_irqsave(&ad->pq_lock, flags);
 		list_add_tail(&rq->queuelist, &ad->prio_queue[1]);
+		spin_unlock_irqrestore(&ad->pq_lock, flags);
 		return;
 	}
 
@@ -774,14 +777,16 @@ static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
 	struct adios_rq_data *rd = get_rq_data(rq);
 	u8 optype = adios_optype(rq);
 	u8 idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
+	unsigned long flags;
 
 	rd->block_size = blk_rq_bytes(rq);
 	rd->pred_lat =
 		latency_model_predict(&ad->latency_model[optype], rd->block_size);
 
 	atomic64_add(rd->pred_lat, &ad->total_pred_lat);
-	spin_lock_irqsave(&ad->pq_lock);
+	spin_lock_irqsave(&ad->pq_lock, flags);
 	list_add_tail(&rq->queuelist, &ad->prio_queue[idx]);
+	spin_unlock_irqrestore(&ad->pq_lock, flags);
 
 	if (ad->latency_model[ADIOS_READ].base > 0 &&
 		ad->latency_model[ADIOS_WRITE].base > 0)
@@ -796,10 +801,11 @@ static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct request *rq;
 	bool stop = false;
+	unsigned long flags;
 	LIST_HEAD(free);
 
 	do {
-		spin_lock_irqsave(&ad->lock);
+		spin_lock_irqsave(&ad->lock, flags);
 		for (int i = 0; i < ADIOS_MAX_INSERTS_PER_LOCK; i++) {
 			if (list_empty(list)) {
 				stop = true;
@@ -809,6 +815,7 @@ static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 			list_del_init(&rq->queuelist);
 			ad->insert_request_fn(hctx, rq, insert_flags, &free);
 		}
+		spin_unlock_irqrestore(&ad->lock, flags);
 	} while (!stop);
 
 	blk_mq_free_requests(&free);
@@ -848,11 +855,12 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 	u8 optype;
 	bool page = !ad->bq_page, dl_idx, bias_idx, reduce_bias;
 	u64 added_lat = 0;
+	unsigned long flags;
 
 	// Reset batch queue counts for the back page
 	memset(&ad->batch_count[page], 0, sizeof(ad->batch_count[page]));
 
-	spin_lock_irqsave(&ad->lock);
+	spin_lock_irqsave(&ad->lock, flags);
 	while (true) {
 
 		// Check if there are any requests queued in the deadline tree
@@ -901,6 +909,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 tpl) {
 		optype_count[optype]++;
 		count++;
 	}
+	spin_unlock_irqrestore(&ad->lock, flags);
 
 	if (count) {
 		atomic64_add(added_lat, &ad->total_pred_lat);
@@ -923,14 +932,17 @@ static void flip_bq_page(struct adios_data *ad) {
 // Dispatch a request from the batch queues
 static struct request *dispatch_from_bq(struct adios_data *ad) {
 	struct request *rq = NULL;
+	unsigned long flags;
 
-	spin_lock_irqsave(&ad->bq_lock);
+	spin_lock_irqsave(&ad->bq_lock, flags);
 
 	u64 tpl = atomic64_read(&ad->total_pred_lat);
 
 	if (!ad->more_bq_ready && (!tpl || tpl < div_u64(
 			ad->global_latency_window * ad->bq_refill_below_ratio, 100)))
 		fill_batch_queues(ad, tpl);
+	
+	spin_unlock_irqrestore(&ad->bq_lock, flags);
 
 again:
 	// Check if there are any requests in the batch queues
@@ -955,8 +967,9 @@ again:
 // Dispatch a request from the priority queue
 static struct request *dispatch_from_pq(struct adios_data *ad) {
 	struct request *rq = NULL;
+	unsigned long flags;
 
-	spin_lock_irqsave(&ad->pq_lock);
+	spin_lock_irqsave(&ad->pq_lock, flags);
 
 	for (int i = 0; i < 2; i++) {
 		struct list_head *q = &ad->prio_queue[i];
@@ -966,6 +979,9 @@ static struct request *dispatch_from_pq(struct adios_data *ad) {
 			break;
 		}
 	}
+
+	spin_unlock_irqrestore(&ad->pq_lock, flags);
+
 	return rq;
 }
 
@@ -1024,18 +1040,25 @@ static void adios_finish_request(struct request *rq) {
 }
 
 static inline bool pq_has_work(struct adios_data *ad) {
-	spin_lock_irqsave(&ad->pq_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ad->pq_lock, flags);
 	for (int i = 0; i < 2; i++)
 		if (!list_empty(&ad->prio_queue[i])) return true;
+	spin_unlock_irqrestore(&ad->pq_lock, flags);
 	return false;
 }
 
 static inline bool bq_has_work(struct adios_data *ad) {
-	spin_lock_irqsave(&ad->bq_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ad->bq_lock, flags);
 
 	for (u8 i = 0; i < ADIOS_OPTYPES; i++)
 		if (!list_empty(&ad->batch_queue[ad->bq_page][i]))
 			return true;
+	
+	spin_unlock_irqrestore(&ad->bq_lock, flags);
 
 	return ad->more_bq_ready;
 }
@@ -1371,14 +1394,16 @@ static ssize_t adios_read_priority_store(
 	struct adios_data *ad = e->elevator_data;
 	int prio;
 	int ret;
+	unsigned long flags;
 
 	ret = kstrtoint(page, 10, &prio);
 	if (ret || prio < -20 || prio > 19)
 		return -EINVAL;
 
-	spin_lock_irqsave(&ad->lock);
+	spin_lock_irqsave(&ad->lock, flags);
 	ad->dl_prio[0] = prio;
 	ad->dl_bias = 0;
+	spin_unlock_irqrestore(&ad->lock, flags);
 
 	return count;
 }
