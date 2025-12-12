@@ -667,7 +667,7 @@ static void adios_limit_depth(unsigned int op, struct blk_mq_alloc_data *data) {
 	struct adios_data *ad = data->q->elevator->elevator_data;
 
 	// Do not throttle synchronous reads
-	if (op_is_sync(on) && !op_is_write(op))
+	if (op_is_sync(op) && !op_is_write(op))
 		return;
 
 	data->shallow_depth = to_word_depth(data->hctx, ad->async_depth);
@@ -728,7 +728,7 @@ static bool adios_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio) {
 
 // Insert a request into the scheduler (after Read & Write models stabilized)
 static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
-		struct request *rq, bool at_head) {
+		struct request *rq, bool at_head, struct list_head *free) {
 	struct request_queue *q = hctx->queue;
 	struct adios_data *ad = q->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
@@ -759,7 +759,7 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 		return;
 	}
 
-	if (blk_mq_sched_try_insert_merge(q, rq))
+	if (blk_mq_sched_try_insert_merge(q, rq, &free))
 		return;
 
 	add_to_dl_tree(ad, dl_idx, rq);
@@ -773,7 +773,7 @@ static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 
 // Insert a request into the scheduler (before Read & Write models stabilizes)
 static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
-		struct request *rq, bool at_head) {
+		struct request *rq, bool at_head, struct list_head *free) {
 	struct adios_data *ad = hctx->queue->elevator->elevator_data;
 	struct adios_rq_data *rd = get_rq_data(rq);
 	u8 optype = adios_optype(rq);
