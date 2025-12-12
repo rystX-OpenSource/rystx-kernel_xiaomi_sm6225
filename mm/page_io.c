@@ -276,7 +276,7 @@ static bool kcompressd_store(struct page *page)
 		/* Enqueue failed, so we must cancel the reference count */
 		put_page(page);
 	
-	spin_lock_irqrestore(&pgdat->kcompress_fifo_lock, flags);
+	spin_unlock_irqrestore(&pgdat->kcompress_fifo_lock, flags);
 
 	/* If we had to swap out the head folio, do it now.
 	 * This will block until the folio is written out.
@@ -312,7 +312,7 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	 * of both file and anon pages, try to do compression async
 	 * if possible
 	 */
-	if (kcompressd_store(folio))
+	if (kcompressd_store(page))
 		return 0;
 
 	ret = __swap_writepage(page, wbc, end_swap_bio_write);
