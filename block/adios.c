@@ -1064,8 +1064,14 @@ static inline bool bq_has_work(struct adios_data *ad) {
 }
 
 static inline bool dl_tree_has_work(struct adios_data *ad) {
-	spin_lock_irqsave(&ad->lock);
-	return ad->dl_queued;
+	u8 dl_queued;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ad->lock, flags);
+	dl_queued = ad->dl_queued;
+	spin_unlock_irqrestore(&ad->lock, flags);
+
+	return dl_queued;
 }
 
 // Check if there are any requests available for dispatch
@@ -1086,7 +1092,6 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	struct adios_data *ad;
 	struct elevator_queue *eq;
 	int ret = -ENOMEM;
-	u8 optype = 0;
 
 	eq = elevator_alloc(q, e);
 	if (!eq)
@@ -1127,8 +1132,8 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 		ad->dl_tree[i] = RB_ROOT_CACHED;
 	ad->dl_bias = 0;
 	ad->dl_queued = 0x0;
-	for (u8 i = 0; i < 2; i++)
-		ad->dl_prio[i] = default_dl_prio[i];
+	for (u8 j = 0; j < 2; j++)
+		ad->dl_prio[j] = default_dl_prio[j];
 
 	ad->aggr_buckets = kzalloc(sizeof(*ad->aggr_buckets), GFP_KERNEL);
 	if (!ad->aggr_buckets) {
@@ -1136,7 +1141,7 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 		goto destroy_dl_group_pool;
 	}
 
-	for (optype = 0; optype < ADIOS_OPTYPES; optype++) {
+	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++) {
 		struct latency_model *model = &ad->latency_model[optype];
 		seqlock_init(&model->lock);
 
@@ -1195,13 +1200,13 @@ put_eq:
 static void adios_exit_sched(struct elevator_queue *e) {
 	struct adios_data *ad = e->elevator_data;
 
-	timer_shutdown_sync(&ad->update_timer);
+	del_timer_sync(&ad->update_timer);
 
 	for (int i = 0; i < 2; i++)
 		WARN_ON_ONCE(!list_empty(&ad->prio_queue[i]));
 
-	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
-		struct latency_model *model = &ad->latency_model[i];
+	for (u8 j = 0; j < ADIOS_OPTYPES; j++) {
+		struct latency_model *model = &ad->latency_model[j];
 		free_percpu(model->pcpu_buckets);
 	}
 	kfree(ad->aggr_buckets);
@@ -1568,7 +1573,7 @@ static struct elv_fs_entry adios_sched_attrs[] = {
 
 // Define the ADIOS scheduler type
 static struct elevator_type mq_adios = {
-	.ops = {
+	.ops.mq = {
 		.next_request		= elv_rb_latter_request,
 		.former_request		= elv_rb_former_request,
 		.limit_depth		= adios_limit_depth,
