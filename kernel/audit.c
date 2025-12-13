@@ -131,7 +131,7 @@ static u32	audit_rate_limit;
 
 /* Number of outstanding audit_buffers allowed.
  * When set to zero, this means unlimited. */
-static u32	audit_backlog_limit = 64;
+static u32	audit_backlog_limit = 0;
 #define AUDIT_BACKLOG_WAIT_TIME (60 * HZ)
 static u32	audit_backlog_wait_time = AUDIT_BACKLOG_WAIT_TIME;
 
