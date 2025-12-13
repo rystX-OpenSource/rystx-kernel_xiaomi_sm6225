@@ -478,7 +478,7 @@ enum elv_merge elv_merge(struct request_queue *q, struct request **req,
  * Returns true if we merged, false otherwise. 'free' will contain all
  * requests that need to be freed.
  */
-bool elv_attempt_insert_merge(struct request_queue *q, struct request *rq
+bool elv_attempt_insert_merge(struct request_queue *q, struct request *rq,
 					struct list_head *free)
 {
 	struct request *__rq;
@@ -636,6 +636,8 @@ void elv_drain_elevator(struct request_queue *q)
 
 void __elv_add_request(struct request_queue *q, struct request *rq, int where)
 {
+	LIST_HEAD(free);
+
 	trace_block_rq_insert(q, rq);
 
 	blk_pm_add_request(q, rq);
@@ -683,7 +685,7 @@ void __elv_add_request(struct request_queue *q, struct request *rq, int where)
 		 * queue already, we are done - rq has now been freed,
 		 * so no need to do anything further.
 		 */
-		if (elv_attempt_insert_merge(q, rq))
+		if (elv_attempt_insert_merge(q, rq, &free))
 			break;
 		/* fall through */
 	case ELEVATOR_INSERT_SORT:

@@ -797,7 +797,7 @@ struct request *attempt_front_merge(struct request_queue *q, struct request *rq)
 	return NULL;
 }
 
-int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+bool blk_attempt_req_merge(struct request_queue *q, struct request *rq,
 			  struct request *next)
 {
 	return attempt_merge(q, rq, next);
