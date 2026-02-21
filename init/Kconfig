@@ -1285,6 +1285,14 @@ config SCHED_AUTOGROUP
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
 
+config SCHED_TUNE_DUMMY
+	bool "Dummy SCHEDTUNE nodes"
+	depends on SMP
+	depends on !CGROUP_SCHEDTUNE
+	default y
+	help
+	  Create dummy SCHEDTUNE nodes to satisfy rom compability.
+
 config SYSFS_DEPRECATED
 	bool "Enable deprecated sysfs features to support old userspace tools"
 	depends on SYSFS
