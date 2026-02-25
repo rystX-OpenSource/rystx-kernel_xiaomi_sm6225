@@ -6,22 +6,84 @@
 #include <generated/compile.h>
 #include <linux/version.h> /* LINUX_VERSION_CODE, KERNEL_VERSION macros */
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
+#include <uapi/asm-generic/errno.h>
+#else
+#include <asm-generic/errno.h>
+#endif
+
+#define ksu_get_uid_t(x) *(unsigned int *)&(x)
+
 #include "allowlist.h"
+#include "apk_sign.h"
+#include "app_profile.h"
+#include "arch.h"
 #include "core_hook.h"
 #include "feature.h"
-#include "klog.h" // IWYU pragma: keep
-#include "ksu.h"
-#include "throne_tracker.h"
-#include "sucompat.h"
+#include "file_wrapper.h"
+#include "kernel_compat.h"
+#include "klog.h"
 #include "ksud.h"
-#include "supercalls.h"
 #include "ksu.h"
+#include "manager.h"
+#include "sucompat.h"
+#include "supercalls.h"
+#include "throne_tracker.h"
+#include "su_mount_ns.h"
+#include "selinux/selinux.h"
+#include "selinux/sepolicy.h"
 
-struct cred* ksu_cred;
+// selinux includes
+#include <linux/lsm_audit.h>
+#include "avc_ss.h"
+#include "objsec.h"
+#include "ss/services.h"
+#include "ss/symtab.h"
+#include "xfrm.h"
+#ifndef KSU_COMPAT_USE_SELINUX_STATE
+#include "avc.h"
+#endif
+
+// unity build
+#include "tiny_sulog.c"
+#include "allowlist.c"
+#include "app_profile.c"
+#include "apk_sign.c"
+#include "sucompat.c"
+#include "throne_tracker.c"
+#include "core_hook.c"
+#include "supercalls.c"
+#include "feature.c"
+#include "su_mount_ns.c"
+#include "ksud.c"
+#include "kernel_compat.c"
+#include "file_wrapper.c"
+
+#include "selinux/selinux.c"
+#include "selinux/sepolicy.c"
+#include "selinux/rules.c"
+
+#ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+#ifdef CONFIG_ARM64
+#include "syscall_table_hook.c"
+#elif CONFIG_ARM
+#include "syscall_table_hook_arm.c"
+#endif
+#endif
 
 #ifdef CONFIG_KSU_KPROBES_KSUD
-extern void kp_ksud_init();
+#include "kp_ksud.c"
 #endif
+
+#ifdef CONFIG_KSU_KRETPROBES_SUCOMPAT
+#include "rp_sucompat.c"
+#endif
+
+#ifdef CONFIG_KSU_EXTRAS
+#include "extras.c"
+#endif
+
+struct cred* ksu_cred;
 
 extern void ksu_supercalls_init();
 
@@ -35,7 +97,7 @@ extern void ksu_supercalls_init();
 #endif
 
 #if defined(CONFIG_KSU_KRETPROBES_SUCOMPAT)
-	#define FEAT_2 " +kretprobes_sucompat"
+	#define FEAT_2 " +rp_sucompat"
 #else
 	#define FEAT_2 ""
 #endif
@@ -44,13 +106,13 @@ extern void ksu_supercalls_init();
 #else
 	#define FEAT_3 ""
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0) && !defined(CONFIG_KSU_LSM_SECURITY_HOOKS)
-	#define FEAT_4 " -lsm_hooks"
+#if defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
+	#define FEAT_4 " +sys_call_table_hook"
 #else
 	#define FEAT_4 ""
 #endif
-#if !(LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)) && defined(KSU_HAS_PATH_UMOUNT)
-	#define FEAT_5 " +path_umount"
+#if !defined(CONFIG_KSU_LSM_SECURITY_HOOKS)
+	#define FEAT_5 " -lsm_hooks"
 #else
 	#define FEAT_5 ""
 #endif
@@ -87,6 +149,14 @@ int __init kernelsu_init(void)
 	ksu_allowlist_init();
 
 	ksu_throne_tracker_init();
+
+	ksu_ksud_init();
+
+	ksu_file_wrapper_init();
+
+#ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+	ksu_syscall_table_hook_init();
+#endif
 
 #ifdef CONFIG_KSU_KPROBES_KSUD
 	kp_ksud_init();

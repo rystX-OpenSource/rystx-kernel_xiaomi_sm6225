@@ -2,13 +2,6 @@
 #include <linux/types.h>
 #include <linux/version.h>
 
-#include "../klog.h" // IWYU pragma: keep
-#include "selinux.h"
-#include "sepolicy.h"
-#include "ss/services.h"
-#include "linux/lsm_audit.h"
-#include "xfrm.h"
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 #define SELINUX_POLICY_INSTEAD_SELINUX_SS
 #endif
@@ -70,10 +63,11 @@ void apply_kernelsu_rules()
 	}
 
 	// our ksud triggered by init
-	// restore this as we dont really have a way to escape "before" ksud executes 
+	ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
+
+	// restored from https://github.com/tiann/KernelSU/pull/3031 
 	ksu_allow(db, "init", "adb_data_file", "file", ALL);
 	ksu_allow(db, "init", "adb_data_file", "dir", ALL); // #1289
-	ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
 
 	// copied from Magisk rules
 	// suRights
@@ -101,8 +95,7 @@ void apply_kernelsu_rules()
 	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
 	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
 	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
-	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process",
-		  "getattr");
+	ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
 
 	// Allow all binder transactions
 	ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "binder", ALL);
@@ -211,22 +204,22 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		char perm_buf[MAX_SEPOL_LEN];
 
 		char *s, *t, *c, *p;
-		if (get_object(src_buf, (void __user *)data.sepol1, sizeof(src_buf), &s) < 0) {
+		if (get_object(src_buf, (void __user *)(uintptr_t)data.sepol1, sizeof(src_buf), &s) < 0) {
 			pr_err("sepol: copy src failed.\n");
 			goto exit;
 		}
 
-		if (get_object(tgt_buf, (void __user *)data.sepol2, sizeof(tgt_buf), &t) < 0) {
+		if (get_object(tgt_buf, (void __user *)(uintptr_t)data.sepol2, sizeof(tgt_buf), &t) < 0) {
 			pr_err("sepol: copy tgt failed.\n");
 			goto exit;
 		}
 
-		if (get_object(cls_buf, (void __user *)data.sepol3, sizeof(cls_buf), &c) < 0) {
+		if (get_object(cls_buf, (void __user *)(uintptr_t)data.sepol3, sizeof(cls_buf), &c) < 0) {
 			pr_err("sepol: copy cls failed.\n");
 			goto exit;
 		}
 
-		if (get_object(perm_buf, (void __user *)data.sepol4, sizeof(perm_buf), &p) <
+		if (get_object(perm_buf, (void __user *)(uintptr_t)data.sepol4, sizeof(perm_buf), &p) <
 		    0) {
 			pr_err("sepol: copy perm failed.\n");
 			goto exit;
@@ -256,24 +249,24 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		char perm_set[MAX_SEPOL_LEN];
 
 		char *s, *t, *c;
-		if (get_object(src_buf, (void __user *)data.sepol1, sizeof(src_buf), &s) < 0) {
+		if (get_object(src_buf, (void __user *)(uintptr_t)data.sepol1, sizeof(src_buf), &s) < 0) {
 			pr_err("sepol: copy src failed.\n");
 			goto exit;
 		}
-		if (get_object(tgt_buf, (void __user *)data.sepol2, sizeof(tgt_buf), &t) < 0) {
+		if (get_object(tgt_buf, (void __user *)(uintptr_t)data.sepol2, sizeof(tgt_buf), &t) < 0) {
 			pr_err("sepol: copy tgt failed.\n");
 			goto exit;
 		}
-		if (get_object(cls_buf, (void __user *)data.sepol3, sizeof(cls_buf), &c) < 0) {
+		if (get_object(cls_buf, (void __user *)(uintptr_t)data.sepol3, sizeof(cls_buf), &c) < 0) {
 			pr_err("sepol: copy cls failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(operation, (void __user *)data.sepol4,
+		if (strncpy_from_user(operation, (void __user *)(uintptr_t)data.sepol4,
 				      sizeof(operation)) < 0) {
 			pr_err("sepol: copy operation failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(perm_set, (void __user *)data.sepol5, sizeof(perm_set)) <
+		if (strncpy_from_user(perm_set, (void __user *)(uintptr_t)data.sepol5, sizeof(perm_set)) <
 		    0) {
 			pr_err("sepol: copy perm_set failed.\n");
 			goto exit;
@@ -293,7 +286,7 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 	} else if (cmd == CMD_TYPE_STATE) {
 		char src[MAX_SEPOL_LEN];
 
-		if (strncpy_from_user(src, (void __user *)data.sepol1, sizeof(src)) < 0) {
+		if (strncpy_from_user(src, (void __user *)(uintptr_t)data.sepol1, sizeof(src)) < 0) {
 			pr_err("sepol: copy src failed.\n");
 			goto exit;
 		}
@@ -313,11 +306,11 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		char type[MAX_SEPOL_LEN];
 		char attr[MAX_SEPOL_LEN];
 
-		if (strncpy_from_user(type, (void __user *)data.sepol1, sizeof(type)) < 0) {
+		if (strncpy_from_user(type, (void __user *)(uintptr_t)data.sepol1, sizeof(type)) < 0) {
 			pr_err("sepol: copy type failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(attr, (void __user *)data.sepol2, sizeof(attr)) < 0) {
+		if (strncpy_from_user(attr, (void __user *)(uintptr_t)data.sepol2, sizeof(attr)) < 0) {
 			pr_err("sepol: copy attr failed.\n");
 			goto exit;
 		}
@@ -337,7 +330,7 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 	} else if (cmd == CMD_ATTR) {
 		char attr[MAX_SEPOL_LEN];
 
-		if (strncpy_from_user(attr, (void __user *)data.sepol1, sizeof(attr)) < 0) {
+		if (strncpy_from_user(attr, (void __user *)(uintptr_t)data.sepol1, sizeof(attr)) < 0) {
 			pr_err("sepol: copy attr failed.\n");
 			goto exit;
 		}
@@ -354,28 +347,28 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		char default_type[MAX_SEPOL_LEN];
 		char object[MAX_SEPOL_LEN];
 
-		if (strncpy_from_user(src, (void __user *)data.sepol1, sizeof(src)) < 0) {
+		if (strncpy_from_user(src, (void __user *)(uintptr_t)data.sepol1, sizeof(src)) < 0) {
 			pr_err("sepol: copy src failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(tgt, (void __user *)data.sepol2, sizeof(tgt)) < 0) {
+		if (strncpy_from_user(tgt, (void __user *)(uintptr_t)data.sepol2, sizeof(tgt)) < 0) {
 			pr_err("sepol: copy tgt failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(cls, (void __user *)data.sepol3, sizeof(cls)) < 0) {
+		if (strncpy_from_user(cls, (void __user *)(uintptr_t)data.sepol3, sizeof(cls)) < 0) {
 			pr_err("sepol: copy cls failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(default_type, (void __user *)data.sepol4,
+		if (strncpy_from_user(default_type, (void __user *)(uintptr_t)data.sepol4,
 				      sizeof(default_type)) < 0) {
 			pr_err("sepol: copy default_type failed.\n");
 			goto exit;
 		}
 		char *real_object;
-		if ((void __user *)data.sepol5 == NULL) {
+		if ((void __user *)(uintptr_t)data.sepol5 == NULL) {
 			real_object = NULL;
 		} else {
-			if (strncpy_from_user(object, (void __user *)data.sepol5,
+			if (strncpy_from_user(object, (void __user *)(uintptr_t)data.sepol5,
 					      sizeof(object)) < 0) {
 				pr_err("sepol: copy object failed.\n");
 				goto exit;
@@ -394,19 +387,19 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		char cls[MAX_SEPOL_LEN];
 		char default_type[MAX_SEPOL_LEN];
 
-		if (strncpy_from_user(src, (void __user *)data.sepol1, sizeof(src)) < 0) {
+		if (strncpy_from_user(src, (void __user *)(uintptr_t)data.sepol1, sizeof(src)) < 0) {
 			pr_err("sepol: copy src failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(tgt, (void __user *)data.sepol2, sizeof(tgt)) < 0) {
+		if (strncpy_from_user(tgt, (void __user *)(uintptr_t)data.sepol2, sizeof(tgt)) < 0) {
 			pr_err("sepol: copy tgt failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(cls, (void __user *)data.sepol3, sizeof(cls)) < 0) {
+		if (strncpy_from_user(cls, (void __user *)(uintptr_t)data.sepol3, sizeof(cls)) < 0) {
 			pr_err("sepol: copy cls failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(default_type, (void __user *)data.sepol4,
+		if (strncpy_from_user(default_type, (void __user *)(uintptr_t)data.sepol4,
 				      sizeof(default_type)) < 0) {
 			pr_err("sepol: copy default_type failed.\n");
 			goto exit;
@@ -427,15 +420,15 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		char name[MAX_SEPOL_LEN];
 		char path[MAX_SEPOL_LEN];
 		char context[MAX_SEPOL_LEN];
-		if (strncpy_from_user(name, (void __user *)data.sepol1, sizeof(name)) < 0) {
+		if (strncpy_from_user(name, (void __user *)(uintptr_t)data.sepol1, sizeof(name)) < 0) {
 			pr_err("sepol: copy name failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(path, (void __user *)data.sepol2, sizeof(path)) < 0) {
+		if (strncpy_from_user(path, (void __user *)(uintptr_t)data.sepol2, sizeof(path)) < 0) {
 			pr_err("sepol: copy path failed.\n");
 			goto exit;
 		}
-		if (strncpy_from_user(context, (void __user *)data.sepol3, sizeof(context)) <
+		if (strncpy_from_user(context, (void __user *)(uintptr_t)data.sepol3, sizeof(context)) <
 		    0) {
 			pr_err("sepol: copy context failed.\n");
 			goto exit;

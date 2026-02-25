@@ -6,6 +6,7 @@
 #include <linux/key.h>
 #include <linux/version.h>
 #include <linux/key.h>
+#include <linux/syscalls.h>
 #include <linux/cred.h>
 
 extern struct file *ksu_filp_open_compat(const char *filename, int flags,
@@ -38,7 +39,7 @@ __weak int close_fd(unsigned fd)
 }
 #endif
 
-extern long ksu_copy_from_user_nofault(void *dst, const void __user *src, size_t size);
+extern long copy_from_user_nofault(void *dst, const void __user *src, size_t size);
 
 /*
  * ksu_copy_from_user_retry
@@ -48,10 +49,9 @@ extern long ksu_copy_from_user_nofault(void *dst, const void __user *src, size_t
  * + hot since this is reused on sucompat
  */
 __attribute__((hot))
-static long ksu_copy_from_user_retry(void *to, 
-		const void __user *from, unsigned long count)
+static long ksu_copy_from_user_retry(void *to, const void __user *from, unsigned long count)
 {
-	long ret = ksu_copy_from_user_nofault(to, from, count);
+	long ret = copy_from_user_nofault(to, from, count);
 	if (likely(!ret))
 		return ret;
 
@@ -81,26 +81,10 @@ __weak char *bin2hex(char *dst, const void *src, size_t count)
 }
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
-__weak ssize_t strscpy(char *dest, const char *src, size_t count)
-{
-	return strlcpy(dest, src, count);
-}
-#endif
-
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0) && !defined(KSU_UL_HAS_FILE_INODE)
 static inline struct inode *file_inode(struct file *f)
 {
 	return f->f_path.dentry->d_inode;
-}
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-__weak int anon_inode_getfd_secure(const char *name, const struct file_operations *fops,
-			    void *priv, int flags,
-			    const struct inode *context_inode)
-{
-	return anon_inode_getfd(name, fops, priv, flags);
 }
 #endif
 
@@ -115,6 +99,13 @@ static inline struct inode_security_struct *selinux_inode(const struct inode *in
 static inline struct task_security_struct *selinux_cred(const struct cred *cred)
 {
 	return cred->security;
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION (4, 15, 0)
+__weak void groups_sort(struct group_info *group_info)
+{
+	return;
 }
 #endif
 
