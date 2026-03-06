@@ -2717,8 +2717,16 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
  *                          shorthand helpers
  ******************************************************************************/
 
+#define RESWAPPINESS_PROGNAME	"Re-swappiness: MGLRU anon/file independent aging"
+#define RESWAPPINESS_AUTHOR		"Masahito Suzuki"
+
+#define RESWAPPINESS_VERSION	"1.1"
+
 #define DEFINE_MAX_SEQ(lruvec)						\
-	unsigned long max_seq = READ_ONCE((lruvec)->lrugen.max_seq)
+	unsigned long max_seq[ANON_AND_FILE] = {			\
+		READ_ONCE((lruvec)->lrugen.max_seq[LRU_GEN_ANON]),	\
+		READ_ONCE((lruvec)->lrugen.max_seq[LRU_GEN_FILE]),	\
+	}
 
 #define DEFINE_MIN_SEQ(lruvec)						\
 	unsigned long min_seq[ANON_AND_FILE] = {			\
@@ -2730,6 +2738,9 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
 	for ((gen) = 0; (gen) < MAX_NR_GENS; (gen)++)			\
 		for ((type) = 0; (type) < ANON_AND_FILE; (type)++)	\
 			for ((zone) = 0; (zone) < MAX_NR_ZONES; (zone)++)
+
+#define for_each_evictable_type(type, swappiness)			\
+	for ((type) = min_type(swappiness); (type) <= max_type(swappiness); (type)++)
 
 static int page_lru_gen(struct page *page)
 {
@@ -2790,7 +2801,7 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 
 static int get_nr_gens(struct lruvec *lruvec, int type)
 {
-	return lruvec->lrugen.max_seq - lruvec->lrugen.min_seq[type] + 1;
+	return lruvec->lrugen.max_seq[type] - lruvec->lrugen.min_seq[type] + 1;
 }
 
 static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)
@@ -2840,8 +2851,10 @@ void lru_gen_add_mm(struct mm_struct *mm)
 		if (!lruvec)
 			continue;
 
-		if (lruvec->mm_state.tail == &mm_list->fifo)
-			lruvec->mm_state.tail = &mm->lru_gen.list;
+		for (int t = 0; t < ANON_AND_FILE; t++) {
+			if (mm_state->tail[t] == &mm_list->fifo)
+				mm_state->tail[t] = &mm->lru_gen.list;
+		}
 	}
 
 	list_add_tail(&mm->lru_gen.list, &mm_list->fifo);
@@ -2871,15 +2884,22 @@ void lru_gen_del_mm(struct mm_struct *mm)
 		if (!lruvec)
 			continue;
 
-		if (lruvec->mm_state.tail == &mm->lru_gen.list)
-			lruvec->mm_state.tail = lruvec->mm_state.tail->next;
+		for (int t = 0; t < ANON_AND_FILE; t++) {
+			/* where the current iteration continues after */
+			if (lruvec->mm_state.head[t] == &mm->lru_gen.list)
+				lruvec->mm_state.head[t] = lruvec->mm_state.head[t]->prev;
 
-		if (lruvec->mm_state.head != &mm->lru_gen.list)
-			continue;
+			if (lruvec->mm_state.tail[t] == &mm->lru_gen.list)
+				lruvec->mm_state.tail[t] = lruvec->mm_state.tail[t]->next;
+		}
+		
+		// Comment it, trying to match MGLRU code from 6.18.x
+		// if (lruvec->mm_state.head != &mm->lru_gen.list)
+		// 	continue;
 
-		lruvec->mm_state.head = lruvec->mm_state.head->next;
-		if (lruvec->mm_state.head == &mm_list->fifo)
-			WRITE_ONCE(lruvec->mm_state.seq, lruvec->mm_state.seq + 1);
+		// lruvec->mm_state.head = lruvec->mm_state.head->next;
+		// if (lruvec->mm_state.head == &mm_list->fifo)
+		// 	WRITE_ONCE(lruvec->mm_state.seq, lruvec->mm_state.seq + 1);
 	}
 
 	list_del_init(&mm->lru_gen.list);
@@ -3014,7 +3034,7 @@ static void reset_mm_stats(struct lruvec *lruvec, struct lru_gen_mm_walk *walk, 
 	lockdep_assert_held(&get_mm_list(lruvec_memcg(lruvec))->lock);
 
 	if (walk) {
-		hist = lru_hist_from_seq(walk->max_seq);
+		hist = lru_hist_from_seq(walk->max_seq[walk->aging_type]);
 
 		for (i = 0; i < NR_MM_STATS; i++) {
 			WRITE_ONCE(lruvec->mm_state.stats[hist][i],
@@ -3024,7 +3044,7 @@ static void reset_mm_stats(struct lruvec *lruvec, struct lru_gen_mm_walk *walk, 
 	}
 
 	if (NR_HIST_GENS > 1 && last) {
-		hist = lru_hist_from_seq(lruvec->mm_state.seq + 1);
+		hist = lru_hist_from_seq(lruvec->mm_state.seq[walk->aging_type] + 1);
 
 		for (i = 0; i < NR_MM_STATS; i++)
 			WRITE_ONCE(lruvec->mm_state.stats[hist][i], 0);
@@ -3064,6 +3084,7 @@ static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
 	bool first = false;
 	bool last = true;
 	struct mm_struct *mm = NULL;
+	int type = walk->aging_type;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct lru_gen_mm_list *mm_list = get_mm_list(memcg);
 	struct lru_gen_mm_state *mm_state = &lruvec->mm_state;
@@ -3081,36 +3102,36 @@ static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
 	 */
 	if (*iter)
 		mmput_async(*iter);
-	else if (walk->max_seq <= READ_ONCE(mm_state->seq))
+	else if (walk->max_seq[type] <= READ_ONCE(mm_state->seq[type]))
 		return false;
 
 	spin_lock(&mm_list->lock);
 
-	VM_BUG_ON(mm_state->seq + 1 < walk->max_seq);
-	VM_BUG_ON(*iter && mm_state->seq > walk->max_seq);
+	VM_BUG_ON(mm_state->seq[type] + 1 < walk->max_seq[type]);
+	VM_BUG_ON(*iter && mm_state->seq[type] > walk->max_seq[type]);
 	VM_BUG_ON(*iter && !mm_state->nr_walkers);
 
-	if (walk->max_seq <= mm_state->seq) {
+	if (walk->max_seq[type] <= mm_state->seq[type]) {
 		if (!*iter)
 			last = false;
 		goto done;
 	}
 
 	if (!mm_state->nr_walkers) {
-		VM_BUG_ON(mm_state->head && mm_state->head != &mm_list->fifo);
+		VM_BUG_ON(mm_state->head[type] && mm_state->head[type] != &mm_list->fifo);
 
-		mm_state->head = mm_list->fifo.next;
+		mm_state->head[type] = mm_list->fifo.next;
 		first = true;
 	}
 
-	while (!mm && mm_state->head != &mm_list->fifo) {
-		mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
+	while (!mm && mm_state->head[type] != &mm_list->fifo) {
+		mm = list_entry(mm_state->head[walk->aging_type], struct mm_struct, lru_gen.list);
 
-		mm_state->head = mm_state->head->next;
+		mm_state->head[type] = mm_state->head[type]->next;
 
 		/* full scan for those added after the last iteration */
-		if (!mm_state->tail || mm_state->tail == &mm->lru_gen.list) {
-			mm_state->tail = mm_state->head;
+		if (!mm_state->tail[type] || mm_state->tail[type] == &mm->lru_gen.list) {
+			mm_state->tail[type] = mm_state->head[type];
 			walk->full_scan = true;
 		}
 
@@ -3118,8 +3139,8 @@ static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
 			mm = NULL;
 	}
 
-	if (mm_state->head == &mm_list->fifo)
-		WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
+	if (mm_state->head[type] == &mm_list->fifo)
+		WRITE_ONCE(mm_state->seq[type], mm_state->seq[type] + 1);
 done:
 	if (*iter && !mm)
 		mm_state->nr_walkers--;
@@ -3130,7 +3151,7 @@ done:
 		last = false;
 
 	if (mm && first)
-		reset_bloom_filter(lruvec, walk->max_seq + 1);
+		reset_bloom_filter(lruvec, walk->max_seq[type] + 1);
 
 	if (*iter || last)
 		reset_mm_stats(lruvec, walk, last);
@@ -3142,24 +3163,24 @@ done:
 	return last;
 }
 
-static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
+static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq, int type)
 {
 	bool success = false;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct lru_gen_mm_list *mm_list = get_mm_list(memcg);
 	struct lru_gen_mm_state *mm_state = &lruvec->mm_state;
 
-	if (max_seq <= READ_ONCE(mm_state->seq))
+	if (max_seq <= READ_ONCE(mm_state->seq[type]))
 		return false;
 
 	spin_lock(&mm_list->lock);
 
-	VM_BUG_ON(mm_state->seq + 1 < max_seq);
+	VM_BUG_ON(mm_state->seq[type] + 1 < max_seq);
 
-	if (max_seq > mm_state->seq && !mm_state->nr_walkers) {
-		VM_BUG_ON(mm_state->head && mm_state->head != &mm_list->fifo);
+	if (max_seq > mm_state->seq[type] && !mm_state->nr_walkers) {
+		VM_BUG_ON(mm_state->head[type] && mm_state->head[type] != &mm_list->fifo);
 
-		WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
+		WRITE_ONCE(mm_state->seq[type], mm_state->seq[type] + 1);
 		reset_mm_stats(lruvec, NULL, true);
 		success = true;
 	}
@@ -3218,7 +3239,7 @@ static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
 	int hist, tier;
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 	bool clear = carryover ? NR_HIST_GENS == 1 : NR_HIST_GENS > 1;
-	unsigned long seq = carryover ? lrugen->min_seq[type] : lrugen->max_seq + 1;
+	unsigned long seq = carryover ? lrugen->min_seq[type] : lrugen->max_seq[type] + 1;
 
 	lockdep_assert_held(&lruvec_pgdat(lruvec)->lru_lock);
 
@@ -3356,7 +3377,7 @@ static void reset_batch_size(struct lruvec *lruvec, struct lru_gen_mm_walk *walk
 		WRITE_ONCE(lrugen->nr_pages[gen][type][zone],
 			   lrugen->nr_pages[gen][type][zone] + delta);
 
-		if (lru_gen_is_active(lruvec, gen))
+		if (lru_gen_is_active(lruvec, gen, type))
 			lru += LRU_ACTIVE;
 		update_lru_size(lruvec, lru, zone, delta);
 	}
@@ -3374,7 +3395,7 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
 		return true;
 
 	if (vma_is_anonymous(vma))
-		return !priv->can_swap;
+		return walk->aging_type == LRU_GEN_FILE || !priv->can_swap;
 
 	if (WARN_ON_ONCE(!vma->vm_file || !vma->vm_file->f_mapping))
 		return true;
@@ -3383,8 +3404,15 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
 	if (mapping_unevictable(mapping))
 		return true;
 
-	/* check readpage to exclude special mappings like dax, etc. */
-	return shmem_mapping(mapping) ? !priv->can_swap : !mapping->a_ops->readpage;
+	if (shmem_mapping(mapping))
+		return walk->aging_type == LRU_GEN_FILE || !priv->can_swap
+
+	/* file VMA: skip when aging anon type */
++	if (walk->aging_type == LRU_GEN_ANON)
++		return true;
+
+	/* to exclude special mappings like dax, etc. */
+	return !mapping->a_ops->readpage;
 }
 
 /*
@@ -3446,7 +3474,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 	struct lru_gen_mm_walk *priv = walk->private;
 	struct mem_cgroup *memcg = lruvec_memcg(priv->lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(priv->lruvec);
-	int old_gen, new_gen = lru_gen_from_seq(priv->max_seq);
+	int old_gen, new_gen = lru_gen_from_seq(priv->max_seq[walk->aging_type]);
 
 	VM_BUG_ON(pmd_trans_huge(*pmd) || pmd_devmap(*pmd));
 
@@ -3526,7 +3554,7 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
 	struct lru_gen_mm_walk *priv = walk->private;
 	struct mem_cgroup *memcg = lruvec_memcg(priv->lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(priv->lruvec);
-	int old_gen, new_gen = lru_gen_from_seq(priv->max_seq);
+	int old_gen, new_gen = lru_gen_from_seq(priv->max_seq[walk->aging_type]);
 
 	VM_BUG_ON(pud_trans_huge(*pud) || pud_devmap(*pud));
 
@@ -3680,7 +3708,7 @@ restart:
 			walk_pmd_range_locked(pud, addr, vma, walk, &pos);
 		}
 #endif
-		if (!priv->full_scan && !test_bloom_filter(priv->lruvec, priv->max_seq, pmd + i))
+		if (!priv->full_scan && !test_bloom_filter(priv->lruvec, priv->max_seq[walk->aging_type], pmd + i))
 			continue;
 
 		priv->mm_stats[MM_PMD_FOUND]++;
@@ -3691,7 +3719,7 @@ restart:
 		priv->mm_stats[MM_PMD_ADDED]++;
 
 		/* carry over to the next generation */
-		update_bloom_filter(priv->lruvec, priv->max_seq + 1, pmd + i);
+		update_bloom_filter(priv->lruvec, priv->max_seq[walk->aging_type] + 1, pmd + i);
 	}
 
 	walk_pmd_range_locked(pud, -1, vma, walk, &pos);
@@ -3822,7 +3850,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 	VM_BUG_ON(!seq_is_valid(lruvec));
 
 	for (type = !can_swap; type < ANON_AND_FILE; type++) {
-		while (min_seq[type] + MIN_NR_GENS <= lrugen->max_seq) {
+		while (min_seq[type] + MIN_NR_GENS <= lrugen->max_seq[type]) {
 			gen = lru_gen_from_seq(min_seq[type]);
 
 			for (zone = 0; zone < MAX_NR_ZONES; zone++) {
@@ -3834,12 +3862,6 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 		}
 next:
 		;
-	}
-
-	/* see the comment on lru_gen_struct */
-	if (can_swap) {
-		min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);
-		min_seq[LRU_GEN_FILE] = max(min_seq[LRU_GEN_ANON], lrugen->min_seq[LRU_GEN_FILE]);
 	}
 
 	for (type = !can_swap; type < ANON_AND_FILE; type++) {
@@ -3854,10 +3876,10 @@ next:
 	return success;
 }
 
-static void inc_max_seq(struct lruvec *lruvec)
+static void inc_max_seq(struct lruvec *lruvec, int type)
 {
 	int prev, next;
-	int type, zone;
+	int zone;
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
@@ -3874,44 +3896,41 @@ static void inc_max_seq(struct lruvec *lruvec)
 	 * overlap, cold/hot inversion happens. This can be solved by moving
 	 * pages from min_seq to min_seq+1 but is omitted for simplicity.
 	 */
-	prev = lru_gen_from_seq(lrugen->max_seq - 1);
-	next = lru_gen_from_seq(lrugen->max_seq + 1);
+	prev = lru_gen_from_seq(lrugen->max_seq[type] - 1);
+	next = lru_gen_from_seq(lrugen->max_seq[type] + 1);
 
-	for (type = 0; type < ANON_AND_FILE; type++) {
-		for (zone = 0; zone < MAX_NR_ZONES; zone++) {
-			enum lru_list lru = type * LRU_INACTIVE_FILE;
-			long delta = lrugen->nr_pages[prev][type][zone] -
-				     lrugen->nr_pages[next][type][zone];
+	for (zone = 0; zone < MAX_NR_ZONES; zone++) {
+		enum lru_list lru = type * LRU_INACTIVE_FILE;
+		long delta = lrugen->nr_pages[prev][type][zone] -
+			     lrugen->nr_pages[next][type][zone];
 
-			if (!delta)
-				continue;
+		if (!delta)
+			continue;
 
-			WARN_ON_ONCE(delta != (int)delta);
+		WARN_ON_ONCE(delta != (int)delta);
 
-			update_lru_size(lruvec, lru, zone, delta);
-			update_lru_size(lruvec, lru + LRU_ACTIVE, zone, -delta);
-		}
+		update_lru_size(lruvec, lru, zone, delta);
+		update_lru_size(lruvec, lru + LRU_ACTIVE, zone, -delta);
 	}
 
-	for (type = 0; type < ANON_AND_FILE; type++)
-		reset_ctrl_pos(lruvec, type, false);
+	reset_ctrl_pos(lruvec, type, false);
 
 	WRITE_ONCE(lrugen->timestamps[next], jiffies);
 	/* make sure preceding modifications appear */
-	smp_store_release(&lrugen->max_seq, lrugen->max_seq + 1);
+	smp_store_release(&lrugen->max_seq[type], lrugen->max_seq[type] + 1);
 
 	spin_unlock_irq(&pgdat->lru_lock);
 }
 
 static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
-			       struct scan_control *sc, bool can_swap, bool full_scan)
+			       struct scan_control *sc, int type, bool can_swap, bool full_scan)
 {
 	bool success;
 	struct lru_gen_mm_walk *walk;
 	struct mm_struct *mm = NULL;
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 
-	VM_BUG_ON(max_seq > READ_ONCE(lrugen->max_seq));
+	VM_BUG_ON(max_seq > READ_ONCE(lrugen->max_seq[type]));
 
 	/*
 	 * If the hardware doesn't automatically set the accessed bit, fallback
@@ -3920,17 +3939,18 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
 	 * is less efficient, but it avoids bursty page faults.
 	 */
 	if (!full_scan && (!arch_has_hw_pte_young() || !get_cap(LRU_GEN_MM_WALK))) {
-		success = iterate_mm_list_nowalk(lruvec, max_seq);
+		success = iterate_mm_list_nowalk(lruvec, max_seq, type);
 		goto done;
 	}
 
 	walk = alloc_mm_walk();
 	if (!walk) {
-		success = iterate_mm_list_nowalk(lruvec, max_seq);
+		success = iterate_mm_list_nowalk(lruvec, max_seq, type);
 		goto done;
 	}
 
 	walk->lruvec = lruvec;
+	walk->aging_type = type;
 	walk->max_seq = max_seq;
 	walk->can_swap = can_swap;
 	walk->full_scan = full_scan;
@@ -3948,12 +3968,12 @@ done:
 	if (!success) {
 		if (!current_is_kswapd() && !sc->priority)
 			wait_event_killable(lruvec->mm_state.wait,
-					    max_seq < READ_ONCE(lrugen->max_seq));
+					    max_seq < READ_ONCE(lrugen->max_seq[type]));
 
-		return max_seq < READ_ONCE(lrugen->max_seq);
+		return max_seq < READ_ONCE(lrugen->max_seq[type]);
 	}
 
-	VM_BUG_ON(max_seq != READ_ONCE(lrugen->max_seq));
+	VM_BUG_ON(max_seq != READ_ONCE(lrugen->max_seq[type]));
 
 	inc_max_seq(lruvec);
 	/* either this sees any waiters or they will see updated max_seq */
@@ -4025,6 +4045,8 @@ static long get_nr_evictable(struct lruvec *lruvec, unsigned long max_seq,
 static bool age_lruvec(struct lruvec *lruvec, struct scan_control *sc,
 		       unsigned long min_ttl)
 {
+	int type, gen;
+	unsigned long birth = jiffies;
 	bool need_aging;
 	long nr_to_scan;
 	int swappiness = get_swappiness(lruvec, sc);
@@ -4034,11 +4056,17 @@ static bool age_lruvec(struct lruvec *lruvec, struct scan_control *sc,
 	DEFINE_MIN_SEQ(lruvec);
 
 	if (min_ttl) {
-		int gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
-		unsigned long birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
+		for_each_evictable_type(type, swappiness) {
+			unsigned long ts;
 
-		if (time_is_after_jiffies(birth + min_ttl))
-			return false;
+			gen = lru_gen_from_seq(min_seq[type]);
+			birth = READ_ONCE(lruvec->lrugen.timestamps[type][gen]);
+			if (time_before(ts, birth))
+				birth = ts;
+
+			if (time_is_after_jiffies(birth + min_ttl))
+				return false;
+		}
 	}
 
 	if (prot == MEMCG_PROT_MIN)
@@ -4054,7 +4082,7 @@ static bool age_lruvec(struct lruvec *lruvec, struct scan_control *sc,
 		nr_to_scan++;
 
 	if (nr_to_scan && need_aging && (prot != MEMCG_PROT_LOW || sc->memcg_low_reclaim))
-		try_to_inc_max_seq(lruvec, max_seq, sc, swappiness, false);
+		try_to_inc_max_seq(lruvec, max_seq, sc, type, swappiness, false);
 
 	return true;
 }
@@ -4141,8 +4169,9 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 	struct mem_cgroup *memcg = page_memcg(pvmw->page);
 	struct pglist_data *pgdat = page_pgdat(pvmw->page);
 	struct lruvec *lruvec = mem_cgroup_lruvec(pgdat, memcg);
+	int ptype = page_is_file_cache(page);
 	DEFINE_MAX_SEQ(lruvec);
-	int old_gen, new_gen = lru_gen_from_seq(max_seq);
+	int old_gen, new_gen = lru_gen_from_seq(max_seq[ptype]);
 
 	lockdep_assert_held(pvmw->ptl);
 	VM_BUG_ON_PAGE(PageLRU(pvmw->page), pvmw->page);
@@ -4215,7 +4244,7 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 
 	/* feedback from rmap walkers to page table walkers */
 	if (suitable_to_scan(i, young))
-		update_bloom_filter(lruvec, max_seq, pvmw->pmd);
+		update_bloom_filter(lruvec, max_seq[ptype], pvmw->pmd);
 
 	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
 
@@ -4414,7 +4443,10 @@ static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
 	 * may_writepage. Check the remaining to prevent livelock if there is no
 	 * progress.
 	 */
-	return isolated || !remaining ? scanned : 0;
+	if (isolated || !remaining)
+		return scanned;
+
+	return 0;
 }
 
 static int get_tier_idx(struct lruvec *lruvec, int type)
@@ -4443,9 +4475,13 @@ static int get_type_to_scan(struct lruvec *lruvec, int swappiness, int *tier_idx
 	struct ctrl_pos sp, pv;
 	int gain[ANON_AND_FILE] = { swappiness, 200 - swappiness };
 
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	unsigned long anon_scanned, file_scanned;
+
 	/*
-	 * Compare the first tier of anon with that of file to determine which
-	 * type to scan. Also need to compare other tiers of the selected type
+	 * Compare the first tier of anon with that of file to determine which type to scan. 
+	 * This uses refault rates as feedback to adapt to changing workloads.
+	 * Also need to compare other tiers of the selected type
 	 * with the first tier of the other type to determine the last tier (of
 	 * the selected type) to evict.
 	 */
@@ -4535,8 +4571,20 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	if (try_to_inc_min_seq(lruvec, swappiness))
 		scanned++;
 
-	if (get_nr_gens(lruvec, !swappiness) == MIN_NR_GENS)
-		scanned = 0;
+	{
+		bool can_evict = false;
+		int type_i;
+
+		for_each_evictable_type(type_i, swappiness) {
+			if (lrugen->min_seq[type_i] + MIN_NR_GENS <=
+			    lrugen->max_seq[type_i]) {
+				can_evict = true;
+				break;
+			}
+		}
+		if (!can_evict)
+			scanned = 0;
+	}
 
 	spin_unlock_irq(&pgdat->lru_lock);
 
