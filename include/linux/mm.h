@@ -141,7 +141,7 @@ extern int mmap_rnd_compat_bits __read_mostly;
 
 extern int sysctl_max_map_count;
 
-extern bool sysctl_workingset_protection;
+extern int sysctl_workingset_protection;
 extern u8 sysctl_anon_min_ratio;
 extern u8 sysctl_clean_low_ratio;
 extern u8 sysctl_clean_min_ratio;
