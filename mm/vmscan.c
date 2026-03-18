@@ -2615,7 +2615,7 @@ out:
 	}
 }
 
-int vm_workingset_protection_update_handler(const struct ctl_table *table, int write,
+int vm_workingset_protection_update_handler(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
