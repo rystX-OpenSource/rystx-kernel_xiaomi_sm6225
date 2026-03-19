@@ -40,6 +40,5 @@ CLANG_FLAGS	+= -Wno-bool-operation
 CLANG_FLAGS	+= -Wno-gnu
 CLANG_FLAGS	+= -Wno-duplicate-decl-specifier
 CLANG_FLAGS	+= -Wno-format-invalid-specifier
-KBUILD_CFLAGS	+= $(CLANG_FLAGS)
-KBUILD_AFLAGS	+= $(CLANG_FLAGS)
+KBUILD_CPPFLAGS	+= $(CLANG_FLAGS)
 export CLANG_FLAGS
