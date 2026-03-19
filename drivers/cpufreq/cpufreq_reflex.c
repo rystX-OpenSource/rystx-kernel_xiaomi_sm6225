@@ -699,7 +699,7 @@ static void rfx_tunables_free(struct kobject *kobj)
 	kfree(to_rfx_tunables(attr_set));
 }
 
-static const struct kobj_type rfx_tunables_ktype = {
+static struct kobj_type rfx_tunables_ktype = {
 	.default_attrs = rfx_attrs,
 	.sysfs_ops = &governor_sysfs_ops,
 	.release = &rfx_tunables_free,
