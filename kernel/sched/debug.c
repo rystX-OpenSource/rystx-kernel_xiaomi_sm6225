@@ -841,6 +841,22 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	P(se.avg.util_est.ewma);
 	PM(se.avg.util_est.enqueued, ~UTIL_AVG_UNCHANGED);
 #endif
+#ifdef CONFIG_GORE_SCHED_DEBUG
+	{
+		static const char * const type_names[] = {
+			"REALTIME", "INTERACTIVE", "NO_TYPE",
+			"CPU_BOUND", "BATCH"
+		};
+		unsigned int tt = p->se.gore_node.task_type;
+
+		SEQ_printf(m, "%-45s: %20s\n", "gore_task_type",
+			   tt < 5 ? type_names[tt] : "UNKNOWN");
+		P(se.gore_node.bore_score);
+		PN(se.gore_node.est);
+		PN(se.gore_node.vruntime);
+		PN(se.gore_node.bore_burst_time);
+	}
+#endif /* CONFIG_GORE_SCHED_DEBUG */
 	P(policy);
 	P(prio);
 	if (task_has_dl_policy(p)) {

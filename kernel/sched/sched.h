@@ -551,6 +551,12 @@ extern void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
 			struct sched_entity *parent);
 extern void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
 
+#ifdef CONFIG_GORE_SCHED
+/* Expose reweight_entity so gore.c can adjust BORE-penalised weights */
+extern void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+			    unsigned long weight);
+#endif
+
 extern void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b);
 extern void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
 extern void unthrottle_cfs_rq(struct cfs_rq *cfs_rq);
@@ -646,6 +652,17 @@ struct cfs_rq {
 	u64			exec_clock;
 	u64			min_vruntime;
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreScheduler linked-list runqueue.
+	 * The RB-tree (tasks_timeline) is retained for migration
+	 * compatibility; scheduling decisions use the linked list.
+	 */
+	struct gore_node	*gore_head;
+	struct gore_node	*gore_tail;
+	struct gore_node	*gore_dedicated_cpu; /* current dedicated CPU-bound slot */
+#endif
+
 	struct rb_root_cached	tasks_timeline;
 
 	/*
@@ -654,6 +671,15 @@ struct cfs_rq {
 	 */
 	struct sched_entity	*curr;
 	struct sched_entity	*next;
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * local_cand_score caches the score of the current best
+	 * candidate for the global pull balancer to inspect without
+	 * locking this rq.
+	 */
+	u64			local_cand_score;
+#endif
 
 #ifdef	CONFIG_SCHED_DEBUG
 	unsigned int		nr_spread_over;
@@ -1090,6 +1116,11 @@ struct rq {
 	struct cfs_rq		cfs;
 	struct rt_rq		rt;
 	struct dl_rq		dl;
+
+#ifdef CONFIG_GORE_SCHED
+	unsigned int		gore_cand_score; /* cross-rq pull helper */
+	struct task_struct	*gore_to_migrate;
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this CPU: */

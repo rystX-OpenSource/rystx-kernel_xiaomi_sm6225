@@ -43,6 +43,10 @@ const_debug unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
  */
 unsigned int sysctl_sched_rt_period = 1000000;
 
+#ifdef CONFIG_GORE_SCHED
+#include "gore.h"
+#endif
+
 __read_mostly int scheduler_running;
 
 /*
@@ -736,7 +740,17 @@ int tg_nop(struct task_group *tg, void *data)
 
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * BORE: use the gore-adjusted effective priority to derive the
+	 * CFS load weight.  This makes bursty tasks (high bore_score)
+	 * appear as if they have a higher nice value, reducing their
+	 * scheduling share without changing their real nice.
+	 */
+	int prio = gore_effective_prio(p);
+#else
 	int prio = p->static_prio - MAX_RT_PRIO;
+#endif /* CONFIG_GORE_SCHED */
 	struct load_weight lw;
 
 	if (task_has_idle_policy(p)) {
@@ -2146,6 +2160,12 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	trace_sched_migrate_task(p, new_cpu);
 
 	if (task_cpu(p) != new_cpu) {
+#ifdef CONFIG_GORE_SCHED
+		if (task_is_gore_lat_sensitive(p)) {
+			gore_dec_nr_lat_sensitive(task_cpu(p));
+			gore_inc_nr_lat_sensitive(new_cpu);
+		}
+#endif
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
 		p->se.nr_migrations++;
@@ -3268,6 +3288,15 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.prev_sum_exec_runtime	= 0;
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Initialise the gore_node to safe zero state.
+	 * Final initialisation (with real timestamps) happens in
+	 * wake_up_new_task() after the task gets its first CPU.
+	 */
+	memset(&p->se.gore_node, 0, sizeof(p->se.gore_node));
+	p->se.gore_node.task_type = GORE_TT_NO_TYPE;
+#endif
 #ifdef CONFIG_SCHED_WALT
 	p->last_sleep_ts		= 0;
 	p->boost			= 0;
@@ -3543,6 +3572,10 @@ void wake_up_new_task(struct task_struct *p)
 	struct rq_flags rf;
 	struct rq *rq;
 
+#ifdef CONFIG_GORE_SCHED
+	int gore_target_cpu = 0;
+#endif
+
 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
 
 	p->state = TASK_RUNNING;
@@ -3558,6 +3591,12 @@ void wake_up_new_task(struct task_struct *p)
 	p->recent_used_cpu = task_cpu(p);
 	rseq_migrate(p);
 	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+#endif
+#ifdef CONFIG_GORE_SCHED
+	gore_target_cpu = task_cpu(p);
+	if (task_is_gore_lat_sensitive(p))
+		gore_inc_nr_lat_sensitive(gore_target_cpu);
+	p->se.gore_node.start_time = sched_clock();
 #endif
 	rq = __task_rq_lock(p, &rf);
 	update_rq_clock(rq);
@@ -4229,6 +4268,13 @@ void scheduler_tick(void)
 	rq_unlock(rq, &rf);
 
 	perf_event_task_tick();
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Decay the latency-sensitive counter each tick (TT algorithm).
+	 */
+	gore_dec_nr_lat_sensitive(rq->cpu);
+#endif
 
 #ifdef CONFIG_SMP
 	rq->idle_balance = idle_cpu(cpu);
@@ -7464,6 +7510,10 @@ void __init sched_init(void)
 	int i;
 
 	wait_bit_init();
+
+#ifdef CONFIG_GORE_SCHED
+	sched_init_gore();
+#endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	alloc_size += 2 * nr_cpu_ids * sizeof(void **);

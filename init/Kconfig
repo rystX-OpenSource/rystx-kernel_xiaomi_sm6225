@@ -837,6 +837,34 @@ config PELT_COMPATIBILITY_LAYER
 
 	  If unsure, say N.
 
+config GORE_SCHED
+	bool "GoreScheduler (unified BORE+CacULE+TT+ECHO)"
+	default y
+	help
+	  GoreSched combines four upstream CPU scheduler algorithms into a
+	  single coherent scheduling policy:
+
+	    BORE   - Burst-Oriented Response Enhancer (burst penalty)
+	    CacULE - Cache-Aware interactivity scoring with starvation fix
+	    TT     - Task-Type classifier (REALTIME→BATCH tiers)
+	    ECHO   - Exponential burst estimation for smooth penalty
+
+	  Interactive tasks (low gore_score) are naturally preferred.
+	  CPU-bound workloads are deprioritised within their tier but
+	  never starved.  The combined algorithm works as a single
+	  scheduler; no individual sub-scheduler can be selected.
+
+	  Say Y for desktop/laptop/gaming workloads.
+	  Say N for pure throughput servers (CFS is sufficient there).
+
+config GORE_SCHED_DEBUG
+	bool "GoreScheduler debug statistics"
+	default n
+	depends on GORE_SCHED && SCHED_DEBUG
+	help
+	  Enables per-task gore_score, bore_score, and task_type output
+	  in /proc/<pid>/sched and the sched debugfs entries.
+
 
 #
 # For architectures that want to enable the support for NUMA-affine scheduler

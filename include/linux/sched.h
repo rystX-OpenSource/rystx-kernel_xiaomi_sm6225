@@ -499,10 +499,57 @@ struct sched_statistics {
 #endif
 };
 
+#ifdef CONFIG_GORE_SCHED
+/*
+ * GoreScheduler per-entity state.
+ *
+ * This single structure combines all fields required by the four
+ * constituent algorithms (BORE, CacULE, TT, ECHO) to avoid
+ * redundant cache-line pollution.
+ */
+struct gore_node {
+	struct gore_node	*next;		/* linked-list forward link  */
+	struct gore_node	*prev;		/* linked-list backward link */
+
+	/* ---- Task Type (TT-derived) ---- */
+	unsigned int		task_type;	/* GORE_TT_* constant        */
+	unsigned int		rt_sticky;	/* ticks to remain REALTIME  */
+
+	/* ---- Burst tracking (TT/BORE) ---- */
+	u64					prev_wait_time;
+	u64					wait_time;
+	u64					prev_burst;
+	u64					curr_burst;
+	u64					burst;		/* burst before last sleep   */
+
+	/* ---- CacULE interactivity ---- */
+	u64					start_time;	/* task lifetime start (ns)  */
+	u64					last_run;	/* last exec_start (ns)      */
+	u64					vruntime;	/* CacULE virtual runtime    */
+
+	/* ---- ECHO exponential smoothing ---- */
+	u64					vburst;		/* virtual burst this window */
+	u64					est;		/* exponential smoothing est */
+
+	/* ---- BORE burst penalty ---- */
+	u64					bore_burst_time;	/* raw ns since last sleep */
+	u32					bore_curr_penalty;
+	u32					bore_prev_penalty;
+	u8					bore_score;	/* [0..39] added to nice     */
+	bool				bore_stop_update;
+
+	/* ---- Misc ---- */
+	bool				yielded;
+};
+#endif /* CONFIG_GORE_SCHED */
+
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
 	struct rb_node			run_node;
+#ifdef CONFIG_GORE_SCHED
+	struct gore_node	gore_node;
+#endif
 	u64				deadline;
 	u64				min_vruntime;
 	u64				min_slice;
@@ -520,6 +567,9 @@ struct sched_entity {
 	u64				vruntime;
 	s64				vlag;
 	u64				slice;
+#ifdef CONFIG_GORE_SCHED
+	bool			yielded_gore;
+#endif
 
 	u64				nr_migrations;
 

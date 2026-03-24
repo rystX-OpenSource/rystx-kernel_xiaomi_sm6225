@@ -100,6 +100,10 @@
 #include <linux/nmi.h>
 #endif
 
+#ifdef CONFIG_GORE_SCHED
+#include "sched/gore.h"
+#endif
+
 #if defined(CONFIG_SYSCTL)
 
 /* External variables not in a header file. */
@@ -722,6 +726,91 @@ static struct ctl_table kern_table[] = {
 		.extra2		= &one,
 	},
 #endif
+	/*
+	 * GoreScheduler runtime tunables.
+	 * All parameters are also available via sched_gore_sysctl_init()
+	 * late_initcall.  These kern_table entries are provided as a
+	 * belt-and-suspenders fallback in case late_initcall fires after
+	 * userspace first accesses the sysctl tree.
+	 */
+#ifdef CONFIG_GORE_SCHED
+	{
+		.procname	= "sched_gore_enabled",
+		.data		= &gore_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_gore_max_lifetime_ms",
+		.data		= &gore_max_lifetime_ms,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_burst_penalty_offset",
+		.data		= &gore_burst_penalty_offset,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_burst_penalty_scale",
+		.data		= &gore_burst_penalty_scale,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_burst_smoothness",
+		.data		= &gore_burst_smoothness,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_est_alpha",
+		.data		= &gore_est_alpha,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_burst_weight",
+		.data		= &gore_burst_weight,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_starve_div",
+		.data		= &gore_starve_div,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "sched_gore_lat_sens_enabled",
+		.data		= &gore_lat_sens_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_gore_dedicated_cpu_enabled",
+		.data		= &gore_dedicated_cpu_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif /* CONFIG_GORE_SCHED */
 #ifdef CONFIG_SCHED_DEBUG
 	{
 		.procname       = "sched_cstate_aware",

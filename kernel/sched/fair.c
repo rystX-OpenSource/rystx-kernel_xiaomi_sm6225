@@ -1230,6 +1230,18 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	resched = update_deadline(cfs_rq, curr);
 	update_min_vruntime(cfs_rq);
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * BORE+CacULE+ECHO: advance per-task gore accounting.
+	 * Must be called after the CFS vruntime update so that
+	 * calc_delta_fair() uses the current load weight (which
+	 * may include the BORE bore_score adjustment from last tick).
+	 */
+	if (entity_is_task(curr))
+		gore_update_curr(cfs_rq, curr, delta_exec,
+				 rq_clock_task(rq_of(cfs_rq)));
+#endif
+
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
@@ -3269,7 +3281,7 @@ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }
 
 static void place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags);
 
-static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
 	bool curr = cfs_rq->curr == se;
@@ -4958,6 +4970,15 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	account_entity_enqueue(cfs_rq, se);
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreSched: insert into the linked-list runqueue and update
+	 * wait/burst history on wakeup.
+	 */
+	gore_enqueue_entity(cfs_rq, se, flags,
+			    rq_clock_task(rq_of(cfs_rq)));
+#endif
+
 	/* Entity has migrated, no longer consider this task hot */
 	if (flags & ENQUEUE_MIGRATED)
 		se->exec_start = 0;
@@ -5091,6 +5112,17 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	update_stats_dequeue(cfs_rq, se, flags);
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreSched: remove from linked list.  On DEQUEUE_SLEEP also
+	 * restarts the BORE burst and finalises the ECHO EST.
+	 * Called before clear_buddies() since we may modify se fields.
+	 */
+	if (entity_is_task(se))
+		gore_dequeue_entity(cfs_rq, se, flags,
+				    rq_clock_task(rq_of(cfs_rq)));
+#endif
+
 	update_entity_lag(cfs_rq, se);
 	if (sched_feat(PLACE_REL_DEADLINE) && !sleep) {
 		se->deadline -= se->vruntime;
@@ -5176,6 +5208,18 @@ static struct sched_entity *
 pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *se = pick_eevdf(cfs_rq);
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreSched: delegate entirely to our O(n) linked-list scan.
+	 * The RB-tree pick below is bypassed; it is only used for
+	 * __pick_first_entity() in the no-GORE path.
+	 */
+	if (gore_enabled) {
+		se = gore_pick_next_entity(cfs_rq, curr);
+		if (se)
+			return se;
+	}
+#endif
 
 	/*
 	 * Picking the ->next buddy will affect latency but not fairness.
@@ -5229,6 +5273,17 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreSched: re-run pick_next_entity at each tick.
+	 * If a better candidate exists, reschedule immediately.
+	 */
+	if (gore_enabled && pick_next_entity(cfs_rq, curr) != curr) {
+		resched_curr(rq_of(cfs_rq));
+		return;
+	}
+#endif
 
 	/*
 	 * Ensure that runnable average is periodically updated.
@@ -8732,6 +8787,14 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	if (unlikely(throttled_hierarchy(cfs_rq_of(pse))))
 		return;
 
+#ifdef CONFIG_GORE_SCHED
+	if (gore_enabled) {
+		if (gore_check_preempt(cfs_rq_of(se), se, pse))
+			goto preempt;
+		return;
+	}
+#endif
+
 	if (sched_feat(NEXT_BUDDY) && !(wake_flags & WF_FORK) && !pse->sched_delayed) {
 		set_next_buddy(pse);
 	}
@@ -8945,6 +9008,18 @@ static void yield_task_fair(struct rq *rq)
 	struct task_struct *curr = rq->curr;
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
 	struct sched_entity *se = &curr->se;
+#ifdef CONFIG_GORE_SCHED
+	if (gore_enabled) {
+		update_rq_clock(rq);
+		update_curr(cfs_rq);
+		gore_yield_entity(se);
+		if (unlikely(rq->nr_running == 1))
+			return;
+		clear_buddies(cfs_rq, se);
+		set_skip_buddy(se);
+		return;
+	}
+#endif
 
 	/*
 	 * Are we the only task in the tree?
@@ -12881,6 +12956,12 @@ static void task_fork_fair(struct task_struct *p)
 	struct rq *rq = this_rq();
 	struct rq_flags rf;
 
+#ifdef CONFIG_GORE_SCHED
+	if (gore_enabled)
+		gore_init_entity(&p->se, sched_clock());
+	gore_task_fork(p);
+#endif
+
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
 
@@ -12892,6 +12973,16 @@ static void task_fork_fair(struct task_struct *p)
 		update_curr(cfs_rq);
 	place_entity(cfs_rq, se, ENQUEUE_INITIAL);
 	rq_unlock(rq, &rf);
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreSched: adjust load weight using BORE effective prio.
+	 * Called after rq_unlock so we don't hold rq lock over a
+	 * potentially expensive weight table lookup.
+	 */
+	if (gore_enabled)
+		set_load_weight(p, false);
+#endif
 }
 
 /*
@@ -13062,6 +13153,12 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreSched: initialise linked-list head/tail/dedicated-cpu fields.
+	 */
+	gore_init_cfs_rq(cfs_rq);
+#endif
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
 #ifdef CONFIG_SMP
 	raw_spin_lock_init(&cfs_rq->removed.lock);
