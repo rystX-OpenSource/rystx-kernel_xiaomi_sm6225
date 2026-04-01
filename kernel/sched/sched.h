@@ -645,6 +645,7 @@ struct cfs_rq {
 	u64			avg_load;
 
 	u64			zero_vruntime;
+	u64			exec_clock;
 
 	struct rb_root_cached	tasks_timeline;
 
@@ -654,6 +655,10 @@ struct cfs_rq {
 	 */
 	struct sched_entity	*curr;
 	struct sched_entity	*next;
+
+#ifdef	CONFIG_SCHED_DEBUG
+	unsigned int		nr_spread_over;
+#endif
 
 #ifdef CONFIG_SMP
 	/*
@@ -1225,6 +1230,7 @@ struct rq {
 	/* latency stats */
 	struct sched_info	rq_sched_info;
 	unsigned long long	rq_cpu_time;
+	/* could above be rq->cfs_rq.exec_clock + rq->rt_rq.rt_runtime ? */
 
 	/* sys_sched_yield() stats */
 	unsigned int		yld_count;
