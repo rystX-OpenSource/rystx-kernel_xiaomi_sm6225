@@ -54,21 +54,10 @@ show_one(input_boost_ms);
 store_one(input_boost_ms);
 cpu_boost_attr_rw(input_boost_ms);
 
-static unsigned int powerkey_input_boost_ms = 400;
-show_one(powerkey_input_boost_ms);
-store_one(powerkey_input_boost_ms);
-cpu_boost_attr_rw(powerkey_input_boost_ms);
-
 static unsigned int sched_boost_on_input;
 show_one(sched_boost_on_input);
 store_one(sched_boost_on_input);
 cpu_boost_attr_rw(sched_boost_on_input);
-
-
-static bool sched_boost_on_powerkey_input = true;
-show_one(sched_boost_on_powerkey_input);
-store_one(sched_boost_on_powerkey_input);
-cpu_boost_attr_rw(sched_boost_on_powerkey_input);
 
 static bool sched_boost_active;
 
@@ -371,21 +360,9 @@ static int cpu_boost_init(void)
 		pr_err("Failed to create input_boost_freq node: %d\n", ret);
 
 	ret = sysfs_create_file(cpu_boost_kobj,
-				&powerkey_input_boost_freq_attr.attr);
-	if (ret)
-		pr_err("Failed to create powerkey_input_boost_freq node: %d\n",
-			ret);
-
-	ret = sysfs_create_file(cpu_boost_kobj,
 				&sched_boost_on_input_attr.attr);
 	if (ret)
 		pr_err("Failed to create sched_boost_on_input node: %d\n", ret);
-
-	ret = sysfs_create_file(cpu_boost_kobj,
-				&sched_boost_on_powerkey_input_attr.attr);
-	if (ret)
-		pr_err("Failed to create sched_boost_on_powerkey_input node: %d\n",
-			ret);
 
 	ret = input_register_handler(&cpuboost_input_handler);
 	return 0;
