@@ -40,7 +40,7 @@
 #include "lpm-levels.h"
 #include <trace/events/power.h>
 #include "../clk/clk.h"
-#ifdef CONFIG_DRM_PANEL
+#ifdef CONFIG_LPM_WFI_SCREEN_ON
 #include <drm/drm_panel.h>
 #endif
 #define CREATE_TRACE_POINTS
@@ -97,7 +97,7 @@ static void cluster_prepare(struct lpm_cluster *cluster,
 static bool print_parsed_dt;
 module_param_named(print_parsed_dt, print_parsed_dt, bool, 0664);
 
-#ifdef CONFIG_DRM_PANEL
+#ifdef CONFIG_LPM_WFI_SCREEN_ON
 static bool sleep_disabled = true;
 module_param_named(sleep_disabled, sleep_disabled, bool, 0444);
 
@@ -1756,7 +1756,7 @@ static int lpm_probe(struct platform_device *pdev)
 	unsigned int cpu;
 	struct hrtimer *cpu_histtimer;
 	struct kobject *module_kobj = NULL;
-#ifdef CONFIG_DRM_PANEL
+#ifdef CONFIG_LPM_WFI_SCREEN_ON
 	struct drm_panel *active_panel = get_active_panel();
 
 	if (!active_panel)

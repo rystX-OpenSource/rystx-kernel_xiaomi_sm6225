@@ -39,6 +39,14 @@ depends on PPC
 source "drivers/cpuidle/Kconfig.powerpc"
 endmenu
 
+config LPM_WFI_SCREEN_ON
+	bool "Use only WFI idle state when screen is on"
+	depends on DRM_PANEL
+	help
+	  Disables deep idle states when the screen is on, using only the
+	  shallowest idle state (WFI). Requires get_active_panel() to be
+	  exported by the panel driver.
+
 endif
 
 config ARCH_NEEDS_CPU_IDLE_COUPLED
