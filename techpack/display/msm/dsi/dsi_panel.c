@@ -1127,25 +1127,21 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 
 #ifdef CONFIG_TARGET_PROJECT_C3Q
     if (refresh_rate_cus >= 48 && refresh_rate_cus <= 72) {
-        u32 old_fps = mode->refresh_rate;
+		u32 old_fps = mode->refresh_rate;
         
         mode->refresh_rate = refresh_rate_cus;
+		DSI_INFO("Using dynamic engine calculation for %u FPS\n", refresh_rate_cus);
 
-        if (mode->clk_rate_hz > 0) {
-            u64 new_clk = div_u64(mode->clk_rate_hz * refresh_rate_cus, old_fps);
+        if (mode->clk_rate_hz > 0 && old_fps > 0) {
+            u64 new_clk = (u64)mode->clk_rate_hz * refresh_rate_cus;
+            do_div(new_clk, old_fps); 
             
-            mode->clk_rate_hz = new_clk;
-            
+            mode->clk_rate_hz = (u32)new_clk;
+
             if (display_mode && display_mode->priv_info) {
-                display_mode->priv_info->clk_rate_hz = new_clk;
+                display_mode->priv_info->clk_rate_hz = mode->clk_rate_hz;
+				DSI_INFO("Calculated scaling: %llu Hz for %u FPS\n", new_clk, refresh_rate_cus);
             }
-            DSI_INFO("Calculated scaling: %llu Hz for %u FPS\n", new_clk, refresh_rate_cus);
-        } else {
-            mode->clk_rate_hz = 0;
-            if (display_mode && display_mode->priv_info) {
-                display_mode->priv_info->clk_rate_hz = 0;
-            }
-            DSI_INFO("Using dynamic engine calculation for %u FPS\n", refresh_rate_cus);
         }
     }
 #endif
