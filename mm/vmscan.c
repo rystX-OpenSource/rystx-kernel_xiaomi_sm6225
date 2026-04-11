@@ -4226,29 +4226,7 @@ int kswapd_run(int nid)
 			pgdat->kswapd[hid] = NULL;
 		}
 	}
-
 	kswapd_threads_current = nr_threads;
-
-	ret = kfifo_alloc(&pgdat->kcompress_fifo,
-			KCOMPRESS_FIFO_SIZE * sizeof(struct page *),
-			GFP_KERNEL);
-	if (ret) {
-		pr_err("%s: fail to kfifo_alloc\n", __func__);
-		return ret;
-	}
-
-	printk(KERN_INFO "[BACKPORT] Kcompressd-Unofficial 0.5 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)");
-	pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
-			"kcompressd%d", nid);
-	if (IS_ERR(pgdat->kcompressd)) {
-		pr_err("Failed to start kcompressd on node %d，ret=%ld\n",
-				nid, PTR_ERR(pgdat->kcompressd));
-		pgdat->kcompressd = NULL;
-		kfifo_free(&pgdat->kcompress_fifo);
-	} else {
-		wake_up_process(pgdat->kcompressd);
-	}
-
 	return ret;
 }
 

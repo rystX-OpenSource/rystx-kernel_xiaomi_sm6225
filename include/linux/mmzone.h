@@ -697,12 +697,6 @@ typedef struct pglist_data {
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
 
-#define KCOMPRESS_FIFO_SIZE 256
-	wait_queue_head_t kcompressd_wait;
-	struct task_struct *kcompressd;
-	struct kfifo kcompress_fifo;
-	spinlock_t kcompress_fifo_lock;
-
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;
 	enum zone_type kcompactd_classzone_idx;
