@@ -18,14 +18,7 @@ libfdt		= $(addprefix libfdt/,$(libfdt-objs))
 fdtoverlay-objs	:= $(libfdt) fdtoverlay.o util.o
 
 # Source files need to get at the userspace version of libfdt_env.h to compile
-HOST_EXTRACFLAGS += -I $(srctree)/$(src)/libfdt
-
-ifeq ($(wildcard /usr/include/yaml.h),)
-HOST_EXTRACFLAGS += -DNO_YAML
-else
-dtc-objs	+= yamltree.o
-HOSTLDLIBS_dtc	:= -lyaml
-endif
+HOST_EXTRACFLAGS := -I $(srctree)/$(src)/libfdt
 
 # Generated files need one more search path to include headers in source tree
 HOSTCFLAGS_dtc-lexer.lex.o := -I $(srctree)/$(src)
