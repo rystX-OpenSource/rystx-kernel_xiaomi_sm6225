@@ -1989,7 +1989,7 @@ struct reclaim_param reclaim_task_nomap(struct task_struct *task,
 		goto out;
 	mmap_read_lock(mm);
 
-	proc_reclaim_notify((unsigned long)task_pid(task), (void *)&rp);
+	proc_reclaim_notify(task_tgid_nr(task), (void *)&rp);
 
 	mmap_read_unlock(mm);
 	mmput(mm);
