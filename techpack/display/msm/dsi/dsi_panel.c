@@ -25,6 +25,22 @@
 #include <linux/powersuspend.h>
 #endif
 
+#ifdef CONFIG_TARGET_PROJECT_C3Q
+unsigned int refresh_rate_cus = 60;
+
+static int __init read_refresh_rate_cmd(char *s)
+{
+	if (s)
+		refresh_rate_cus = simple_strtoul(s, NULL, 0);
+
+	if (refresh_rate_cus < 48 || refresh_rate_cus > 72)
+		refresh_rate_cus = 60;
+
+	return 1;
+}
+__setup("refresh.rate=", read_refresh_rate_cmd);
+#endif
+
 /**
  * topology is currently defined by a set of following 3 values:
  * 1. num of layer mixers
@@ -1108,6 +1124,31 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		       rc);
 		goto error;
 	}
+
+#ifdef CONFIG_TARGET_PROJECT_C3Q
+    if (refresh_rate_cus >= 48 && refresh_rate_cus <= 72) {
+        u32 old_fps = mode->refresh_rate;
+        
+        mode->refresh_rate = refresh_rate_cus;
+
+        if (mode->clk_rate_hz > 0) {
+            u64 new_clk = div_u64(mode->clk_rate_hz * refresh_rate_cus, old_fps);
+            
+            mode->clk_rate_hz = new_clk;
+            
+            if (display_mode && display_mode->priv_info) {
+                display_mode->priv_info->clk_rate_hz = new_clk;
+            }
+            DSI_INFO("Calculated scaling: %llu Hz for %u FPS\n", new_clk, refresh_rate_cus);
+        } else {
+            mode->clk_rate_hz = 0;
+            if (display_mode && display_mode->priv_info) {
+                display_mode->priv_info->clk_rate_hz = 0;
+            }
+            DSI_INFO("Using dynamic engine calculation for %u FPS\n", refresh_rate_cus);
+        }
+    }
+#endif
 
 	rc = utils->read_u32(utils->data, "qcom,mdss-dsi-panel-width",
 				  &mode->h_active);
