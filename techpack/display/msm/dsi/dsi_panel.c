@@ -55,7 +55,81 @@ void set_lcd_reset_gpio_keep_high(bool en)
 	lcd_reset_keep_high = en;
 }
 EXPORT_SYMBOL(set_lcd_reset_gpio_keep_high);
-#endif
+
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+unsigned int refresh_rate_cus = 60;
+
+static int __init read_refresh_rate_cmd(char *s)
+{
+	if (s)
+		refresh_rate_cus = simple_strtoul(s, NULL, 0);
+
+	if (refresh_rate_cus < 48 || refresh_rate_cus > 76)
+		refresh_rate_cus = 60;
+
+	return 1;
+}
+__setup("refresh.rate=", read_refresh_rate_cmd);
+
+/**
+ * dsi_panel_apply_custom_rr - Handle high refresh rates for C3Q Panel
+ * @mode: The display mode structure to modify
+ * @priv_info: The hardware-specific private info structure
+ *
+ * This function handles the "High Refresh Rate Wall" by adjusting horizontal timing
+ * porches and recalculating the bit clock to prevent screen flickering.
+ */
+static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
+                      struct dsi_display_mode_priv_info *priv_info)
+{
+    if (refresh_rate_cus < 48 || refresh_rate_cus > 76)
+        return;
+
+    u32 old_fps = mode->refresh_rate ? mode->refresh_rate : 60;
+    u64 base_clk = (u64)mode->clk_rate_hz;
+
+    DSI_INFO("custom_rr: Starting Custom RR for %uHz (Default: %uHz)\n", 
+         refresh_rate_cus, old_fps);
+
+    if (refresh_rate_cus >= 70) {
+        mode->h_front_porch += 12;
+        mode->h_sync_width   += 4;
+        mode->h_back_porch    += 8;
+        mode->v_front_porch   += 2;
+        
+        DSI_INFO("custom_rr: Stability offsets applied (H-FP:+12, H-SW:+4, H-BP:+8, V-FP:+2)\n");
+    }
+
+    if (base_clk == 0) {
+        u32 h_total = mode->h_active + mode->h_front_porch + 
+                      mode->h_back_porch + mode->h_sync_width;
+        u32 v_total = mode->v_active + mode->v_front_porch + 
+                      mode->v_back_porch + mode->v_sync_width;
+        
+        u64 pixel_clk = (u64)h_total * v_total * refresh_rate_cus;
+        mode->clk_rate_hz = (u32)(pixel_clk * 3); 
+
+        DSI_INFO("custom_rr: Wake-up fix! Bit Clock: %uHz (P-Clk: %lluHz)\n", 
+                 mode->clk_rate_hz, pixel_clk);
+    } else {
+        u64 new_clk = base_clk * refresh_rate_cus;
+        do_div(new_clk, old_fps); 
+        mode->clk_rate_hz = (u32)new_clk;
+        DSI_INFO("custom_rr: Scaled existing clock to %uHz\n", mode->clk_rate_hz);
+    }
+
+    mode->refresh_rate = refresh_rate_cus;
+
+    if (priv_info) {
+        priv_info->clk_rate_hz = mode->clk_rate_hz;
+        DSI_INFO("custom_rr: priv_info updated for hardware sync\n");
+    }
+
+    DSI_INFO("custom_rr: Final timings -> H-FP: %u, V-FP: %u, FPS: %u\n",
+             mode->h_front_porch, mode->v_front_porch, mode->refresh_rate);
+}
+#endif /* CONFIG_DSI_PANEL_CUSTOM_RR */
+#endif /* CONFIG_TARGET_PROJECT_C3Q */
 
 enum dsi_dsc_ratio_type {
 	DSC_8BPC_8BPP,
@@ -1150,10 +1224,6 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		DSI_ERR("qcom,mdss-dsi-h-sync-skew is not defined, rc=%d\n",
 				rc);
 
-	DSI_DEBUG("panel horz active:%d front_portch:%d back_porch:%d sync_skew:%d\n",
-		mode->h_active, mode->h_front_porch, mode->h_back_porch,
-		mode->h_sync_width);
-
 	rc = utils->read_u32(utils->data, "qcom,mdss-dsi-panel-height",
 				  &mode->v_active);
 	if (rc) {
@@ -1185,6 +1255,15 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		       rc);
 		goto error;
 	}
+
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+    dsi_panel_apply_custom_rr(mode, display_mode->priv_info);
+#endif
+
+	DSI_DEBUG("panel horz active:%d front_portch:%d back_porch:%d sync_skew:%d\n",
+		mode->h_active, mode->h_front_porch, mode->h_back_porch,
+		mode->h_sync_width);
+	
 	DSI_DEBUG("panel vert active:%d front_portch:%d back_porch:%d pulse_width:%d\n",
 		mode->v_active, mode->v_front_porch, mode->v_back_porch,
 		mode->v_sync_width);
