@@ -40,7 +40,7 @@
 #include "lpm-levels.h"
 #include <trace/events/power.h>
 #include "../clk/clk.h"
-#ifdef CONFIG_DRM_PANEL
+#ifdef CONFIG_DRM
 #include <drm/drm_panel.h>
 #endif
 #define CREATE_TRACE_POINTS
@@ -97,28 +97,28 @@ static void cluster_prepare(struct lpm_cluster *cluster,
 static bool print_parsed_dt;
 module_param_named(print_parsed_dt, print_parsed_dt, bool, 0664);
 
-#ifdef CONFIG_DRM_PANEL
+#ifdef CONFIG_DRM
 static bool sleep_disabled = true;
 module_param_named(sleep_disabled, sleep_disabled, bool, 0444);
 
-static int lpm_drm_panel_notify(struct notifier_block *nb,
+static int lpm_drm_notify(struct notifier_block *nb,
 		unsigned long val, void *ptr)
 {
-	struct drm_panel_notifier *evdata = ptr;
+	struct drm_notify_data *evdata = ptr;
 	int *blank;
 
-	if (val != DRM_PANEL_EARLY_EVENT_BLANK || !evdata || !evdata->data)
+	if (val != DRM_EARLY_EVENT_BLANK || !evdata || !evdata->data)
 		return NOTIFY_OK;
 
 	blank = evdata->data;
 	switch (*blank) {
-	case DRM_PANEL_BLANK_UNBLANK:
+	case DRM_BLANK_UNBLANK:
 		sleep_disabled = true;
 		wake_up_all_idle_cpus();
 		break;
-	case DRM_PANEL_BLANK_POWERDOWN:
-	case DRM_PANEL_BLANK_LP1:
-        case DRM_PANEL_BLANK_LP2:
+	case DRM_BLANK_POWERDOWN:
+	case DRM_BLANK_LP1:
+    case DRM_BLANK_LP2:
 		sleep_disabled = false;
 		wake_up_all_idle_cpus();
 		break;
@@ -129,11 +129,9 @@ static int lpm_drm_panel_notify(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
-static struct notifier_block drm_notifier = {
-	.notifier_call = lpm_drm_panel_notify,
+static struct notifier_block lpm_drm_notifier = {
+	.notifier_call = lpm_drm_notify,
 };
-
-extern struct drm_panel *get_active_panel(void);
 #else
 static bool sleep_disabled;
 module_param_named(sleep_disabled, sleep_disabled, bool, 0664);
@@ -1756,13 +1754,8 @@ static int lpm_probe(struct platform_device *pdev)
 	unsigned int cpu;
 	struct hrtimer *cpu_histtimer;
 	struct kobject *module_kobj = NULL;
-#ifdef CONFIG_DRM_PANEL
-	struct drm_panel *active_panel = get_active_panel();
-
-	if (!active_panel)
-		return -EPROBE_DEFER;
-
-	ret = drm_panel_notifier_register(active_panel, &drm_notifier);
+#ifdef CONFIG_DRM
+	ret = drm_register_client(&lpm_drm_notifier);
 	if (ret)
 		pr_err("Failed to register DRM panel notifier, ret=%d\n", ret);
 	else
