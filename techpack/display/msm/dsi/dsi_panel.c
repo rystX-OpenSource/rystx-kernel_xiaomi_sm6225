@@ -33,7 +33,7 @@ static int __init read_refresh_rate_cmd(char *s)
 	if (s)
 		refresh_rate_cus = simple_strtoul(s, NULL, 0);
 
-	if (refresh_rate_cus < 48 || refresh_rate_cus > 75)
+	if (refresh_rate_cus < 48 || refresh_rate_cus > 72)
 		refresh_rate_cus = 60;
 
 	return 1;
@@ -1126,7 +1126,7 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 	}
 
 #ifdef CONFIG_TARGET_PROJECT_C3Q
-    if (refresh_rate_cus >= 48 && refresh_rate_cus <= 75) {
+    if (refresh_rate_cus >= 48 && refresh_rate_cus <= 72) {
 		u32 old_fps = mode->refresh_rate;
         
         mode->refresh_rate = refresh_rate_cus;
