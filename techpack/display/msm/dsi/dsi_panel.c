@@ -83,6 +83,9 @@ __setup("rystx.rr=", read_refresh_rate_cmd);
 static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
                       struct dsi_display_mode_priv_info *priv_info)
 {
+	char clean_name[32] = "Generic Panel";
+    const char *full_name = NULL;
+	
     if (refresh_rate_cus < 48 || refresh_rate_cus > 76)
         return;
 
