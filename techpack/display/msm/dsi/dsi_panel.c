@@ -57,6 +57,7 @@ void set_lcd_reset_gpio_keep_high(bool en)
 EXPORT_SYMBOL(set_lcd_reset_gpio_keep_high);
 
 #ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+static struct dsi_panel *rr_global_panel = NULL;
 unsigned int refresh_rate_cus = 60;
 
 static int __init read_refresh_rate_cmd(char *s)
@@ -69,7 +70,7 @@ static int __init read_refresh_rate_cmd(char *s)
 
 	return 1;
 }
-__setup("refresh.rate=", read_refresh_rate_cmd);
+__setup("rystx.rr=", read_refresh_rate_cmd);
 
 /**
  * dsi_panel_apply_custom_rr - Handle high refresh rates for C3Q Panel
@@ -85,6 +86,20 @@ static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
     if (refresh_rate_cus < 48 || refresh_rate_cus > 76)
         return;
 
+	if (rr_global_panel && rr_global_panel->name) {
+        full_name = rr_global_panel->name;
+        
+        if (strnstr(full_name, "nt36525b", strlen(full_name))) {
+            strlcpy(clean_name, "Novatek NT36525B", sizeof(clean_name));
+        } else if (strnstr(full_name, "ft8006s", strlen(full_name))) {
+            strlcpy(clean_name, "FocalTech FT8006S", sizeof(clean_name));
+        } else {
+            strlcpy(clean_name, "OEM Custom", sizeof(clean_name));
+        }
+    }
+
+	DSI_INFO("custom_rr: Current active panel: %s\n", clean_name);
+
     u32 old_fps = mode->refresh_rate ? mode->refresh_rate : 60;
     u64 base_clk = (u64)mode->clk_rate_hz;
 
@@ -96,7 +111,7 @@ static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
         mode->h_sync_width   += 4;
         mode->h_back_porch    += 16;
         
-        DSI_INFO("custom_rr: Ghost touch fix applied (H-FP:+4, H-SW:+4, H-BP:+16)\n");
+        DSI_INFO("custom_rr: Custom offsets applied (H-FP:+4, H-SW:+4, H-BP:+16)\n");
     }
 
     if (base_clk == 0) {
@@ -110,7 +125,7 @@ static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
 
         mode->clk_rate_hz = (calculated_bit_clk / 1000000) * 1000000;
 
-        DSI_INFO("custom_rr: Clean Clock: %uHz (HTOT:%u VTOT:%u)\n", 
+        DSI_INFO("custom_rr: Clean Clock: %uHz (H-TOT:%u V-TOT:%u)\n", 
                  mode->clk_rate_hz, h_total, v_total);
     } else {
         u64 new_clk = base_clk * refresh_rate_cus;
@@ -3859,6 +3874,12 @@ error:
 
 void dsi_panel_put(struct dsi_panel *panel)
 {
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+    if (rr_global_panel == panel) {
+        rr_global_panel = NULL;
+        pr_info("custom_rr: Global panel pointer detached\n");
+    }
+#endif
 	drm_panel_remove(&panel->drm_panel);
 
 	/* free resources allocated for ESD check */
@@ -4275,6 +4296,10 @@ int dsi_panel_get_mode(struct dsi_panel *panel,
 		DSI_ERR("invalid params\n");
 		return -EINVAL;
 	}
+
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+	rr_global_panel = panel;
+#endif
 
 	mutex_lock(&panel->panel_lock);
 	utils = &panel->utils;
