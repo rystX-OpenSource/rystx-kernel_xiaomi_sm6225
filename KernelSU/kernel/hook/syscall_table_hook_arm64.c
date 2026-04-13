@@ -44,12 +44,9 @@ static syscall_fn_t aarch64_execve = NULL;
 static long hook_aarch64_execve(const struct pt_regs *regs)
 {
 	const char __user **filename = (const char __user **)&regs->regs[0];
-
-#ifdef CONFIG_KSU_FEATURE_ADBROOT
 	void ***envp = (void ***)&regs->regs[2];
-	ksu_adb_root_handle_execve(filename, envp);
-#endif
-	ksu_handle_execve_sucompat(NULL, filename, NULL, NULL, NULL);
+
+	ksu_handle_execve_sucompat(NULL, filename, NULL, envp, NULL);
 	return aarch64_execve(regs);
 }
 
@@ -109,12 +106,9 @@ static syscall_fn_t armeabi_execve = NULL;
 static long hook_armeabi_execve(const struct pt_regs *regs)
 {
 	const char __user **filename = (const char __user **)&regs->regs[0];
-
-#ifdef CONFIG_KSU_FEATURE_ADBROOT
 	void ***envp = (void ***)&regs->regs[2];
-	ksu_adb_root_handle_execve(filename, envp);
-#endif
-	ksu_handle_execve_sucompat(NULL, filename, NULL, NULL, NULL);
+
+	ksu_handle_execve_sucompat(NULL, filename, NULL, envp, NULL);
 	return armeabi_execve(regs);
 }
 
@@ -175,10 +169,7 @@ static long hook_aarch64_execve(const char __user * filename,
 				const char __user *const __user * argv,
 				const char __user *const __user * envp)
 {
-#ifdef CONFIG_KSU_FEATURE_ADBROOT
-	ksu_adb_root_handle_execve(&filename, (void ***)&envp);
-#endif
-	ksu_handle_execve_sucompat(NULL, &filename, NULL, NULL, NULL);
+	ksu_handle_execve_sucompat(NULL, &filename, NULL, (void ***)&envp, NULL);
 	return aarch64_execve(filename, argv, envp);
 }
 
@@ -229,10 +220,7 @@ static long hook_armeabi_execve(const char __user * filename,
 				const compat_uptr_t __user * argv,
 				const compat_uptr_t __user * envp)
 {
-#ifdef CONFIG_KSU_FEATURE_ADBROOT
-	ksu_adb_root_handle_execve(&filename, (void ***)&envp);
-#endif
-	ksu_handle_execve_sucompat(NULL, &filename, NULL, NULL, NULL);
+	ksu_handle_execve_sucompat(NULL, &filename, NULL, (void ***)&envp, NULL);
 	return armeabi_execve(filename, argv, envp);
 }
 

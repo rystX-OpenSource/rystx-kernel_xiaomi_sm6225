@@ -10,7 +10,7 @@ static struct key *init_session_keyring = NULL;
 
 bool is_init(const struct cred* cred);
 
-static int install_session_keyring(struct key *keyring)
+static inline int install_session_keyring(struct key *keyring)
 {
 	struct cred *new;
 	int ret;
@@ -58,13 +58,23 @@ static noinline void ksu_grab_init_session_keyring(const char *filename)
 	pr_info("%s: init_session_keyring: 0x%lx \n", __func__, (uintptr_t)init_session_keyring);
 }
 
-struct file *ksu_filp_open_compat(const char *filename, int flags, umode_t mode)
+static noinline struct file *ksu_filp_open_compat(const char *filename, int flags, umode_t mode)
 {
-	// normally we only put this on ((current->flags & PF_WQ_WORKER) || (current->flags & PF_KTHREAD))
-	// but in the grand scale of things, this does NOT matter.
-	if (init_session_keyring && !current_cred()->session_keyring)
-		install_session_keyring(init_session_keyring);
+	// it used to be that we put this on (current->flags & PF_WQ_WORKER)
+	// but since things actually needing this has been offloaded to kthread
+	// like allowlist write, we check for that instead.
+	if (!(current->flags & PF_KTHREAD))
+		goto filp_open;
+	
+	if (!init_session_keyring)
+		goto filp_open;
 
+	if (current_cred()->session_keyring)
+		goto filp_open;
+
+	install_session_keyring(init_session_keyring);
+
+filp_open:
 	return filp_open(filename, flags, mode);
 }
 #define filp_open ksu_filp_open_compat
@@ -74,7 +84,7 @@ static inline void ksu_grab_init_session_keyring(const char *filename) {} // no-
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 // https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L418
-ssize_t ksu_kernel_read_compat(struct file *p, void *buf, size_t count, loff_t *pos)
+static noinline ssize_t ksu_kernel_read_compat(struct file *p, void *buf, size_t count, loff_t *pos)
 {
 	mm_segment_t old_fs;
 	old_fs = get_fs();
@@ -84,7 +94,7 @@ ssize_t ksu_kernel_read_compat(struct file *p, void *buf, size_t count, loff_t *
 	return result;
 }
 // https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L512
-ssize_t ksu_kernel_write_compat(struct file *p, const void *buf, size_t count, loff_t *pos)
+static noinline ssize_t ksu_kernel_write_compat(struct file *p, const void *buf, size_t count, loff_t *pos)
 {
 	mm_segment_t old_fs;
 	old_fs = get_fs();
@@ -119,24 +129,17 @@ static inline void ksu_kvfree(void *buf)
 #endif
 
 // for supercalls.c fd install tw
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
-#ifndef TWA_RESUME
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0) && !defined(TWA_RESUME)
 #define TWA_RESUME 1
 #endif
-#endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 0)
+// this is ksys_close, however that is spotty to use 
+// as 5.10 backported close_fd and rekt ksys_close
+// so we use what it does internally, __close_fd
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
+#define close_fd(fd) __close_fd(current->files, fd)
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 0)
 #define close_fd sys_close
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
-#include <linux/fdtable.h>
-__weak int close_fd(unsigned fd)
-{
-	// this is ksys_close, but that shit is inline
-	// its problematic to cascade a weak symbol for it
-	return __close_fd(current->files, fd);
-}
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
@@ -269,13 +272,8 @@ static inline u64 ksu_ktime_get_ns(void) { return ktime_to_ns(ktime_get()); }
 #endif
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION (4, 9, 0)
-static inline __s64 ksu_sign_extend64(__u64 value, int index)
-{
-	__u8 shift = 63 - index;
-	return (__s64)(value << shift) >> shift;
-}
-#define untagged_addr(addr) ksu_sign_extend64(addr, 55)
+#ifndef untagged_addr
+#define untagged_addr(addr) (addr)
 #endif
 
 static inline void ksu_kfree_byref(void *buf) { kfree(*(void **)buf); }

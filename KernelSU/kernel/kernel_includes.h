@@ -145,16 +145,25 @@
  */
 #if !defined(CONFIG_FORTIFY_SOURCE)
 
+#define memchr		__builtin_memchr
 #define memcmp		__builtin_memcmp
 #define memcpy		__builtin_memcpy
 #define memmove		__builtin_memmove
 #define memset		__builtin_memset
+#define strcasecmp	__builtin_strcasecmp
+#define strcat		__builtin_strcat
 #define strchr		__builtin_strchr
 #define strcmp		__builtin_strcmp
 #define strcpy		__builtin_strcpy
+#define strcspn		__builtin_strcspn
 #define strlen		__builtin_strlen
+#define strncasecmp	__builtin_strncasecmp
+#define strncat		__builtin_strncat
 #define strncmp		__builtin_strncmp
 #define strncpy		__builtin_strncpy
+#define strpbrk		__builtin_strpbrk
+#define strrchr		__builtin_strrchr
+#define strspn		__builtin_strspn
 #define strstr		__builtin_strstr
 
 #endif // !CONFIG_FORTIFY_SOURCE
