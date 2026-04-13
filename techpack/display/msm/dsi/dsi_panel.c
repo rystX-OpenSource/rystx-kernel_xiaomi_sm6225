@@ -92,12 +92,11 @@ static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
          refresh_rate_cus, old_fps);
 
     if (refresh_rate_cus >= 70) {
-        mode->h_front_porch += 12;
+        mode->h_front_porch += 4;
         mode->h_sync_width   += 4;
-        mode->h_back_porch    += 8;
-        mode->v_front_porch   += 2;
+        mode->h_back_porch    += 16;
         
-        DSI_INFO("custom_rr: Stability offsets applied (H-FP:+12, H-SW:+4, H-BP:+8, V-FP:+2)\n");
+        DSI_INFO("custom_rr: Ghost touch fix applied (H-FP:+4, H-SW:+4, H-BP:+16)\n");
     }
 
     if (base_clk == 0) {
@@ -107,15 +106,17 @@ static void dsi_panel_apply_custom_rr(struct dsi_mode_info *mode,
                       mode->v_back_porch + mode->v_sync_width;
         
         u64 pixel_clk = (u64)h_total * v_total * refresh_rate_cus;
-        mode->clk_rate_hz = (u32)(pixel_clk * 3); 
+        u32 calculated_bit_clk = (u32)(pixel_clk * 3); 
 
-        DSI_INFO("custom_rr: Wake-up fix! Bit Clock: %uHz (P-Clk: %lluHz)\n", 
-                 mode->clk_rate_hz, pixel_clk);
+        mode->clk_rate_hz = (calculated_bit_clk / 1000000) * 1000000;
+
+        DSI_INFO("custom_rr: Clean Clock: %uHz (HTOT:%u VTOT:%u)\n", 
+                 mode->clk_rate_hz, h_total, v_total);
     } else {
         u64 new_clk = base_clk * refresh_rate_cus;
-        do_div(new_clk, old_fps); 
-        mode->clk_rate_hz = (u32)new_clk;
-        DSI_INFO("custom_rr: Scaled existing clock to %uHz\n", mode->clk_rate_hz);
+        do_div(new_clk, old_fps);
+        mode->clk_rate_hz = ((u32)new_clk / 1000000) * 1000000;
+        DSI_INFO("custom_rr: Scaled and rounded clock to %uHz\n", mode->clk_rate_hz);
     }
 
     mode->refresh_rate = refresh_rate_cus;
