@@ -1600,23 +1600,21 @@ static int fts_ts_suspend(struct device *dev)
     if (ts_data->gesture_mode) {
         fts_gesture_suspend(ts_data);
     } else {
-	//check this
         fts_irq_disable();
-        FTS_INFO("make TP enter into sleep mode");
-        ret = fts_write_reg(FTS_REG_POWER_MODE, FTS_REG_POWER_MODE_SLEEP);
-        if (ret < 0)
-            FTS_ERROR("set TP to sleep mode fail, ret=%d", ret);
-
-        if (!ts_data->ic_info.is_incell) {
-#if FTS_POWER_SOURCE_CUST_EN
-            ret = fts_power_source_suspend(ts_data);
-            if (ret < 0) {
-                FTS_ERROR("power enter suspend fail");
-            }
-#endif
+        
+        /* * FIX: Check if the hardware is already being reset by Techpack.
+         * If the GPIO is already 0, the DSI bridge has won the race.
+         * Writing to SPI now will cause a bus timeout/panic.
+         */
+        if (gpio_get_value(ts_data->pdata->reset_gpio) != 0) {
+            FTS_INFO("Hardware alive, sending sleep command");
+            fts_write_reg(FTS_REG_POWER_MODE, FTS_REG_POWER_MODE_SLEEP);
         }
-        /* touch reset gpio pull down */
-        gpio_direction_output(fts_data->pdata->reset_gpio, 0 );
+
+        /* * FIX: REMOVE the line below. 
+         * On khaje, pulling this low here conflicts with the DSI bridge doze state.
+         * gpio_direction_output(fts_data->pdata->reset_gpio, 0); 
+         */
     }
 
     fts_release_all_finger();
