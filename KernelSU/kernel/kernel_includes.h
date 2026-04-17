@@ -33,6 +33,7 @@
 #include <linux/ioctl.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
+#include <linux/kref.h>
 #include <linux/kthread.h>
 #include <linux/limits.h>
 #include <linux/list.h>
@@ -125,6 +126,10 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/sched/user.h>
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
+#include <linux/hashtable.h>
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 5, 0)
