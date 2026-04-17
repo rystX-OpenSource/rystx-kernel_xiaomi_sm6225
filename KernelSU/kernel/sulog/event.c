@@ -25,13 +25,8 @@ static void ksu_sulog_fill_task_info(struct ksu_sulog_event *event, __u16 event_
 	event->pid = task_pid_nr(current);
 	event->tgid = task_tgid_nr(current);
 	event->ppid = task_ppid_nr(current);
-
-	kuid_t current_uid = current_uid();
-	kuid_t current_euid = current_euid();
-
-	event->uid = ksu_get_uid_t(current_uid);
-	event->euid = ksu_get_uid_t(current_euid);
-
+	event->uid = current_uid().val;
+	event->euid = current_euid().val;
 	get_task_comm(event->comm, current);
 }
 

@@ -67,8 +67,7 @@ static __always_inline bool is_su_allowed(const void **ptr_to_check)
 		return false;
 
 	// with seccomp check above, we can make this neutral
-	kuid_t current_uid = current_uid();
-	if (!ksu_is_allow_uid_for_current( ksu_get_uid_t(current_uid) ))
+	if (!ksu_is_allow_uid_for_current(current_uid().val))
 		return false;
 
 	// first check the pointer-to-pointer
@@ -175,8 +174,7 @@ no_escalate:
 }
 
 // sys_faccessat
-int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
-			 int *__unused_flags)
+int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags)
 {
 	if (!is_su_allowed((const void **)filename_user))
 		return 0;
@@ -194,8 +192,7 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 }
 
 // sys_execve, compat_sys_execve
-static int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
-				void *argv, void *envp, int *flags)
+static int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user, void *argv, void *envp, int *flags)
 {
 	if (unlikely(!ksu_boot_completed))
 		sys_execve_escape_ksud(filename_user);
@@ -210,17 +207,23 @@ static int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user
 	return ksu_sucompat_user_common(filename_user, "sys_execve", true, 'x');
 }
 
-static noinline int ksu_sucompat_kernel_common(void *filename_ptr, const char *function_name, bool escalate)
+static __always_inline int ksu_sucompat_kernel_common(void **filename_ptr, void *argv, void *envp, const char *function_name)
 {
+	if (unlikely(!ksu_boot_completed))
+		kernel_execve_escape_ksud((void *)*filename_ptr);
 
-	if (likely(memcmp(filename_ptr, SU_PATH, sizeof(SU_PATH))))
+#ifdef CONFIG_KSU_FEATURE_ADBROOT
+	ksu_adb_root_handle_execveat((void *)*filename_ptr, envp);
+#endif
+
+	if (!is_su_allowed((const void **)filename_ptr))
+		return 0;
+
+	if (likely(memcmp(*filename_ptr, SU_PATH, sizeof(SU_PATH))))
 		return 0;
 
 	// we only handle execve here after removing vfs_statx hook for >= 6.1
 	write_sulog('x');
-
-	if (!escalate)
-		goto no_escalate;
 
 #ifdef CONFIG_KSU_FEATURE_SULOG
 	ksu_sulog_emit(KSU_SULOG_EVENT_SUCOMPAT, NULL, NULL, GFP_KERNEL);
@@ -235,15 +238,13 @@ static noinline int ksu_sucompat_kernel_common(void *filename_ptr, const char *f
 
 	path_put(&kpath);
 	pr_info("%s su->ksud!\n", function_name);
-	memcpy(filename_ptr, KSUD_PATH, sizeof(KSUD_PATH));
+	memcpy(*filename_ptr, KSUD_PATH, sizeof(KSUD_PATH));
 	return 0;
 
 no_ksud:
-no_escalate:
 	pr_info("%s su->sh!\n", function_name);
-	memcpy(filename_ptr, SH_PATH, sizeof(SH_PATH));
+	memcpy(*filename_ptr, SH_PATH, sizeof(SH_PATH));
 	return 0;
-
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
@@ -251,37 +252,14 @@ no_escalate:
 // take note: struct filename **filename
 int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
 {
-	if (unlikely(!ksu_boot_completed))
-		kernel_execve_escape_ksud((void *)(*filename_ptr)->name);
-
-#ifdef CONFIG_KSU_FEATURE_ADBROOT
-	ksu_adb_root_handle_execveat((void *)(*filename_ptr)->name, envp);
-#endif
-	if (!is_su_allowed((const void **)filename_ptr))
-		return 0;
-
-	return ksu_sucompat_kernel_common((void *)(*filename_ptr)->name, "do_execveat_common", true);
-}
-int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
-{
-	// literally just an alias due to old hooks
-	return ksu_handle_execveat(fd, filename_ptr, argv, envp, flags);
+	return ksu_sucompat_kernel_common((void **)&(*filename_ptr)->name, argv, envp, "do_execveat_common");
 }
 #else
 // for do_execve_common on < 3.14
 // take note: char **filename
 int ksu_legacy_execve_sucompat(const char **filename_ptr, void *argv, void *envp)
 {
-	if (unlikely(!ksu_boot_completed))
-		kernel_execve_escape_ksud((void *)*filename_ptr);
-
-#ifdef CONFIG_KSU_FEATURE_ADBROOT
-	ksu_adb_root_handle_execveat((void *)*filename_ptr, envp);
-#endif
-	if (!is_su_allowed((const void **)filename_ptr))
-		return 0;
-
-	return ksu_sucompat_kernel_common((void *)*filename_ptr, "do_execve_common", true);
+	return ksu_sucompat_kernel_common((void **)filename_ptr, argv, envp, "do_execve_common");
 }
 #endif
 

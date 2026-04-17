@@ -146,21 +146,6 @@ static struct kretprobe sys_fstat64_rp = {
 };
 #endif
 
-// sys_read
-static int sys_read_handler_pre(struct kprobe *p, struct pt_regs *regs)
-{
-	struct pt_regs *real_regs = PT_REAL_REGS(regs);
-	unsigned int fd = (int)PT_REGS_PARM1(real_regs);
-
-	ksu_handle_sys_read_fd(fd);
-	return 0;
-}
-
-static struct kprobe sys_read_kp = {
-	.symbol_name = SYS_READ_SYMBOL,
-	.pre_handler = sys_read_handler_pre,
-};
-
 // sys_reboot
 extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
 
@@ -186,7 +171,7 @@ loop_start:
 
 	msleep(1000);
 
-	if ((volatile bool)ksu_execveat_hook)
+	if (*(volatile bool *)&ksu_vfs_read_hook)
 		goto loop_start;
 
 	pr_info("kp_ksud: unregistering kprobes...\n");
@@ -198,9 +183,6 @@ loop_start:
 	unregister_kretprobe(&sys_fstat64_rp);
 	pr_info("kp_ksud: unregister sys_fstat64_rp!\n");
 #endif
-
-	unregister_kprobe(&sys_read_kp);
-	pr_info("kp_ksud: unregister sys_read_kp!\n");
 
 	return 0;
 }
@@ -223,9 +205,6 @@ static void kp_ksud_init()
 	int ret3 = register_kretprobe(&sys_fstat64_rp);
 	pr_info("kp_ksud: sys_fstat64_rp: %d\n", ret3);
 #endif
-
-	int ret4 = register_kprobe(&sys_read_kp);
-	pr_info("kp_ksud: sys_read_kp: %d\n", ret4);
 
 	unregister_kprobe_thread();
 }

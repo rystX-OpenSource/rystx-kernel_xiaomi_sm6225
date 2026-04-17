@@ -1,10 +1,7 @@
 #ifndef __KSU_H_KERNEL_COMPAT
 #define __KSU_H_KERNEL_COMPAT
 
-#define ksu_get_uid_t(x) *(unsigned int *)&(x)
-
-#if defined(CONFIG_KEYS) && LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
-
+#if defined(CONFIG_KEYS) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
 extern int install_session_keyring_to_cred(struct cred *cred, struct key *keyring);
 static struct key *init_session_keyring = NULL;
 
@@ -28,15 +25,18 @@ static inline int install_session_keyring(struct key *keyring)
 	return commit_creds(new);
 }
 
-// this is on tgcred on < 3.8
-// while we can grab that one, it seems to not actually be needed 
+// up to 5.1, struct key __rcu *session_keyring; /* keyring inherited over fork */
+// so we need to grab this using rcu_dereference
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+static inline struct key *ksu_get_current_session_keyring() { return rcu_dereference(current->cred->session_keyring); }
+#else
+static inline struct key *ksu_get_current_session_keyring() { return rcu_dereference(current->cred->tgcred->session_keyring); }
+#endif
+
 __attribute__((cold))
-static noinline void ksu_grab_init_session_keyring(const char *filename)
+static noinline void ksu_grab_init_session_keyring()
 {
 	if (init_session_keyring)
-		return;
-		
-	if (!strstr(filename, "init")) 
 		return;
 
 	if (!!strcmp(current->comm, "init"))
@@ -45,11 +45,8 @@ static noinline void ksu_grab_init_session_keyring(const char *filename)
 	if (!!!is_init(current_cred()))
 		return;
 
-	// thats surely some exclamation comedy
-	// and now we are sure that this is the key we want
-	// up to 5.1, struct key __rcu *session_keyring; /* keyring inherited over fork */
-	// so we need to grab this using rcu_dereference
-	struct key *keyring = rcu_dereference(current->cred->session_keyring);
+	// now we are sure that this is the key we want
+	struct key *keyring = ksu_get_current_session_keyring();
 	if (!keyring)
 		return;
 
@@ -65,13 +62,15 @@ static noinline struct file *ksu_filp_open_compat(const char *filename, int flag
 	// like allowlist write, we check for that instead.
 	if (!(current->flags & PF_KTHREAD))
 		goto filp_open;
+
+	if (!!ksu_get_current_session_keyring())
+		goto filp_open;
 	
-	if (!init_session_keyring)
+	if (!!!init_session_keyring)
 		goto filp_open;
 
-	if (current_cred()->session_keyring)
-		goto filp_open;
-
+	// thats surely some exclamation comedy, pt. 2
+	// now we are sure that we need to install init keyring to current
 	install_session_keyring(init_session_keyring);
 
 filp_open:
@@ -79,8 +78,8 @@ filp_open:
 }
 #define filp_open ksu_filp_open_compat
 #else
-static inline void ksu_grab_init_session_keyring(const char *filename) {} // no-op
-#endif // KEYS && ( >= 3.8 && < 5.2 )
+static inline void ksu_grab_init_session_keyring() {} // no-op
+#endif // KEYS && < 5.2
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 // https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L418
@@ -186,8 +185,11 @@ static inline void ksu_zeroed_strncpy(char *dest, const char *src, size_t count)
 	__builtin_memset(dest, 0, count);
 	__builtin_strncpy(dest, src, count - 1);
 }
-#define strscpy ksu_zeroed_strncpy
 #define strscpy_pad ksu_zeroed_strncpy
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
+#define strscpy ksu_zeroed_strncpy
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
@@ -278,4 +280,35 @@ static inline u64 ksu_ktime_get_ns(void) { return ktime_to_ns(ktime_get()); }
 
 static inline void ksu_kfree_byref(void *buf) { kfree(*(void **)buf); }
 
-#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION (3, 9, 0)
+// hashtable.h, list.h, rculist.h
+// ref: https://github.com/torvalds/linux/commit/b67bfe0d42cac56c512dd5da4b1b347a23f4b70a
+#include "linux_hashtable.h"
+static inline int __must_check ksu_kref_get_unless_zero(struct kref *kref)
+{ 
+	return atomic_add_unless(&kref->refcount, 1, 0); 
+}
+#define kref_get_unless_zero ksu_kref_get_unless_zero
+#endif // < 3.9
+
+/**
+ *  kver agnostic workaround for < 3.14's CONFIG_UIDGID_STRICT_TYPE_CHECKS=n
+ *
+ *  - force dereferences an unsigned int (uid_t)
+ *  - redefines current_uid / current_euid macros
+ *
+ * ref
+ *  - https://elixir.bootlin.com/linux/v3.13/source/include/linux/uidgid.h
+ *  - https://elixir.bootlin.com/linux/v3.13/source/include/linux/cred.h#L331
+ */
+#define ksu_get_uid_t(x) *(unsigned int *)&(x)
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION (3, 14, 0)
+#undef current_uid
+#undef current_euid
+typedef struct { uid_t val; } ksu_kuid_t;
+static inline ksu_kuid_t current_uid() { return *(ksu_kuid_t *)(&current_cred()->uid); }
+static inline ksu_kuid_t current_euid() { return *(ksu_kuid_t *)(&current_cred()->euid); }
+#endif // < 3.14
+
+#endif // __KSU_H_KERNEL_COMPAT
