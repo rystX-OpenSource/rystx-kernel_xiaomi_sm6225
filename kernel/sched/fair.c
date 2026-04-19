@@ -969,6 +969,9 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 #define GORE_LES(a, b)      ((s64)((a) - (b)) <  0)
 #define GORE_EQ_D(a, b, d)  (GORE_LEQ((a), (b) + (d)) && GORE_GEQ((a), (b) - (d)))
 
+/* Forward declaration helper */
+int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+
 /* ------------------------------------------------------------------
  * gore_normalize_lifetime (CaCULE / TT-CFS)
  *
@@ -13954,7 +13957,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
 	 * Note: the child inherits NO type information — it starts as
 	 * GORE_NO_TYPE and classifies itself through its own behaviour.
 	 */
-	gore_init_entity(se, sched_clock());
+	gore_init_entity(&p->se, sched_clock());
 #endif /* CONFIG_GORE_SCHED */
 
 	set_task_max_allowed_capacity(p);
