@@ -502,6 +502,87 @@ struct sched_statistics {
 #endif
 };
 
+/* ====================================================================
+ * GoreScheduler — per-entity metadata (gore_node)
+ *
+ * Embedded in sched_entity.  Carries all state needed by GoreSched
+ * without touching any EEVDF-managed fields (vruntime, vlag, deadline,
+ * slice, …).
+ *
+ * Task type constants:
+ * GORE_REALTIME    (0) — periodic, tiny bursts; highest priority
+ * GORE_INTERACTIVE (1) — sleeps >> runs
+ * GORE_NO_TYPE     (2) — unclassified (new tasks start here)
+ * GORE_CPU_BOUND   (3) — runs >> sleeps
+ * GORE_BATCH       (4) — extended compute; lowest priority
+ * ==================================================================== */
+#ifdef CONFIG_GORE_SCHED
+
+#define GORE_REALTIME      0U
+#define GORE_INTERACTIVE   1U
+#define GORE_NO_TYPE       2U
+#define GORE_CPU_BOUND     3U
+#define GORE_BATCH     4U
+
+/*
+ * Score multiplier per type tier.  Large enough so that a BATCH task
+ * (tier 4) never beats a REALTIME task (tier 0) on HRRN alone.
+ */
+#define GORE_TIER_SCALE        100000LL
+
+/*
+ * Shift amounts for burst penalty and starvation bonus normalisation.
+ * BURST_SHIFT 22 ≈ 4 ms granularity; STARVE_SHIFT 24 ≈ 16 ms.
+ */
+#define GORE_BURST_SHIFT   22
+#define GORE_STARVE_SHIFT  24
+
+/*
+ * TT-CFS classification thresholds (from TT-CFS patch, in ns).
+ */
+#define GORE_RT_WAIT_DELTA 800000ULL   /* 0.8 ms – realtime wait delta   */
+#define GORE_RT_BURST_DELTA    2000000ULL  /* 2 ms   – realtime burst delta   */
+#define GORE_RT_BURST_MAX  4000000ULL  /* 4 ms   – max burst for realtime */
+#define GORE_RT_MIN_LIFETIME   500000000ULL    /* 500 ms – min age for realtime   */
+#define GORE_INTERACTIVE_HRRN  2ULL        /* HRRN ratio ≥ 2 → interactive   */
+#define GORE_CPU_BOUND_PCT 80ULL       /* ≥ 80% CPU → cpu_bound          */
+#define GORE_RT_STICKY     4       /* ticks to hold REALTIME label   */
+
+/* Maximum task age before HRRN counters are renormalised (~22 s).
+ * Left-shifted by 20 bits ≈ × 1 048 576 ≈ × 1 000 000 (ns → ~ms). */
+#define GORE_MAX_LIFETIME_SHIFT    20
+#define GORE_MAX_LIFETIME_MS   22000ULL
+
+struct gore_node {
+   /*
+    * Intrusive singly-linked list maintained by cfs_rq.
+    * O(1) insert at head, O(n) pick-next scan.
+    */
+   struct gore_node    *next;
+   struct gore_node    *prev;
+
+   /* ---- Task classification (TT-CFS) ---- */
+   unsigned int         task_type;  /* GORE_{REALTIME,…,BATCH}  */
+   int          rt_sticky;  /* ticks left holding RT label */
+
+   /* ---- HRRN accumulators (CaCULE / TT-CFS) ---- */
+   u64          start_time;     /* ns: first time on scheduler */
+   u64          gore_vruntime;  /* weighted runtime for HRRN   */
+   u64          wait_time;  /* accumulated sleep/wait time  */
+   u64          prev_wait_time; /* wait on the previous sleep   */
+   u64          last_run;   /* ns: exec_start of last slice */
+
+   /* ---- Burst accumulators (BORE / TT-CFS / ECHO) ---- */
+   u64          curr_burst;     /* runtime in current activation */
+   u64          burst;      /* burst length at last sleep     */
+   u64          prev_burst;     /* burst length at second-last    */
+
+   /* ---- Yield marker (TT-CFS) ---- */
+   bool             yielded;    /* skip in Gore pick until reset  */
+};
+
+#endif /* CONFIG_GORE_SCHED */
+
 struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
@@ -517,6 +598,10 @@ struct sched_entity {
 	unsigned char			rel_deadline;
 	unsigned char			custom_slice;
 					/* hole */
+
+#ifdef CONFIG_GORE_SCHED
+	struct gore_node		gore_node;
+#endif /* CONFIG_GORE_SCHED */
 
 	u64				exec_start;
 	u64				sum_exec_runtime;

@@ -638,6 +638,17 @@ struct cfs_rq {
 	struct load_weight	load;
 	unsigned int		nr_queued;
 	unsigned int		h_nr_queued;       /* SCHED_{NORMAL,BATCH,IDLE} */
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreScheduler parallel linked list.
+	 *
+	 * All sched_entities currently on this cfs_rq (whether on the
+	 * RB-tree or currently running as cfs_rq->curr) are also linked
+	 * here via gore_node.{next,prev}.  This lets pick_gore_next()
+	 * scan the entire runnable set in O(n) without touching the tree.
+	 */
+	struct gore_node	*gore_head;
+#endif /* CONFIG_GORE_SCHED */
 	unsigned int		h_nr_runnable;     /* SCHED_{NORMAL,BATCH,IDLE} */
 	unsigned int		h_nr_idle; /* SCHED_IDLE */
 

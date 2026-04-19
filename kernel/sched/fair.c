@@ -94,6 +94,29 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_N
 unsigned int sysctl_sched_base_slice			= 2800000ULL;
 static unsigned int normalized_sysctl_sched_base_slice	= 2800000ULL;
 
+/* ====================================================================
+ * GoreScheduler — global tunables
+ *
+ * Threshold values mirror the TT-CFS defaults and are exposed here
+ * for easy tuning.  A future sysctl interface may allow runtime changes.
+ * ==================================================================== */
+#ifdef CONFIG_GORE_SCHED
+
+/*
+ * Maximum task age (ns) before HRRN accumulators are renormalised.
+ * Computed as GORE_MAX_LIFETIME_MS << GORE_MAX_LIFETIME_SHIFT.
+ * The shift approximates × 10^6 (ns per ms) without a multiply.
+ */
+static u64 __read_mostly gore_max_lifetime =
+	GORE_MAX_LIFETIME_MS << GORE_MAX_LIFETIME_SHIFT;
+
+static void __init gore_print_banner(void)
+{
+	pr_info("GoreScheduler v1.0 (BORE+CaCULE+TT-CFS+ECHO) active\n");
+}
+
+#endif /* CONFIG_GORE_SCHED */
+
 const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
 
@@ -306,6 +329,18 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 }
 
 const struct sched_class fair_sched_class;
+
+/* ====================================================================
+ * GoreScheduler — inline accessor
+ * ==================================================================== */
+#ifdef CONFIG_GORE_SCHED
+
+static __always_inline struct sched_entity *se_of_gore(struct gore_node *gn)
+{
+	return container_of(gn, struct sched_entity, gore_node);
+}
+
+#endif /* CONFIG_GORE_SCHED */
 
 /**************************************************************
  * CFS operations on generic schedulable entities:
@@ -920,6 +955,379 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 	return avg >= vruntime_op(vruntime, "-", cfs_rq->zero_vruntime) * load;
 }
 
+/* ====================================================================
+ * GoreScheduler core implementation
+ *
+ * All gore_* functions are defined here, before the EEVDF pick logic,
+ * so they are available to the modified pick_eevdf() wrapper below.
+ * ==================================================================== */
+#ifdef CONFIG_GORE_SCHED
+
+/* Helper comparison macros (from TT-CFS) */
+#define GORE_GEQ(a, b)      ((s64)((a) - (b)) >= 0)
+#define GORE_LEQ(a, b)      ((s64)((a) - (b)) <= 0)
+#define GORE_LES(a, b)      ((s64)((a) - (b)) <  0)
+#define GORE_EQ_D(a, b, d)  (GORE_LEQ((a), (b) + (d)) && GORE_GEQ((a), (b) - (d)))
+
+/* ------------------------------------------------------------------
+ * gore_normalize_lifetime (CaCULE / TT-CFS)
+ *
+ * Called from gore_update_curr() every tick.  When a task has lived
+ * longer than gore_max_lifetime we scale back its accumulators so
+ * that HRRN ratios stay bounded and no overflow occurs.
+ * ------------------------------------------------------------------ */
+static void gore_normalize_lifetime(struct gore_node *gn, u64 now)
+{
+   u64 life_time = now - gn->start_time;
+   u64 old_hrrn_x;
+   s64 diff;
+
+   diff = (s64)(life_time - gore_max_lifetime);
+   if (likely(diff < 0))
+       return; /* typical fast path — nothing to do */
+
+   /*
+    * Compute the HRRN numerator rescaler.  Left-shift by 7 to keep
+    * integer precision; the compensating right-shift is in the
+    * gore_vruntime reset below (>> 3 then << 9 cancel to << 6 net).
+    */
+   old_hrrn_x = (life_time << 7) / ((gn->gore_vruntime >> 3) | 1ULL);
+   if (unlikely(old_hrrn_x == 0))
+       old_hrrn_x = 1ULL;
+
+   /* Reset start_time to half max_lifetime ago (~11 s from now) */
+   gn->start_time = now - (gore_max_lifetime >> 1);
+
+   /* Rescale gore_vruntime preserving the original HRRN ratio */
+   gn->gore_vruntime = ((gore_max_lifetime << 9) / old_hrrn_x) | 1ULL;
+
+   /* Clear yield marker; this event is rare enough to not matter */
+   gn->yielded = false;
+}
+
+/* ------------------------------------------------------------------
+ * Task-type classification predicates  (TT-CFS adapted)
+ * ------------------------------------------------------------------ */
+
+static bool gore_is_realtime(struct gore_node *gn, u64 now, int flags)
+{
+   struct sched_entity *se = se_of_gore(gn);
+   struct task_struct  *p;
+   u64 life_time, wait;
+
+   if (!entity_is_task(se))
+       return false;
+
+   p = task_of(se);
+
+   /* Must have slept at least once */
+   if (!gn->wait_time)
+       return false;
+
+   /* Minimum task age = 500 ms */
+   life_time = now - p->start_time;
+   if (GORE_LES(life_time, GORE_RT_MIN_LIFETIME))
+       return false;
+
+   /* For non-migrated tasks, consecutive wait times must be equal */
+   if (!(flags & ENQUEUE_MIGRATED)) {
+       wait = now - se->exec_start;
+       if (wait && !GORE_EQ_D(wait, gn->prev_wait_time,
+                      GORE_RT_WAIT_DELTA))
+           return false;
+   }
+
+   /* Burst lengths at last two sleeps must be equal within delta */
+   if (!GORE_EQ_D(gn->burst, gn->prev_burst, GORE_RT_BURST_DELTA))
+       return false;
+
+   /* Both last burst and current in-flight burst must be short */
+   if (GORE_LEQ(gn->burst,      GORE_RT_BURST_MAX) &&
+       GORE_LEQ(gn->curr_burst, GORE_RT_BURST_MAX))
+       return true;
+
+   return false;
+}
+
+static bool gore_is_interactive(struct gore_node *gn, u64 now)
+{
+   struct sched_entity *se = se_of_gore(gn);
+   u64 total, hrrn, wait;
+
+   if (!gn->gore_vruntime)
+       return false;
+
+   total = gn->gore_vruntime + gn->wait_time;
+   if (!total)
+       return false;
+
+   /* HRRN ratio: sleep >> run → ratio ≥ 2 */
+   hrrn = total / gn->gore_vruntime;
+   if (GORE_LES(hrrn, GORE_INTERACTIVE_HRRN))
+       return false;
+
+   /*
+    * Reject tasks whose consecutive wait times are nearly equal —
+    * those are REALTIME candidates (already checked with higher
+    * priority above).
+    */
+   wait = now - se->exec_start;
+   if (wait && GORE_EQ_D(wait, gn->prev_wait_time, GORE_RT_WAIT_DELTA))
+       return false;
+
+   return true;
+}
+
+static bool gore_is_cpu_bound(struct gore_node *gn)
+{
+   u64 total, pct;
+
+   total = gn->gore_vruntime + gn->wait_time;
+   if (!total || !gn->gore_vruntime)
+       return false;
+
+   pct = (gn->gore_vruntime * 100ULL) / total;
+   return GORE_GEQ(pct, GORE_CPU_BOUND_PCT);
+}
+
+static bool gore_is_batch(struct gore_node *gn)
+{
+   u64 total, hrrn;
+
+   total = gn->gore_vruntime + gn->wait_time;
+   if (!total || !gn->gore_vruntime)
+       return false;
+
+   hrrn = total / gn->gore_vruntime;
+   return GORE_LES(hrrn, GORE_INTERACTIVE_HRRN); /* ratio < 2 */
+}
+
+/* ------------------------------------------------------------------
+ * gore_detect_type — run classification logic; called on every wakeup
+ * and periodically during update_curr via gore_update_curr.
+ * ------------------------------------------------------------------ */
+static void gore_detect_type(struct gore_node *gn, u64 now, int flags)
+{
+   struct sched_entity *se = se_of_gore(gn);
+   unsigned int new_type = GORE_NO_TYPE;
+
+   if (!entity_is_task(se) || gn->gore_vruntime <= 1ULL) {
+       gn->task_type = GORE_NO_TYPE;
+       return;
+   }
+
+   if (gore_is_realtime(gn, now, flags))
+       new_type = GORE_REALTIME;
+   else if (gore_is_interactive(gn, now))
+       new_type = GORE_INTERACTIVE;
+   else if (gore_is_cpu_bound(gn))
+       new_type = GORE_CPU_BOUND;
+   else if (gore_is_batch(gn))
+       new_type = GORE_BATCH;
+
+   /*
+    * RT sticky: once classified as REALTIME, hold the label for
+    * GORE_RT_STICKY scheduling decisions to prevent thrashing.
+    */
+   if (new_type == GORE_REALTIME) {
+       gn->rt_sticky = GORE_RT_STICKY;
+   } else if (gn->task_type == GORE_REALTIME && gn->rt_sticky > 0) {
+       gn->rt_sticky--;
+       return; /* keep existing REALTIME label */
+   }
+
+   gn->task_type = new_type;
+}
+
+/* ------------------------------------------------------------------
+ * gore_score — the combined scheduling metric; lower value wins.
+ *
+ * Composition:
+ * [1] Type tier     × GORE_TIER_SCALE  (ensures tier ordering)
+ * [2] HRRN percent  0–100             (lower = more interactive)
+ * [3] Burst penalty                   (BORE: penalise long runs)
+ * [4] Starvation bonus (subtracted)   (CaCULE: reward long wait)
+ * ------------------------------------------------------------------ */
+static inline s64 gore_score(struct gore_node *gn, u64 now)
+{
+   s64 type_score, hrrn_score, burst_score, starve_score;
+   u64 total, wait_ns;
+
+   /* [1] Type tier */
+   type_score = (s64)gn->task_type * GORE_TIER_SCALE;
+
+   /* [2] HRRN percentage — 0 = fully interactive, 100 = CPU hog */
+   total = gn->gore_vruntime + gn->wait_time;
+   hrrn_score = likely(total > 0)
+       ? (s64)((gn->gore_vruntime * 100ULL) / total)
+       : 100LL;
+
+   /* [3] Burst penalty — right-shifted for coarse granularity */
+   burst_score = (s64)(gn->curr_burst >> GORE_BURST_SHIFT);
+
+   /* [4] Starvation bonus — increases the longer a task waits */
+   wait_ns     = (gn->last_run > 0) ? (now - gn->last_run) : 0ULL;
+   starve_score = (s64)(wait_ns >> GORE_STARVE_SHIFT);
+
+   return type_score + hrrn_score + burst_score - starve_score;
+}
+
+/* ------------------------------------------------------------------
+ * gore_update_curr — hot path; called from update_curr() each tick.
+ *
+ * Updates gore_vruntime (the HRRN run accumulator), curr_burst (BORE),
+ * last_run, and triggers type re-detection + normalisation.
+ * ------------------------------------------------------------------ */
+static __always_inline void gore_update_curr(struct sched_entity *se,
+                         u64 delta_exec, u64 now)
+{
+   struct gore_node *gn = &se->gore_node;
+
+   /* Accumulate weighted runtime for HRRN */
+   gn->gore_vruntime += calc_delta_fair(delta_exec, se);
+
+   /* Accumulate raw runtime for BORE burst tracking */
+   gn->curr_burst += delta_exec;
+
+   /* Record when we last ran (for starvation scoring) */
+   gn->last_run = now;
+
+   /* Re-classify on every tick (cheap: ratio comparisons only) */
+   gore_detect_type(gn, now, 0);
+
+   /* Prevent overflow of HRRN counters */
+   gore_normalize_lifetime(gn, now);
+}
+
+/* ------------------------------------------------------------------
+ * gore_enqueue_update — called when a task is enqueued (woken up).
+ * Records sleep duration and re-classifies with wakeup context.
+ * ------------------------------------------------------------------ */
+static void gore_enqueue_update(struct sched_entity *se,
+                int flags, u64 now)
+{
+   struct gore_node *gn = &se->gore_node;
+
+   if (flags & ENQUEUE_WAKEUP) {
+       u64 wait          = now - se->exec_start;
+       gn->wait_time    += wait;
+       gn->prev_wait_time = wait;
+   }
+
+   gore_detect_type(gn, now, flags);
+   gn->yielded = false; /* always clear yield flag on re-enqueue */
+}
+
+/* ------------------------------------------------------------------
+ * gore_dequeue_update — called when a task is dequeued (goes to sleep
+ * or is migrated).  Rotates the burst accumulators (BORE / TT-CFS).
+ * ------------------------------------------------------------------ */
+static void gore_dequeue_update(struct sched_entity *se, int flags)
+{
+   struct gore_node *gn = &se->gore_node;
+
+   if (flags & DEQUEUE_SLEEP) {
+       gn->prev_burst = gn->burst;
+       gn->burst      = gn->curr_burst;
+       gn->curr_burst = 0;
+
+       /*
+        * A CPU-bound task that just went to sleep is reclassified as
+        * BATCH — it has demonstrated it can idle — matching TT-CFS.
+        */
+       if (gn->task_type == GORE_CPU_BOUND)
+           gn->task_type = GORE_BATCH;
+   }
+}
+
+/* ------------------------------------------------------------------
+ * gore_init_entity — zero-initialise a gore_node for a new task.
+ * Called from task_fork_fair() and switched_to_fair().
+ * ------------------------------------------------------------------ */
+static void gore_init_entity(struct sched_entity *se, u64 now)
+{
+   struct gore_node *gn = &se->gore_node;
+
+   gn->next           = NULL;
+   gn->prev           = NULL;
+   gn->task_type      = GORE_NO_TYPE;
+   gn->rt_sticky      = 0;
+   gn->start_time     = now;
+   gn->gore_vruntime  = 1ULL; /* non-zero: avoids division by zero */
+   gn->wait_time      = 0;
+   gn->prev_wait_time = 0;
+   gn->last_run       = now;
+   gn->curr_burst     = 0;
+   gn->burst          = 0;
+   gn->prev_burst     = 0;
+   gn->yielded        = false;
+}
+
+/* ------------------------------------------------------------------
+ * pick_gore_next — Gore-aware pick-next implementation.
+ *
+ * Scans the cfs_rq gore_head linked list.  For each entity that is
+ * EEVDF-eligible (entity_eligible()) and not yield-marked, computes
+ * gore_score() and tracks the minimum.  Also evaluates curr (which
+ * remains in the Gore list while running).
+ *
+ * Returns the entity with the lowest score, or NULL if nothing is
+ * eligible (caller falls back to __pick_eevdf).
+ * ------------------------------------------------------------------ */
+static struct sched_entity *pick_gore_next(struct cfs_rq *cfs_rq,
+                       struct sched_entity *curr)
+{
+   struct gore_node    *gn       = cfs_rq->gore_head;
+   struct gore_node    *best_gn  = NULL;
+   s64                  best_sc  = LLONG_MAX;
+   bool                 all_yield = true; /* track if every elig is yielded */
+   struct gore_node    *yield_best = NULL;
+   s64                  yield_sc  = LLONG_MAX;
+   const u64            now      = sched_clock();
+
+   while (gn) {
+       struct sched_entity *se = se_of_gore(gn);
+
+       if (!entity_eligible(cfs_rq, se))
+           goto next;
+
+       if (gn->yielded) {
+           /* Track best yielded candidate as a fallback */
+           s64 sc = gore_score(gn, now);
+           if (!yield_best || sc < yield_sc) {
+               yield_sc   = sc;
+               yield_best = gn;
+           }
+           goto next;
+       }
+
+       all_yield = false;
+       {
+           s64 sc = gore_score(gn, now);
+           if (!best_gn || sc < best_sc) {
+               best_sc = sc;
+               best_gn = gn;
+           }
+       }
+next:
+       gn = gn->next;
+   }
+
+   /*
+    * If every eligible non-curr entity is yielded, relax and use the
+    * best yielded candidate rather than starving the CPU.
+    */
+   if (all_yield && yield_best)
+       best_gn = yield_best;
+
+   if (likely(best_gn))
+       return se_of_gore(best_gn);
+
+   return NULL; /* no eligible entity — caller uses EEVDF fallback */
+}
+
+#endif /* CONFIG_GORE_SCHED */
+
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	if (!sched_feat(ENFORCE_ELIGIBILITY))
@@ -1031,6 +1439,17 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	se->min_slice = se->slice;
 	rb_add_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
 				__entity_less, &min_vruntime_cb);
+#ifdef CONFIG_GORE_SCHED
+	/* Insert at the head of the Gore linked list (O(1)). */
+	{
+		struct gore_node *gn = &se->gore_node;
+		gn->prev = NULL;
+		gn->next = cfs_rq->gore_head;
+		if (cfs_rq->gore_head)
+			cfs_rq->gore_head->prev = gn;
+		cfs_rq->gore_head = gn;
+	}
+#endif /* CONFIG_GORE_SCHED */
 }
 
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -1038,6 +1457,19 @@ static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
 				  &min_vruntime_cb);
 	sum_w_vruntime_sub(cfs_rq, se);
+#ifdef CONFIG_GORE_SCHED
+	/* Remove from the Gore linked list (O(1) with back-pointer). */
+	{
+		struct gore_node *gn = &se->gore_node;
+		if (gn->prev)
+			gn->prev->next = gn->next;
+		else
+			cfs_rq->gore_head = gn->next;
+		if (gn->next)
+			gn->next->prev = gn->prev;
+		gn->next = gn->prev = NULL;
+	}
+#endif /* CONFIG_GORE_SCHED */
 }
 
 struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq)
@@ -1193,7 +1625,30 @@ found:
 
 static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 {
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreScheduler pick: attempt to find the best eligible entity
+	 * by Gore scoring (combined BORE + CaCULE + TT tier).
+	 *
+	 * If gore_head is empty (all entities are delayed / throttled) or
+	 * pick_gore_next() finds nothing eligible we fall through to the
+	 * standard EEVDF logic.
+	 */
+	if (likely(cfs_rq->gore_head)) {
+		struct sched_entity *gore_winner =
+			pick_gore_next(cfs_rq, cfs_rq->curr);
+		if (gore_winner)
+			return gore_winner;
+	}
+	/*
+	 * Safety fallback: no eligible entity was found via Gore scan.
+	 * This can legitimately happen when all tasks are ineligible
+	 * (negative lag) and DELAY_DEQUEUE keeps them in the tree.
+	 */
+	return __pick_eevdf(cfs_rq, true);
+#else
         return __pick_eevdf(cfs_rq, true);
+#endif /* CONFIG_GORE_SCHED */
 }
 
 #ifdef CONFIG_SCHED_DEBUG
@@ -1374,6 +1829,18 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	struct sched_entity *curr = cfs_rq->curr;
 	struct rq *rq = rq_of(cfs_rq);
 	u64 now = rq_clock_task(rq_of(cfs_rq));
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreScheduler uses raw sched_clock() for its own timing so that
+	 * its nanosecond wallclock is consistent with what CaCULE and TT
+	 * used.  This is independent of rq_clock_task() adjustments made
+	 * by the EEVDF / PELT subsystems.
+	 */
+	u64 gore_now;
+
+	if (IS_ENABLED(CONFIG_GORE_SCHED))
+		gore_now = sched_clock();
+#endif /* CONFIG_GORE_SCHED */
 	u64 delta_exec;
 	bool resched;
 
@@ -1394,6 +1861,16 @@ static void update_curr(struct cfs_rq *cfs_rq)
 
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
 	resched = update_deadline(cfs_rq, curr);
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Update Gore burst and HRRN accumulators.  entity_is_task() check
+	 * is inside gore_update_curr() but we guard here to avoid the call
+	 * overhead for group-entity cfs_rqs.
+	 */
+	if (entity_is_task(curr))
+		gore_update_curr(curr, delta_exec, gore_now);
+#endif /* CONFIG_GORE_SCHED */
 
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
@@ -5183,6 +5660,16 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	bool curr = cfs_rq->curr == se;
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Record wakeup wait-time and re-classify task type BEFORE the
+	 * EEVDF renormalisation so the type is fresh for this wakeup
+	 * cycle and affects the very first pick after this enqueue.
+	 */
+	if (entity_is_task(se))
+		gore_enqueue_update(se, flags, sched_clock());
+#endif /* CONFIG_GORE_SCHED */
+
 	/*
 	 * If we're the current task, we must renormalise before calling
 	 * update_curr().
@@ -5303,6 +5790,16 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	bool sleep = flags & DEQUEUE_SLEEP;
 	int action = UPDATE_TG;
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Rotate BORE burst accumulators before any EEVDF dequeue work.
+	 * This ensures burst/prev_burst are correct on the next wakeup's
+	 * gore_is_realtime() check.
+	 */
+	if (entity_is_task(se))
+		gore_dequeue_update(se, flags);
+#endif /* CONFIG_GORE_SCHED */
 
 	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
 		action |= DO_DETACH;
@@ -9094,6 +9591,38 @@ pick:
 	if (__pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT) == pse)
 		goto preempt;
 
+#ifdef CONFIG_GORE_SCHED
+    /*
+     * GoreScheduler wakeup-preemption extension.
+     *
+     * After EEVDF's pick-check, additionally compare the waking task's
+     * Gore score against the current task's score.  If the waker wins
+     * (lower score = higher priority) AND it is EEVDF-eligible, request
+     * an immediate reschedule so interactive / realtime tasks preempt
+     * CPU-bound ones as quickly as possible.
+     *
+     * Conditions mirror TT-CFS check_preempt_wakeup behaviour:
+     * • WAKEUP_PREEMPTION feature must be enabled.
+     * • Both entities must be actual tasks (not group sched entities).
+     * • The waking task must already be eligible (avoids preempting for
+     * an ineligible task that would violate EEVDF's lag guarantee).
+     * • Yielded tasks do not preempt (they voluntarily gave up the CPU).
+     */
+    if (sched_feat(WAKEUP_PREEMPTION) &&
+        entity_is_task(se) && entity_is_task(pse) &&
+        !(wake_flags & WF_FORK) &&
+        !pse->sched_delayed &&
+        !pse->gore_node.yielded &&
+        entity_eligible(cfs_rq, pse)) {
+        u64 gore_now     = sched_clock();
+        s64 score_curr   = gore_score(&se->gore_node,  gore_now);
+        s64 score_waker  = gore_score(&pse->gore_node, gore_now);
+
+        if (score_waker < score_curr)
+            goto preempt;
+    }
+#endif /* CONFIG_GORE_SCHED */
+
 	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
 
@@ -9242,6 +9771,20 @@ static void yield_task_fair(struct rq *rq)
 	struct task_struct *curr = rq->curr;
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
 	struct sched_entity *se = &curr->se;
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Mark the entity as yielded in the Gore node so pick_gore_next()
+	 * skips it when there are other eligible tasks available.  This
+	 * prevents a yielding task from immediately preempting itself.
+	 *
+	 * The yielded flag is cleared on the next enqueue (wakeup) or when
+	 * the Gore scanner finds no non-yielded eligible entity (to avoid
+	 * starvation).
+	 */
+	if (entity_is_task(se) && cfs_rq->h_nr_queued > 1)
+		se->gore_node.yielded = true;
+#endif /* CONFIG_GORE_SCHED */
 
 	/*
 	 * Are we the only task in the tree?
@@ -13259,6 +13802,18 @@ static void task_fork_fair(struct task_struct *p)
 	struct rq *rq = this_rq();
 	struct rq_flags rf;
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Initialise the gore_node of the new task before it is ever
+	 * enqueued.  Using sched_clock() as the start_time reference so
+	 * the HRRN lifetime starts from fork, not from first run.
+	 *
+	 * Note: the child inherits NO type information — it starts as
+	 * GORE_NO_TYPE and classifies itself through its own behaviour.
+	 */
+	gore_init_entity(se, sched_clock());
+#endif /* CONFIG_GORE_SCHED */
+
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
 
@@ -13390,6 +13945,17 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
 	SCHED_WARN_ON(p->se.sched_delayed);
 
 	attach_task_cfs_rq(p);
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Initialise the gore_node of the new task before it is ever
+	 * enqueued.  Using sched_clock() as the start_time reference so
+	 * the HRRN lifetime starts from fork, not from first run.
+	 *
+	 * Note: the child inherits NO type information — it starts as
+	 * GORE_NO_TYPE and classifies itself through its own behaviour.
+	 */
+	gore_init_entity(se, sched_clock());
+#endif /* CONFIG_GORE_SCHED */
 
 	set_task_max_allowed_capacity(p);
 
@@ -13793,6 +14359,9 @@ void show_numa_stats(struct task_struct *p, struct seq_file *m)
 
 __init void init_sched_fair_class(void)
 {
+#ifdef CONFIG_GORE_SCHED
+	gore_print_banner();
+#endif /* CONFIG_GORE_SCHED */
 #ifdef CONFIG_SMP
 	open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
 

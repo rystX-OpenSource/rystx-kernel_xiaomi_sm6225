@@ -869,6 +869,36 @@ config PELT_COMPATIBILITY_LAYER
 
 	  If unsure, say N.
 
+config GORE_SCHED
+	bool "GoreScheduler — BORE + CaCULE + TT-CFS + ECHO combined"
+	default y
+	help
+	  GoreScheduler (GoreSched) augments the existing EEVDF fair scheduler
+	  with combined heuristics from four out-of-tree scheduler projects:
+
+	    BORE   — Burst-Oriented Response Enhancer.
+	             Tracks uninterrupted CPU-burst time; penalises CPU-hungry
+	             tasks and rewards tasks that sleep often (interactive).
+
+	    CaCULE — Cache-ULE interactivity scoring.
+	             Computes sleep/run ratio (ULE-style) and prevents task
+	             starvation via a waiting-time bonus.
+
+	    TT-CFS — Task-Type CFS-compatible scheduler.
+	             Classifies tasks as REALTIME / INTERACTIVE / NO_TYPE /
+	             CPU_BOUND / BATCH and schedules higher tiers first.
+
+	    ECHO   — vburst estimation for early task classification.
+
+	  The EEVDF Red-Black tree and all fairness guarantees are preserved.
+	  GoreSched only changes which EEVDF-eligible task is picked next by
+	  scanning a parallel per-rq linked list (O(n), n ≈ 3-10 on mobile).
+	  Falls back to stock EEVDF if the Gore path finds nothing eligible.
+
+	  Android-specific paths (WALT, EAS, schedtune, uclamp, energy model)
+	  are completely unaffected.
+
+	  If unsure, say Y here.
 
 #
 # For architectures that want to enable the support for NUMA-affine scheduler
