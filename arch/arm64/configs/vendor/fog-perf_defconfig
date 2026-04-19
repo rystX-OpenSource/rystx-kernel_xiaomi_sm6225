@@ -760,6 +760,9 @@ CONFIG_LTO_CLANG=y
 # CONFIG_CFI_CLANG is not set
 CONFIG_LLVM_POLLY=y
 
+# GoreSched CPU Scheduler
+CONFIG_GORE_SCHED=y
+
 # DTS-Eagle | HPX-Ultra
 CONFIG_AINUR_DTS_SW=y
 
