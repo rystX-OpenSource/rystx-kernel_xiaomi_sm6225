@@ -127,11 +127,6 @@ static inline void ksu_kvfree(void *buf)
 #define kvfree ksu_kvfree
 #endif
 
-// for supercalls.c fd install tw
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0) && !defined(TWA_RESUME)
-#define TWA_RESUME 1
-#endif
-
 // this is ksys_close, however that is spotty to use 
 // as 5.10 backported close_fd and rekt ksys_close
 // so we use what it does internally, __close_fd

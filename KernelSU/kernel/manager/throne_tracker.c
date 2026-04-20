@@ -375,11 +375,7 @@ static int throne_tracker_thread(void *data)
 	mutex_lock(&throne_tracker_mutex);
 
 	// lessen that window where user opens manager right away, yet its not crowned
-	// we are async/non-blocking in these kthreads
-	// sched_set_fifo_low
-	struct sched_param param = { 0 };
-	param.sched_priority = 1;
-	sched_setscheduler_nocheck(current, 1, &param);
+	set_user_nice(current, -20);
 
 	escape_to_root_forced();
 	throne_tracker_fn(prune_only);
@@ -404,7 +400,7 @@ void track_throne(bool prune_only)
 #endif
 
 	// HACK: force cast prune_only to be a void *
-	kthread_run(throne_tracker_thread, (void *)prune_only, "thronetracker");
+	kthread_run(throne_tracker_thread, (void *)prune_only, "ksu_throne");
 }
 
 void ksu_throne_tracker_init()

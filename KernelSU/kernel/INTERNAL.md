@@ -42,6 +42,13 @@
 - lockless argv pullouts for sulog
 - might be used for something later
 
+## safe mode
+- the implementation accepts 3x VOLUME_UP or 3x VOLUNE_DOWN to trigger safemode
+- we have a dedicated input handler for this
+- this will be disabled once ksud runs on_post_fs_data / ksu_is_safe_mode
+- if theres no ksud to call it, it will disable itself 30s after init.rc load
+- this should be enough allowance time from init.rc to post-fs-data
+
 ## build system
 - unity build, single unit
 - causes heavy inlining (high stack overflow risk)
