@@ -6,8 +6,6 @@
 // ref: https://elixir.bootlin.com/linux/v4.14.1/source/arch/arm64/include/asm/unistd32.h
 // ref: https://elixir.bootlin.com/linux/v4.14.1/source/arch/arm64/include/asm/unistd.h
 
-#define FORCE_VOLATILE(x) *(volatile typeof(x) *)&(x)
-
 #define __ARMEABI_reboot	88
 #define __ARMEABI_execve	11
 #define __ARMEABI_faccessat	334
@@ -284,11 +282,13 @@ out:
 
 static int ksu_syscall_table_restore()
 {
+	set_user_nice(current, 19); // low prio
+
 loop_start:
 
 	msleep(1000);
 
-	if (FORCE_VOLATILE(ksu_vfs_read_hook))
+	if (*(volatile bool *)&ksu_vfs_read_hook)
 		goto loop_start;
 
 	restore_syscall((void *)&armeabi_fstat64, __ARMEABI_fstat64, (void *)hook_armeabi_fstat64_ret, (void *)sys_call_table);

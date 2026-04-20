@@ -81,52 +81,6 @@ static __always_inline bool is_su_allowed(const void **ptr_to_check)
 	return true;
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
-__attribute__((cold))
-static noinline void sys_execve_escape_ksud(const char __user **filename_user)
-{
-	// see if its init
-	if (!is_init(current_cred()))
-		return;
-
-	const char ksud_path[] = KSUD_PATH;
-	char path[sizeof(ksud_path)];
-
-	// see if its trying to execute ksud
-	if (ksu_copy_from_user_retry(path, *filename_user, sizeof(path)))
-		return;
-
-	if (memcmp(ksud_path, path, sizeof(path)))
-		return;
-
-	pr_info("sys_execve: escape init executing ksud with pid: %d\n", current->pid);
-
-	escape_to_root_forced(); // give this context all permissions
-	
-	return;
-}
-
-__attribute__((cold))
-static noinline void kernel_execve_escape_ksud(void *filename_ptr)
-{
-	// see if its init
-	if (!is_init(current_cred()))
-		return;
-
-	if (likely(memcmp(filename_ptr, KSUD_PATH, sizeof(KSUD_PATH))))
-		return;
-
-	pr_info("kernel_execve: escape init executing ksud with pid: %d\n", current->pid);
-
-	escape_to_root_forced(); // give this context all permissions
-	
-	return;
-}
-#else
-static inline void sys_execve_escape_ksud(const char __user **filename_user) { } // no-op
-static inline void kernel_execve_escape_ksud(void *filename_ptr) { } // no-op
-#endif
-
 static noinline int ksu_sucompat_user_common(const char __user **filename_user,
 				const char *syscall_name,
 				const bool escalate,
@@ -194,11 +148,10 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 // sys_execve, compat_sys_execve
 static int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user, void *argv, void *envp, int *flags)
 {
-	if (unlikely(!ksu_boot_completed))
-		sys_execve_escape_ksud(filename_user);
+	sys_execve_escape_ksud((void *)filename_user);
 
 #ifdef CONFIG_KSU_FEATURE_ADBROOT
-	ksu_adb_root_handle_execve(filename_user, (void ***)envp);
+	ksu_adb_root_handle_execve((void *)filename_user, (void *)envp);
 #endif
 
 	if (!is_su_allowed((const void **)filename_user))
@@ -209,11 +162,10 @@ static int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user
 
 static __always_inline int ksu_sucompat_kernel_common(void **filename_ptr, void *argv, void *envp, const char *function_name)
 {
-	if (unlikely(!ksu_boot_completed))
-		kernel_execve_escape_ksud((void *)*filename_ptr);
+	kernel_execve_escape_ksud((void *)filename_ptr);
 
 #ifdef CONFIG_KSU_FEATURE_ADBROOT
-	ksu_adb_root_handle_execveat((void *)*filename_ptr, envp);
+	ksu_adb_root_handle_execveat((void *)filename_ptr, (void *)envp);
 #endif
 
 	if (!is_su_allowed((const void **)filename_ptr))

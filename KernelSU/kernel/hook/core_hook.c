@@ -21,8 +21,8 @@ LSM_HANDLER_TYPE ksu_handle_rename(struct dentry *old_dentry, struct dentry *new
 	if (strcmp(new_dentry->d_iname, "packages.list"))
 		return 0;
 
-	char path[128];
-	char *buf = dentry_path_raw(new_dentry, path, sizeof(path));
+	char path[128] = { 0 };
+	char *buf = dentry_path_raw(new_dentry, path, sizeof(path) - 1);
 	if (IS_ERR(buf)) {
 		pr_err("dentry_path_raw failed.\n");
 		return 0;
@@ -81,10 +81,12 @@ LSM_HANDLER_TYPE ksu_bprm_check(struct linux_binprm *bprm)
 
 LSM_HANDLER_TYPE ksu_file_permission(struct file *file, int mask)
 {
+#if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
 	if (likely(!ksu_vfs_read_hook))
 		return 0;
 
 	ksu_install_rc_hook(file);
+#endif
 
 	return 0;
 }
@@ -392,6 +394,9 @@ static void ksu_lsm_hook_init(void)
 
 	preempt_disable();
 	local_irq_disable();
+
+	orig_bprm_set_creds = ops->bprm_set_creds;
+	ops->bprm_set_creds = hook_bprm_set_creds;
 
 	orig_inode_rename = ops->inode_rename;
 	ops->inode_rename = hook_inode_rename;

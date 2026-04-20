@@ -1,12 +1,3 @@
-bool ksu_module_mounted __read_mostly = false;
-bool ksu_boot_completed __read_mostly = false;
-
-#ifdef CONFIG_KSU_EXTRAS
-extern void ksu_avc_spoof_late_init();
-#else
-void ksu_avc_spoof_late_init() {}
-#endif
-
 static const char KERNEL_SU_RC[] =
 	"\n"
 
@@ -33,8 +24,10 @@ static const char KERNEL_SU_RC[] =
 static void stop_vfs_read_hook();
 static void stop_input_hook();
 
-bool ksu_vfs_read_hook __read_mostly = true;
-bool ksu_input_hook __read_mostly = true;
+static bool ksu_module_mounted __read_mostly = false;
+static bool ksu_boot_completed __read_mostly = false;
+static bool ksu_vfs_read_hook __read_mostly = true;
+static bool ksu_input_hook __read_mostly = true;
 
 void on_post_fs_data(void)
 {
@@ -74,6 +67,12 @@ int nuke_ext4_sysfs(const char *mnt)
 	return 0;
 }
 
+#ifdef CONFIG_KSU_EXTRAS
+extern void ksu_avc_spoof_late_init();
+#else
+void ksu_avc_spoof_late_init() {}
+#endif
+
 void on_module_mounted(void)
 {
 	pr_info("on_module_mounted!\n");
@@ -82,6 +81,8 @@ void on_module_mounted(void)
 
 void on_boot_completed(void)
 {
+	ksud_escape_exit();
+
 	ksu_boot_completed = true;
 	pr_info("on_boot_completed!\n");
 	track_throne(true);
@@ -310,9 +311,19 @@ static noinline void ksu_common_newfstat_ret(unsigned int fd_int, void **statbuf
 	}
 #endif
 
-	if (copy_from_user(&size, st_size_ptr, len)) {
+	// we do this for kretprobe's reusability
+	// this is pretty short, so nbd
+	bool got_flipped = false;
+	if (!preemptible()) {
+		preempt_enable();
+		got_flipped = true;
+	}
+	int old_nice = task_nice(current);
+	set_user_nice(current, -20);
+
+	if (ksu_copy_from_user_retry(&size, st_size_ptr, len)) {
 		pr_info("%s: read statbuf 0x%lx failed \n", syscall_name, (unsigned long)st_size_ptr);
-		return;
+		goto out;
 	}
 
 	new_size = size + ksu_rc_len;
@@ -323,6 +334,11 @@ static noinline void ksu_common_newfstat_ret(unsigned int fd_int, void **statbuf
 	else
 		pr_info("%s: add ksu_rc_len failed: statbuf 0x%lx \n", syscall_name, (unsigned long)st_size_ptr);
 	
+out:
+	set_user_nice(current, old_nice);
+	if (got_flipped)
+		preempt_disable();
+
 	return;
 }
 
@@ -481,20 +497,37 @@ static int vol_detector_exit()
 	return 0;
 }
 
-// we do this so that if theres no ksud to call on_post_fs_data
-// theres no input handler hanging around
+// we do this so that if theres no ksud to call on_post_fs_data/ksu_is_safe_mode,
+// there will be no input handler that stays around
+// 30s is more than enough time from second_stage to decrypt/post_fs_data
 static int unregister_vol_detector_fn(void *data)
 {
-	msleep(60000); // 1 minute
+	unsigned int i = 0;
+
+	pr_info("vol_detector: unreg kthread init!\n");
+	set_user_nice(current, 19); // low prio
+
+start:
+	if (!*(volatile bool *)&ksu_input_hook)
+		goto bail;
+
+	msleep(10000);
+
+	i++;
+
+	if (i < 3)
+		goto start;
+
 	stop_input_hook();
 
+bail:
 	pr_info("vol_detector: unreg kthread exit!\n");
 	return 0;
 }
 
 static void unregister_vol_detector_thread()
 {
-	kthread_run(unregister_vol_detector_fn, NULL, "kthread");
+	kthread_run(unregister_vol_detector_fn, NULL, "vol_detector");
 }
 
 static void stop_vfs_read_hook()
@@ -516,6 +549,7 @@ static void stop_input_hook()
 
 void __init ksu_ksud_init()
 {
+	ksud_escape_init();
 	vol_detector_init();
 }
 
