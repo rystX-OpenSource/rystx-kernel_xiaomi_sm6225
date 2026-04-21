@@ -102,17 +102,350 @@ static unsigned int normalized_sysctl_sched_base_slice	= 2800000ULL;
  * ==================================================================== */
 #ifdef CONFIG_GORE_SCHED
 
+#include <linux/sysctl.h>
+
+/* ====================================================================
+ * GoreScheduler — runtime-tunable variables
+ *
+ *
+ * GoreScheduler sysctl layout:
+ *
+ * All tunables are registered as flat entries under /proc/sys/kernel/
+ * with the prefix "sched_gore_".  This places them alongside the
+ * existing sched_latency_ns, sched_migration_cost_ns, … knobs and
+ * makes them visible to every Android Kernel Manager app that scans
+ * /proc/sys/kernel/sched_*.
+ *
+ * ==================================================================== */
+
+/* --- Realtime classification: timing thresholds (nanoseconds) --- */
+
 /*
- * Maximum task age (ns) before HRRN accumulators are renormalised.
- * Computed as GORE_MAX_LIFETIME_MS << GORE_MAX_LIFETIME_SHIFT.
- * The shift approximates × 10^6 (ns per ms) without a multiply.
+ * gore_rt_wait_delta_ns:
+ * Maximum difference (ns) between consecutive task sleep durations
+ * for the task to be classified as REALTIME.  Real vsync-driven
+ * threads sleep for almost exactly one frame period each time;
+ * this delta absorbs timer jitter from SurfaceFlinger and HW vsync.
+ * Range: [100000, 20000000]  Default: 2000000 (2 ms)
  */
-static u64 __read_mostly gore_max_lifetime =
-	GORE_MAX_LIFETIME_MS << GORE_MAX_LIFETIME_SHIFT;
+unsigned int __read_mostly gore_rt_wait_delta  = GORE_RT_WAIT_DELTA_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_rt_wait_delta);
+
+/*
+ * gore_rt_burst_delta_ns:
+ * Maximum difference (ns) between the last two sleep-burst lengths
+ * for REALTIME classification.  Periodic tasks have consistent burst
+ * durations; a wider delta is needed on SoCs with variable memory
+ * latency (e.g. single-channel LPDDR4X on budget devices).
+ * Range: [100000, 20000000]  Default: 3000000 (3 ms)
+ */
+unsigned int __read_mostly gore_rt_burst_delta = GORE_RT_BURST_DELTA_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_rt_burst_delta);
+
+/*
+ * gore_rt_burst_max_ns:
+ * Maximum burst length (ns) allowed for a task to still qualify as
+ * REALTIME.  UI render threads on budget SoCs may spend 5-8ms per
+ * frame; setting this too low misclassifies them as INTERACTIVE and
+ * causes dropped frames when background tasks accumulate starvation
+ * bonus and temporarily beat them in the scoring.
+ * Range: [1000000, 50000000]  Default: 8000000 (8 ms)
+ */
+unsigned int __read_mostly gore_rt_burst_max   = GORE_RT_BURST_MAX_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_rt_burst_max);
+
+/*
+ * gore_rt_min_lifetime_ns:
+ * Minimum task age (ns) before REALTIME classification is attempted.
+ * New tasks need to demonstrate a consistent sleep/run pattern over
+ * at least this duration before being promoted.  Lower values allow
+ * faster detection on cold-start but risk false positives.
+ * Range: [10000000, 5000000000]  Default: 100000000 (100 ms)
+ */
+unsigned int __read_mostly gore_rt_min_lifetime = GORE_RT_MIN_LIFETIME_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_rt_min_lifetime);
+
+/* --- Realtime classification: count thresholds --- */
+
+/*
+ * gore_rt_sticky:
+ * Number of scheduling decisions a task retains the REALTIME label
+ * after its classification conditions stop being met.  Prevents
+ * type thrashing at gesture boundaries where burst/wait patterns
+ * briefly become irregular for a few frames.
+ * Range: [1, 50]  Default: 10
+ */
+unsigned int __read_mostly gore_rt_sticky      = GORE_RT_STICKY_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_rt_sticky);
+
+/*
+ * gore_interactive_hrrn:
+ * Minimum integer HRRN ratio (total_time / run_time) for INTERACTIVE
+ * classification.  A value of 2 means the task sleeps at least as
+ * long as it runs.  Raise to require more sleep before classifying
+ * as interactive; lower to be more aggressive.
+ * Range: [1, 10]  Default: 2
+ */
+unsigned int __read_mostly gore_interactive_hrrn = GORE_INTERACTIVE_HRRN_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_interactive_hrrn);
+
+/*
+ * gore_cpu_bound_pct:
+ * CPU utilisation percentage threshold above which a task is
+ * classified as CPU_BOUND.  Computed as
+ * gore_vruntime * 100 / (gore_vruntime + wait_time).
+ * Range: [50, 99]  Default: 80
+ */
+unsigned int __read_mostly gore_cpu_bound_pct  = GORE_CPU_BOUND_PCT_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_cpu_bound_pct);
+
+/* --- Scoring parameters --- */
+
+/*
+ * gore_tier_scale:
+ * Multiplier applied to the task type tier (0=REALTIME … 4=BATCH)
+ * before adding HRRN, burst, and starvation components.  A higher
+ * value makes tier separation stricter (a REALTIME task always beats
+ * BATCH by at least this × 4 = 400000 points).  Lower values let
+ * the fine-grained HRRN/burst scores bleed across tiers.
+ * Range: [1000, 1000000]  Default: 100000
+ */
+int __read_mostly gore_tier_scale              = GORE_TIER_SCALE_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_tier_scale);
+
+/*
+ * gore_curr_bias:
+ * Score advantage (subtracted from curr's gore_score) given to the
+ * currently running entity.  Prevents preempting curr for a marginal
+ * score difference.  The value must be smaller than gore_tier_scale
+ * so genuine tier changes still trigger preemption.  Larger values
+ * increase the "stickiness" of the running task; smaller values make
+ * the scheduler more reactive.
+ * Range: [0, 50000]  Default: 3000
+ */
+int __read_mostly gore_curr_bias               = GORE_CURR_BIAS_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_curr_bias);
+
+/*
+ * gore_burst_shift:
+ * Right-shift applied to curr_burst (ns) before adding it to the
+ * gore_score as a penalty.  burst_penalty = curr_burst >> shift.
+ * Higher shift = softer penalty (less impact from long bursts).
+ * Lower shift = harder penalty (CPU-bound tasks penalised faster).
+ * shift=22 gives ~4ms granularity per point; shift=20 gives ~1ms.
+ * Range: [16, 30]  Default: 22
+ */
+unsigned int __read_mostly gore_burst_shift    = GORE_BURST_SHIFT_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_burst_shift);
+
+/*
+ * gore_starve_shift:
+ * Right-shift applied to (now - last_run) before subtracting it
+ * from gore_score as a starvation-prevention bonus.
+ * Higher shift = weaker bonus (tasks can wait longer without bonus).
+ * Lower shift = stronger bonus (waiting tasks rise in priority faster).
+ * shift=24 gives ~16ms granularity; shift=22 gives ~4ms.
+ * Range: [16, 30]  Default: 24
+ */
+unsigned int __read_mostly gore_starve_shift   = GORE_STARVE_SHIFT_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_starve_shift);
+
+/* --- Lifetime normalisation --- */
+
+/*
+ * gore_max_lifetime_ms:
+ * Task age (milliseconds) at which HRRN accumulators are rescaled
+ * back to prevent overflow and keep ratios meaningful.  The rescale
+ * is proportional so classification is not disrupted.  Increasing
+ * this makes HRRN scores "drift" more slowly but risks large values
+ * on very long-lived tasks; decreasing it causes more frequent (but
+ * cheap) renormalisation events.
+ * Range: [5000, 120000]  Default: 22000 (22 s)
+ */
+unsigned int __read_mostly gore_max_lifetime_ms = GORE_MAX_LIFETIME_MS_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_max_lifetime_ms);
+
+/* ====================================================================
++ * Helper: compute max_lifetime in nanoseconds from the ms sysctl.
++ *
++ * We shift left by 20 (× 1 048 576 ≈ × 10^6) as a fast ns-per-ms
++ * approximation.  The 4.8% error vs exact ×10^6 is irrelevant for
++ * a normalisation period measured in tens of seconds.
++ * ==================================================================== */
+static inline u64 gore_max_lifetime_ns(void)
+{
+	return (u64)gore_max_lifetime_ms << 20;
+}
+
+/* ====================================================================
+ * GoreScheduler sysctl registration
+ * ==================================================================== */
+
+/* Bound sentinels — file-scoped statics that outlive the ctl_table */
+static unsigned int gore_sysctl_uint_1         = 1U;
+static unsigned int gore_sysctl_ns_max         = 50000000U; /* 50 ms */
+static unsigned int gore_sysctl_lt_min         = 10000000U; /* 10 ms */
+static unsigned int gore_sysctl_lt_max         = 2000000000U; /* ~2 s */
+static unsigned int gore_sysctl_sticky_max     = 50U;
+static unsigned int gore_sysctl_hrrn_max       = 10U;
+static unsigned int gore_sysctl_pct_min        = 50U;
+static unsigned int gore_sysctl_pct_max        = 99U;
+static int          gore_sysctl_tier_min       = 1000;
+static int          gore_sysctl_tier_max       = 1000000;
+static int          gore_sysctl_bias_min       = 0;
+static int          gore_sysctl_bias_max       = 50000;
+static unsigned int gore_sysctl_shift_min      = 16U;
+static unsigned int gore_sysctl_shift_max      = 30U;
+static unsigned int gore_sysctl_ltms_min       = 5000U;
+static unsigned int gore_sysctl_ltms_max       = 120000U;
+
+/*
+ * The ctl_table entries use the sched_gore_ prefix so they appear as:
+ *   /proc/sys/kernel/sched_gore_<name>
+ * which is within the sched_* flat namespace scanned by kernel managers.
+ */
+static struct ctl_table gore_sched_table[] = {
+   /* ---- realtime classification: timing ---- */
+   {
+       .procname   = "sched_gore_rt_wait_delta_ns",
+       .data       = &gore_rt_wait_delta,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_uint_1,
+       .extra2     = &gore_sysctl_ns_max,
+   },
+   {
+       .procname   = "sched_gore_rt_burst_delta_ns",
+       .data       = &gore_rt_burst_delta,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_uint_1,
+       .extra2     = &gore_sysctl_ns_max,
+   },
+   {
+       .procname   = "sched_gore_rt_burst_max_ns",
+       .data       = &gore_rt_burst_max,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_uint_1,
+       .extra2     = &gore_sysctl_ns_max,
+   },
+   {
+       .procname   = "sched_gore_rt_min_lifetime_ns",
+       .data       = &gore_rt_min_lifetime,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_lt_min,
+       .extra2     = &gore_sysctl_lt_max,
+   },
+   /* ---- realtime classification: counts ---- */
+   {
+       .procname   = "sched_gore_rt_sticky",
+       .data       = &gore_rt_sticky,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_uint_1,
+       .extra2     = &gore_sysctl_sticky_max,
+   },
+   {
+       .procname   = "sched_gore_interactive_hrrn",
+       .data       = &gore_interactive_hrrn,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_uint_1,
+       .extra2     = &gore_sysctl_hrrn_max,
+   },
+   {
+       .procname   = "sched_gore_cpu_bound_pct",
+       .data       = &gore_cpu_bound_pct,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_pct_min,
+       .extra2     = &gore_sysctl_pct_max,
+   },
+   /* ---- scoring parameters ---- */
+   {
+       .procname   = "sched_gore_tier_scale",
+       .data       = &gore_tier_scale,
+       .maxlen     = sizeof(int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_tier_min,
+       .extra2     = &gore_sysctl_tier_max,
+   },
+   {
+       .procname   = "sched_gore_curr_bias",
+       .data       = &gore_curr_bias,
+       .maxlen     = sizeof(int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_bias_min,
+       .extra2     = &gore_sysctl_bias_max,
+   },
+   {
+       .procname   = "sched_gore_burst_shift",
+       .data       = &gore_burst_shift,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_shift_min,
+       .extra2     = &gore_sysctl_shift_max,
+   },
+   {
+       .procname   = "sched_gore_starve_shift",
+       .data       = &gore_starve_shift,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_shift_min,
+       .extra2     = &gore_sysctl_shift_max,
+   },
+   /* ---- lifetime normalisation ---- */
+   {
+       .procname   = "sched_gore_max_lifetime_ms",
+       .data       = &gore_max_lifetime_ms,
+       .maxlen     = sizeof(unsigned int),
+       .mode       = 0644,
+       .proc_handler   = proc_dointvec_minmax,
+       .extra1     = &gore_sysctl_ltms_min,
+       .extra2     = &gore_sysctl_ltms_max,
+   },
+   { }  /* sentinel */
+};
+
+/*
+ * Flat path — entries go directly into /proc/sys/kernel/.
+ * The sched_gore_ prefix in each .procname gives them their identity.
+ */
+static const struct ctl_path gore_sched_path[] = {
+   { .procname = "kernel"     },
+   { }
+};
+
+static struct ctl_table_header *gore_sysctl_header;
+
+static int __init gore_sysctl_init(void)
+{
+	gore_sysctl_header = register_sysctl_paths(gore_sched_path,
+						   gore_sched_table);
+	if (!gore_sysctl_header)
+		pr_warn("GoreScheduler: sysctl registration failed\n");
+	return 0;
+}
+late_initcall(gore_sysctl_init);
+
 
 static void __init gore_print_banner(void)
 {
-	pr_info("GoreScheduler v1.0 (BORE+CaCULE+TT-CFS+ECHO) active\n");
+	pr_info("GoreScheduler v1.1-sysfs (BORE+CaCULE+TT-CFS+ECHO) active\n");
+	pr_info("GoreScheduler: tunables at /proc/sys/kernel/sched_gore_*\n");
 }
 
 #endif /* CONFIG_GORE_SCHED */
@@ -982,10 +1315,11 @@ int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
 static void gore_normalize_lifetime(struct gore_node *gn, u64 now)
 {
    u64 life_time = now - gn->start_time;
-   u64 old_hrrn_x;
    s64 diff;
+   u64 old_hrrn_x;
+   u64 max_ns = gore_max_lifetime_ns(); /* read sysctl-tunable value */
 
-   diff = (s64)(life_time - gore_max_lifetime);
+   diff = (s64)(life_time - max_ns);
    if (likely(diff < 0))
        return; /* typical fast path — nothing to do */
 
@@ -999,10 +1333,10 @@ static void gore_normalize_lifetime(struct gore_node *gn, u64 now)
        old_hrrn_x = 1ULL;
 
    /* Reset start_time to half max_lifetime ago (~11 s from now) */
-   gn->start_time = now - (gore_max_lifetime >> 1);
+   gn->start_time    = now - (max_ns >> 1);
 
    /* Rescale gore_vruntime preserving the original HRRN ratio */
-   gn->gore_vruntime = ((gore_max_lifetime << 9) / old_hrrn_x) | 1ULL;
+   gn->gore_vruntime = ((max_ns << 9) / old_hrrn_x) | 1ULL;
 
    /* Clear yield marker; this event is rare enough to not matter */
    gn->yielded = false;
@@ -1307,9 +1641,21 @@ static struct sched_entity *pick_gore_next(struct cfs_rq *cfs_rq,
        all_yield = false;
        {
            s64 sc = gore_score(gn, now);
-           if (!best_gn || sc < best_sc) {
-               best_sc = sc;
-               best_gn = gn;
+           /*
+			* Apply curr bias: give the currently running entity a
+			* score advantage of GORE_CURR_BIAS so that it is not
+			* preempted for a marginal score difference.
+			*
+			* curr is identified by checking se == cfs_rq->curr.
+			* We adjust sc rather than maintaining a separate "curr
+			* score" variable so the comparison logic stays uniform.
+			*/
+		   if (se_of_gore(gn) == curr)
+				sc -= GORE_CURR_BIAS;
+
+		   if (!best_gn || sc < best_sc) {
+              best_sc = sc;
+              best_gn = gn;
            }
        }
 next:
@@ -1317,11 +1663,18 @@ next:
    }
 
    /*
-    * If every eligible non-curr entity is yielded, relax and use the
-    * best yielded candidate rather than starving the CPU.
+    * If all eligible entities are yielded pick the best of them
+	* rather than starving the CPU.  Apply curr_bias here too so a
+	* yielded curr is not immediately re-selected over a non-yielded
+	* task waiting in the wings.
     */
    if (all_yield && yield_best)
-       best_gn = yield_best;
+       /* yield_best was selected without curr_bias — re-apply it
+		* now if yield_best happens to be curr. */
+	   if (se_of_gore(yield_best) == curr)
+	      yield_sc -= GORE_CURR_BIAS;
+	   best_gn = yield_best;
+	   best_sc = yield_sc;
 
    if (likely(best_gn))
        return se_of_gore(best_gn);
@@ -9621,7 +9974,14 @@ pick:
         s64 score_curr   = gore_score(&se->gore_node,  gore_now);
         s64 score_waker  = gore_score(&pse->gore_node, gore_now);
 
-        if (score_waker < score_curr)
+        /*
+		 * Apply curr_bias to wakeup-preemption check too:
+		 * the waker must beat curr by more than GORE_CURR_BIAS to
+		 * justify a preemption.  This prevents a woken background
+		 * task with accumulated starvation_bonus from preempting
+		 * the RenderThread mid-frame.
+		 */
+		if (score_waker < score_curr - GORE_CURR_BIAS)
             goto preempt;
     }
 #endif /* CONFIG_GORE_SCHED */

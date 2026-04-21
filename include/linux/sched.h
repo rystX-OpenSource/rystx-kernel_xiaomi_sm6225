@@ -528,30 +528,64 @@ struct sched_statistics {
  * Score multiplier per type tier.  Large enough so that a BATCH task
  * (tier 4) never beats a REALTIME task (tier 0) on HRRN alone.
  */
-#define GORE_TIER_SCALE        100000LL
+#define GORE_TIER_SCALE        100000
 
 /*
  * Shift amounts for burst penalty and starvation bonus normalisation.
  * BURST_SHIFT 22 ≈ 4 ms granularity; STARVE_SHIFT 24 ≈ 16 ms.
  */
-#define GORE_BURST_SHIFT   22
-#define GORE_STARVE_SHIFT  24
+#define GORE_BURST_SHIFT   22U
+#define GORE_STARVE_SHIFT  24U
 
 /*
  * TT-CFS classification thresholds (from TT-CFS patch, in ns).
  */
-#define GORE_RT_WAIT_DELTA 800000ULL   /* 0.8 ms – realtime wait delta   */
-#define GORE_RT_BURST_DELTA    2000000ULL  /* 2 ms   – realtime burst delta   */
-#define GORE_RT_BURST_MAX  4000000ULL  /* 4 ms   – max burst for realtime */
-#define GORE_RT_MIN_LIFETIME   500000000ULL    /* 500 ms – min age for realtime   */
-#define GORE_INTERACTIVE_HRRN  2ULL        /* HRRN ratio ≥ 2 → interactive   */
-#define GORE_CPU_BOUND_PCT 80ULL       /* ≥ 80% CPU → cpu_bound          */
-#define GORE_RT_STICKY     4       /* ticks to hold REALTIME label   */
+/* Realtime wait-time consistency tolerance. */
+#define GORE_RT_WAIT_DELTA 2000000U   /* 2 ms */
+/* Realtime burst-length consistency tolerance. */
+#define GORE_RT_BURST_DELTA    3000000U  /* 3 ms */
+/* Maximum burst for REALTIME classification. */
+#define GORE_RT_BURST_MAX  8000000U  /* 8 ms */
+/* Minimum task lifetime before REALTIME is considered. */
+#define GORE_RT_MIN_LIFETIME   100000000U    /* 100 ms */
+#define GORE_INTERACTIVE_HRRN  2U        /* HRRN ratio ≥ 2 → interactive   */
+#define GORE_CPU_BOUND_PCT 80U       /* ≥ 80% CPU → cpu_bound          */
+/* Ticks to hold REALTIME label after conditions stop holding.*/
+#define GORE_RT_STICKY     10U
 
-/* Maximum task age before HRRN counters are renormalised (~22 s).
- * Left-shifted by 20 bits ≈ × 1 048 576 ≈ × 1 000 000 (ns → ~ms). */
-#define GORE_MAX_LIFETIME_SHIFT    20
-#define GORE_MAX_LIFETIME_MS   22000ULL
+/*
+ * Bias subtracted from the currently-running entity's gore_score.
+ *
+ * Prevents pick_gore_next() from preempting curr for a marginally better
+ * score.  Eliminates the "starvation_bonus barely beats curr" race that
+ * caused single dropped frames during launcher scroll.
+ *
+ * The value (3000) is intentionally smaller than one tier step (100000),
+ * so a genuine tier-level priority difference still triggers preemption.
+ * It is also larger than typical starvation_bonus drift (~500-2000 per
+ * pick) to absorb one or two spurious overtakes per scroll frame.
+ */
+#define GORE_CURR_BIAS		3000
+
+/* Maximum task age before HRRN counters are renormalised (~22 s).*/
+#define GORE_MAX_LIFETIME_MS   22000U
+
+/*
+ * External declarations for the runtime sysctl variables.
+ * The actual definitions live in kernel/sched/fair.c.
+ */
+extern unsigned int gore_rt_wait_delta;
+extern unsigned int gore_rt_burst_delta;
+extern unsigned int gore_rt_burst_max;
+extern unsigned int gore_rt_min_lifetime;
+extern unsigned int gore_rt_sticky;
+extern unsigned int gore_interactive_hrrn;
+extern unsigned int gore_cpu_bound_pct;
+extern int          gore_tier_scale;
+extern int          gore_curr_bias;
+extern unsigned int gore_burst_shift;
+extern unsigned int gore_starve_shift;
+extern unsigned int gore_max_lifetime_ms;
 
 struct gore_node {
    /*
@@ -580,6 +614,19 @@ struct gore_node {
    /* ---- Yield marker (TT-CFS) ---- */
    bool             yielded;    /* skip in Gore pick until reset  */
 };
+
+/* Convenience aliases so existing gore_* functions keep readable names */
+#define GORE_RT_WAIT_DELTA	((u64)gore_rt_wait_delta)
+#define GORE_RT_BURST_DELTA	((u64)gore_rt_burst_delta)
+#define GORE_RT_BURST_MAX	((u64)gore_rt_burst_max)
+#define GORE_RT_MIN_LIFETIME	((u64)gore_rt_min_lifetime)
+#define GORE_RT_STICKY		gore_rt_sticky
+#define GORE_INTERACTIVE_HRRN	((u64)gore_interactive_hrrn)
+#define GORE_CPU_BOUND_PCT	((u64)gore_cpu_bound_pct)
+#define GORE_TIER_SCALE		((s64)gore_tier_scale)
+#define GORE_CURR_BIAS		((s64)gore_curr_bias)
+#define GORE_BURST_SHIFT	gore_burst_shift
+#define GORE_STARVE_SHIFT	gore_starve_shift
 
 #endif /* CONFIG_GORE_SCHED */
 
