@@ -528,30 +528,30 @@ struct sched_statistics {
  * Score multiplier per type tier.  Large enough so that a BATCH task
  * (tier 4) never beats a REALTIME task (tier 0) on HRRN alone.
  */
-#define GORE_TIER_SCALE        100000
+#define GORE_TIER_SCALE_DEFAULT        100000
 
 /*
  * Shift amounts for burst penalty and starvation bonus normalisation.
  * BURST_SHIFT 22 ≈ 4 ms granularity; STARVE_SHIFT 24 ≈ 16 ms.
  */
-#define GORE_BURST_SHIFT   22U
-#define GORE_STARVE_SHIFT  24U
+#define GORE_BURST_SHIFT_DEFAULT   22U
+#define GORE_STARVE_SHIFT_DEFAULT  24U
 
 /*
  * TT-CFS classification thresholds (from TT-CFS patch, in ns).
  */
 /* Realtime wait-time consistency tolerance. */
-#define GORE_RT_WAIT_DELTA 2000000U   /* 2 ms */
+#define GORE_RT_WAIT_DELTA_DEFAULT 2000000U   /* 2 ms */
 /* Realtime burst-length consistency tolerance. */
-#define GORE_RT_BURST_DELTA    3000000U  /* 3 ms */
+#define GORE_RT_BURST_DELTA_DEFAULT    3000000U  /* 3 ms */
 /* Maximum burst for REALTIME classification. */
-#define GORE_RT_BURST_MAX  8000000U  /* 8 ms */
+#define GORE_RT_BURST_MAX_DEFAULT  8000000U  /* 8 ms */
 /* Minimum task lifetime before REALTIME is considered. */
-#define GORE_RT_MIN_LIFETIME   100000000U    /* 100 ms */
-#define GORE_INTERACTIVE_HRRN  2U        /* HRRN ratio ≥ 2 → interactive   */
-#define GORE_CPU_BOUND_PCT 80U       /* ≥ 80% CPU → cpu_bound          */
+#define GORE_RT_MIN_LIFETIME_DEFAULT   100000000U    /* 100 ms */
+#define GORE_INTERACTIVE_HRRN_DEFAULT  2U        /* HRRN ratio ≥ 2 → interactive   */
+#define GORE_CPU_BOUND_PCT_DEFAULT 80U       /* ≥ 80% CPU → cpu_bound          */
 /* Ticks to hold REALTIME label after conditions stop holding.*/
-#define GORE_RT_STICKY     10U
+#define GORE_RT_STICKY_DEFAULT     10U
 
 /*
  * Bias subtracted from the currently-running entity's gore_score.
@@ -565,10 +565,10 @@ struct sched_statistics {
  * It is also larger than typical starvation_bonus drift (~500-2000 per
  * pick) to absorb one or two spurious overtakes per scroll frame.
  */
-#define GORE_CURR_BIAS		3000
+#define GORE_CURR_BIAS_DEFAULT		3000
 
 /* Maximum task age before HRRN counters are renormalised (~22 s).*/
-#define GORE_MAX_LIFETIME_MS   22000U
+#define GORE_MAX_LIFETIME_MS_DEFAULT   22000U
 
 /*
  * External declarations for the runtime sysctl variables.
