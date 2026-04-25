@@ -29,6 +29,18 @@ static bool ksu_boot_completed __read_mostly = false;
 static bool ksu_vfs_read_hook __read_mostly = true;
 static bool ksu_input_hook __read_mostly = true;
 
+#ifdef KSU_CAN_USE_JUMP_LABEL
+DEFINE_STATIC_KEY_TRUE(ksud_vfs_read_key);
+static inline void ksu_disable_vfs_read_branch()
+{
+	pr_info("vfs_read_hook: remove vfs_read branches\n");
+	static_branch_disable(&ksud_vfs_read_key);
+	smp_mb();
+}
+#else
+static inline void ksu_disable_vfs_read_branch() { } // no-op
+#endif
+
 void on_post_fs_data(void)
 {
 	static bool done = false;
@@ -200,9 +212,6 @@ static bool is_init_rc(struct file *fp)
 __attribute__((cold))
 static noinline void ksu_install_rc_hook(struct file *file)
 {
-	if (likely(!ksu_vfs_read_hook))
-		return;
-
 	if (!is_init(current_cred()))
 		return;
 
@@ -344,21 +353,25 @@ out:
 
 void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr)
 {
-	if (likely(!ksu_vfs_read_hook))
-		return;
-
-	ksu_common_newfstat_ret(*fd, (void **)statbuf_ptr, STAT_NATIVE, "sys_newfstat");
+#ifdef KSU_CAN_USE_JUMP_LABEL
+	if (static_branch_likely(&ksud_vfs_read_key))
+		ksu_common_newfstat_ret(*fd, (void **)statbuf_ptr, STAT_NATIVE, "sys_newfstat");
+#else
+	if (unlikely(ksu_vfs_read_hook))
+		ksu_common_newfstat_ret(*fd, (void **)statbuf_ptr, STAT_NATIVE, "sys_newfstat");
+#endif
 }
 
 #if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
 void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr)
 {
-
-	if (likely(!ksu_vfs_read_hook))
-		return;
-
-	// WARNING: LE-only!!!
-	ksu_common_newfstat_ret(*(unsigned int *)fd, (void **)statbuf_ptr, STAT_STAT64, "sys_fstat64");
+#ifdef KSU_CAN_USE_JUMP_LABEL
+	if (static_branch_likely(&ksud_vfs_read_key))
+		ksu_common_newfstat_ret(*(unsigned int *)fd, (void **)statbuf_ptr, STAT_STAT64, "sys_fstat64"); // WARNING: LE-only!!!
+#else
+	if (unlikely(ksu_vfs_read_hook))
+		ksu_common_newfstat_ret(*(unsigned int *)fd, (void **)statbuf_ptr, STAT_STAT64, "sys_fstat64"); // WARNING: LE-only!!!
+#endif
 }
 #endif
 
@@ -497,45 +510,50 @@ static int vol_detector_exit()
 	return 0;
 }
 
-// we do this so that if theres no ksud to call on_post_fs_data/ksu_is_safe_mode,
-// there will be no input handler that stays around
-// 30s is more than enough time from second_stage to decrypt/post_fs_data
-static int unregister_vol_detector_fn(void *data)
+// we do this so that if theres no ksud to call on_post_fs_data/ksu_is_safe_mode/on_boot_completed
+// there will be no input handler / extra execve branch that stays around
+// 60s is more than enough time from second_stage to decrypt/post_fs_data
+// if theres no ksud that does that, we trigger the closing of hooks ourselves
+static int ksu_hook_watchdog(void *data)
 {
 	unsigned int i = 0;
 
-	pr_info("vol_detector: unreg kthread init!\n");
 	set_user_nice(current, 19); // low prio
+	pr_info("%s: kthread init!\n", __func__);
 
 start:
 	if (!*(volatile bool *)&ksu_input_hook)
 		goto bail;
 
-	msleep(10000);
+	msleep(5000);
 
 	i++;
 
-	if (i < 3)
+	if (i < 12)
 		goto start;
 
+	// if this path gets triggerred, it means theres no ksud
+	pr_info("%s: ksud probably absent, closing hooks!\n", __func__);
+
+	// close down input hook
 	stop_input_hook();
 
-bail:
-	pr_info("vol_detector: unreg kthread exit!\n");
-	return 0;
-}
+	// close down ksud escape
+	ksud_escape_exit();
+	ksu_boot_completed = true;
 
-static void unregister_vol_detector_thread()
-{
-	kthread_run(unregister_vol_detector_fn, NULL, "vol_detector");
+bail:
+	pr_info("%s: kthread exit!\n", __func__);
+	return 0;
 }
 
 static void stop_vfs_read_hook()
 {
 	ksu_vfs_read_hook = false;
 	pr_info("stop vfs_read_hook\n");
+	ksu_disable_vfs_read_branch();
 
-	unregister_vol_detector_thread();
+	kthread_run(ksu_hook_watchdog, NULL, "watchdog");
 }
 
 static void stop_input_hook()

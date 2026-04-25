@@ -200,8 +200,6 @@ static void read_and_replace_syscall(void *old_ptr, unsigned long syscall_nr, vo
 	smp_mb(); 
 }
 
-extern long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
-
 static void restore_syscall(void *old_ptr, unsigned long syscall_nr, void *new_ptr, void *target_table)
 {
 	void **sctable = (void **)target_table;
@@ -297,11 +295,6 @@ loop_start:
 	return 0;
 }
 
-static void vfs_read_hook_wait_thread()
-{
-	kthread_run(ksu_syscall_table_restore, NULL, "unhook");
-}
-
 static void ksu_syscall_table_hook_init()
 {
 
@@ -314,7 +307,8 @@ static void ksu_syscall_table_hook_init()
 	read_and_replace_syscall((void *)&armeabi_fstat64, __ARMEABI_fstat64, (void *)hook_armeabi_fstat64_ret, (void *)sys_call_table);
 	read_and_replace_syscall((void *)&armeabi_read, __ARMEABI_read, (void *)hook_armeabi_read, (void *)sys_call_table);
 
-	vfs_read_hook_wait_thread(); // start unreg kthread
+	// start unreg kthread
+	kthread_run(ksu_syscall_table_restore, NULL, "unhook");
 }
 
 static DEFINE_MUTEX(sucompat_toggle_mutex);

@@ -53,23 +53,66 @@ static char __user *ksud_user_path(void)
 	return userspace_stack_buffer(ksud_path, sizeof(ksud_path));
 }
 
-__attribute__((hot))
+#if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE) && defined(KSU_CAN_USE_JUMP_LABEL)
+DEFINE_STATIC_KEY_TRUE(ksud_sucompat_key);
+static inline void ksu_sucompat_enable_branch()
+{
+	pr_info("su_compat: enable sucompat branches\n");
+	static_branch_enable(&ksud_sucompat_key);
+	smp_mb();
+}
+static inline void ksu_sucompat_disable_branch()
+{
+	pr_info("su_compat: remove sucompat branches\n");
+	static_branch_disable(&ksud_sucompat_key);
+	smp_mb();
+}
+#else
+static inline void ksu_sucompat_enable_branch() { } // no-op
+static inline void ksu_sucompat_disable_branch() { } // no-op
+#endif
+
+__attribute__((hot, flatten))
 static __always_inline bool is_su_allowed(const void **ptr_to_check)
 {
 #ifndef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+#ifdef KSU_CAN_USE_JUMP_LABEL
+	// read as: if not 'likely' disabled
+	if (!!!static_branch_likely(&ksud_sucompat_key))
+		return false;
+#else
 	barrier();
 	if (!ksu_su_compat_enabled)
 		return false;
+#endif // KSU_CAN_USE_JUMP_LABEL
 #endif
 
 	barrier();
 	if (likely(!!current->seccomp.mode))
 		return false;
 
-	// with seccomp check above, we can make this neutral
-	if (!ksu_is_allow_uid_for_current(current_uid().val))
+	// see seccomp check above
+	// so if its root but not ksu domain, deny, see __ksu_is_allow_uid_for_current
+	// actually, we can likely skip this step?
+	uid_t uid = current_uid().val;
+	if (!!uid)
+		goto uid_check;
+
+	if (!is_ksu_domain())
+		return false;
+	goto check_ptr;
+
+	// NOTE: shell has its seccomp disabled, so we only need to check for this thing
+	// short-circuit if not shell! as we allow apps on setuid lsm by disabling seccomp
+uid_check:
+	if (likely(uid != 2000))
+		goto check_ptr;
+
+	// use internal function, not the macro
+	if (!__ksu_is_allow_uid(uid))
 		return false;
 
+check_ptr:
 	// first check the pointer-to-pointer
 	if (unlikely(!ptr_to_check))
 		return false;
@@ -81,21 +124,27 @@ static __always_inline bool is_su_allowed(const void **ptr_to_check)
 	return true;
 }
 
-static noinline int ksu_sucompat_user_common(const char __user **filename_user,
+static __always_inline int ksu_sucompat_user_common(const char __user **filename_user,
 				const char *syscall_name,
 				const bool escalate,
 				const uint8_t sym)
 {
 	const char su[] = SU_PATH;
+	char path[sizeof(su)];
 
-	char path[sizeof(su)]; // sizeof includes nullterm already!
-	if (ksu_copy_from_user_retry(path, *filename_user, sizeof(path)))
+	// it seems this is actually the slowest part
+	// so we peek last word first.
+	// NOTE: this forces uint64_t, 32 bit might be damned, but this is better than splitting to 4 usercopies.
+	if (ksu_copy_from_user_retry(path + sizeof(uint64_t), *filename_user + sizeof(uint64_t), sizeof(path) - sizeof(uint64_t)))
 		return 0;
 
-	// what we shouldve copied should've been preterminated!
-	// path[sizeof(path) - 1] = '\0';
+	if (likely(!!__builtin_memcmp(path + sizeof(uint64_t), su + sizeof(uint64_t), sizeof(su) - sizeof(uint64_t) )))
+		return 0;
 
-	if (memcmp(path, su, sizeof(su)))
+	if (ksu_copy_from_user_retry(path, *filename_user, sizeof(uint64_t)))
+		return 0;
+
+	if (unlikely(*(uint64_t *)path != *(uint64_t *)su))
 		return 0;
 
 	write_sulog(sym);
@@ -171,7 +220,29 @@ static __always_inline int ksu_sucompat_kernel_common(void **filename_ptr, void 
 	if (!is_su_allowed((const void **)filename_ptr))
 		return 0;
 
-	if (likely(memcmp(*filename_ptr, SU_PATH, sizeof(SU_PATH))))
+	const char su[] = SU_PATH;
+
+	uintptr_t *su_p = (uintptr_t *)su;
+	uintptr_t *fn_p = (uintptr_t *)*(char **)filename_ptr;
+
+	// it seems this is actually the slowest part
+	// so we peek last word first.
+	// getname_flags pads this so nothing to worry about
+#ifdef CONFIG_64BIT
+	if (likely(!!__builtin_memcmp(*filename_ptr + sizeof(uintptr_t), su + sizeof(uintptr_t), sizeof(su) - sizeof(uintptr_t) )))
+		return 0;
+#else
+	if (likely(!!__builtin_memcmp(&fn_p[3], &su_p[3], sizeof(su) - (3 * sizeof(uintptr_t)) )))
+		return 0;
+
+	if (fn_p[2] != su_p[2])
+		return 0;
+
+	if (fn_p[1] != su_p[1])
+		return 0;
+#endif
+
+	if (fn_p[0] != su_p[0])
 		return 0;
 
 	// we only handle execve here after removing vfs_statx hook for >= 6.1
@@ -200,15 +271,17 @@ no_ksud:
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
-// for do_execveat_common / do_execve_common on >= 3.14
-// take note: struct filename **filename
+// take note: struct filename **filename, for do_execveat_common / do_execve_common on >= 3.14
 int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
 {
-	return ksu_sucompat_kernel_common((void **)&(*filename_ptr)->name, argv, envp, "do_execveat_common");
+	struct filename *filename = *filename_ptr;
+	if (IS_ERR(filename)) // see getname_flags
+		return 0;
+
+	return ksu_sucompat_kernel_common((void **)&filename->name, argv, envp, "do_execveat_common");
 }
 #else
-// for do_execve_common on < 3.14
-// take note: char **filename
+// take note: char **filename, for do_execve_common on < 3.14
 int ksu_legacy_execve_sucompat(const char **filename_ptr, void *argv, void *envp)
 {
 	return ksu_sucompat_kernel_common((void **)filename_ptr, argv, envp, "do_execve_common");
@@ -226,6 +299,7 @@ static inline void syscall_table_sucompat_disable() { } // no-op
 static void ksu_sucompat_enable()
 {
 
+	ksu_sucompat_enable_branch();
 	syscall_table_sucompat_enable();
 
 	ksu_su_compat_enabled = true;
@@ -235,6 +309,7 @@ static void ksu_sucompat_enable()
 static void ksu_sucompat_disable()
 {
 
+	ksu_sucompat_disable_branch();
 	syscall_table_sucompat_disable();
 
 	ksu_su_compat_enabled = false;

@@ -52,28 +52,30 @@ LSM_HANDLER_TYPE ksu_handle_setuid(struct cred *new, const struct cred *old)
 		return 0;
 
 	// we dont have those new fancy things upstream has
-	// lets just do original thing where we disable seccomp
-	if (unlikely(is_uid_manager(new_uid))) {
-		disable_seccomp();
-		pr_info("install fd for: %d\n", new_uid);
-		ksu_install_fd();
-		return 0;
-	}
+	// lets just do the original thing where we disable seccomp
+	if (unlikely(is_uid_manager(new_uid)))
+		goto install_ksu_fd;
 
-	if (unlikely(ksu_is_allow_uid_for_current(new_uid))) {
-		disable_seccomp();
-		return 0;
-	}
+	if (ksu_is_allow_uid_for_current(new_uid))
+		goto kill_seccomp;
 
-	return ksu_handle_umount(new, old);
+	ksu_handle_umount(new, old);
+	return 0;
+
+install_ksu_fd:
+	pr_info("install fd for manager: %d\n", new_uid);
+	ksu_install_fd();
+
+kill_seccomp:
+	disable_seccomp();
+	return 0;
 }
 
 LSM_HANDLER_TYPE ksu_bprm_check(struct linux_binprm *bprm)
 {
 
 #ifdef CONFIG_KSU_FEATURE_SULOG
-	if (unlikely(!current->seccomp.mode))
-		ksu_sulog_emit_bprm((const char *)bprm->filename);
+	ksu_sulog_emit_bprm((const char *)bprm->filename);
 #endif
 
 	return 0;
@@ -82,10 +84,13 @@ LSM_HANDLER_TYPE ksu_bprm_check(struct linux_binprm *bprm)
 LSM_HANDLER_TYPE ksu_file_permission(struct file *file, int mask)
 {
 #if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
-	if (likely(!ksu_vfs_read_hook))
-		return 0;
-
-	ksu_install_rc_hook(file);
+#ifdef KSU_CAN_USE_JUMP_LABEL
+	if (static_branch_likely(&ksud_vfs_read_key))
+		ksu_install_rc_hook(file);
+#else
+	if (unlikely(ksu_vfs_read_hook))
+		ksu_install_rc_hook(file);
+#endif
 #endif
 
 	return 0;
@@ -133,7 +138,6 @@ static void ksu_lsm_hook_init(void)
 
 // selinux_ops (LSM), security_operations struct tampering for ultra legacy
 
-extern long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
 static uintptr_t selinux_ops_addr = NULL;
 
 static int (*orig_inode_rename) (struct inode *old_dir, struct dentry *old_dentry,
@@ -174,9 +178,6 @@ static inline bool verify_selinux_cred_free(void *fn_ptr)
 	if (!fn_ptr)
 		return false;
 
-	// this is not good, calling random function pointers.
-	// but straight up pointer-swapping is worse.
-	// TODO: better way to verify
 	// ref: https://elixir.bootlin.com/linux/v3.18.140/source/security/selinux/hooks.c#L3474
 	void (*selinux_cred_free_fn)(struct cred *) = fn_ptr;
 
@@ -200,32 +201,82 @@ static inline bool verify_selinux_cred_free(void *fn_ptr)
 	return success;
 }
 
+// we should see a lot of pointers that is inside stext && etext
+// basically we check for "pointer density"
+static inline bool is_selinux_ops_valid(uintptr_t addr)
+{
+	extern char _stext[], _etext[];
+	int total_slots = sizeof(struct security_operations) / sizeof(void *); 
+	int valid_ptr = 0;
+	int i = 0;
+
+	uintptr_t member_ptr = 0;
+	uintptr_t current_slot_addr;
+
+	// we will be off by one or off by two due to sizeof("selinux")
+	// thats 8 bytes, on 32 bit, this is two pointers worth, not a big deal
+
+density_verify_start:
+	current_slot_addr = addr + (i * sizeof(void *));
+
+	member_ptr = 0;
+	if (copy_from_kernel_nofault(&member_ptr, (void *)current_slot_addr, sizeof(uintptr_t) ))
+		goto next_iter; // if it fails, just try next slot
+
+	// give up early
+	if (!valid_ptr && i >= 20)
+		return false;
+
+	// pr_info("%s: member_ptr: 0x%lx \n", __func__, (long)member_ptr);
+	if (member_ptr >= (uintptr_t)_stext && member_ptr <= (uintptr_t)_etext)
+		valid_ptr++;
+
+next_iter:
+	i++;	
+	if (i < total_slots)
+		goto density_verify_start;
+
+	pr_info("%s: density: valid: %lu slots: %lu \n", __func__, valid_ptr, total_slots);
+
+	// maybe increase to 75% or something?
+	return (valid_ptr > (total_slots / 2));
+}
+
 static noinline bool check_candidate(uintptr_t addr)
 {
 	struct security_operations *candidate = (struct security_operations *)addr;
 
-	char char_buf[sizeof("selinux")];
+	char char_buf[sizeof("selinux")] = { 0 };
+
 	if (copy_from_kernel_nofault(char_buf, (void *)addr, sizeof("selinux") ))
 		return false;
 
-	if (!!strcmp(char_buf, "selinux"))
+	if (!!memcmp(char_buf, "selinux", sizeof("selinux")))
 		return false;
 
 	// candidate found!
 	pr_info("%s: candidate selinux_ops at 0x%lx\n", __func__, (long)addr);
 
-	uintptr_t cred_free_fn_ptr;
-	if (copy_from_kernel_nofault(&cred_free_fn_ptr, &candidate->cred_free, sizeof(void *)))
+	// check ptr density	
+	if (!is_selinux_ops_valid(addr))
 		return false;
 
-	// "probably useless but wont hurt" verify, the fn_ptr should be inside stext to etext range
-	extern char _stext[], _etext[];
-	if (cred_free_fn_ptr < (uintptr_t)_stext || cred_free_fn_ptr > (uintptr_t)_etext)
+	if (!candidate->cred_free)
 		return false;
 
-	pr_info("%s: candidate selinux_cred_free at 0x%lx\n", __func__, (long)cred_free_fn_ptr);
+#ifdef CONFIG_KALLSYMS // not always available, can also fail, but it wont hurt to try.
+	uintptr_t ksym_ptr = (uintptr_t)kallsyms_lookup_name("selinux_cred_free");
+	if (unlikely(ksym_ptr != (uintptr_t)candidate->cred_free))
+		goto test_fn;
 
-	return verify_selinux_cred_free((void *)cred_free_fn_ptr);
+	pr_info("%s: selinux_cred_free found via ksym_lookup: 0x%lx probe_result: 0x%lx \n", __func__, (long)ksym_ptr, (long)candidate->cred_free);
+	return true;
+
+test_fn:
+#endif
+
+	pr_info("%s: candidate selinux_cred_free at 0x%lx\n", __func__, (long)candidate->cred_free);
+	return verify_selinux_cred_free((void *)candidate->cred_free);
 }
 
 /** 
@@ -332,15 +383,22 @@ static inline void set_selinux_ops()
 	selinux_ops_addr = (uintptr_t)ops;	
 }
 
-static void ksu_lsm_hook_restore(void)
+static int ksu_lsm_hook_restore(void *data)
 {
+loop_start:
+
+	msleep(1000);
+
+	if (*(volatile bool *)&ksu_vfs_read_hook)
+		goto loop_start;
+
 	struct security_operations *ops = (struct security_operations *)selinux_ops_addr;
 
 	if (!ops)
-		return;
+		return 0;
 
 	if (!!strcmp((char *)ops, "selinux"))
-		return;
+		return 0;
 
 	pr_info("%s: selinux_ops: 0x%lx .name = %s\n", __func__, (long)ops, (const char *)ops );
 
@@ -357,26 +415,7 @@ static void ksu_lsm_hook_restore(void)
 	local_irq_enable();
 	preempt_enable();
 	
-	return;
-}
-
-static int execveat_hook_wait_fn(void *data)
-{
-loop_start:
-
-	msleep(1000);
-
-	if (*(volatile bool *)&ksu_vfs_read_hook)
-		goto loop_start;
-
-	ksu_lsm_hook_restore();
-
 	return 0;
-}
-
-static void execveat_hook_wait_thread()
-{
-	kthread_run(execveat_hook_wait_fn, NULL, "unhook");
 }
 
 static void ksu_lsm_hook_init(void)
@@ -419,7 +458,7 @@ static void ksu_lsm_hook_init(void)
 	local_irq_enable();
 	preempt_enable();
 	
-	execveat_hook_wait_thread();
+	kthread_run(ksu_lsm_hook_restore, NULL, "unhook");
 	return;
 }
 

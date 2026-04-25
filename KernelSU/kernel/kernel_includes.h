@@ -31,6 +31,7 @@
 #include <linux/init_task.h>
 #include <linux/input.h>
 #include <linux/ioctl.h>
+#include <linux/jump_label.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/kref.h>

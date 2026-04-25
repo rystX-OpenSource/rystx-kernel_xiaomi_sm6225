@@ -63,18 +63,16 @@ static void kp_ksud_transition_routine_start()
 	already_ran = true;
 }
 #else
-static noinline void sys_execve_escape_ksud_internal(void *filename)
+__attribute__((cold)) static noinline void sys_execve_escape_ksud_internal(void *filename)
 {
+#ifdef KSU_CAN_USE_JUMP_LABEL
 	if (ksu_boot_completed) {
-		pr_info("sys_execve: boot completed, disable escape fn\n");
-#ifdef CONFIG_JUMP_LABEL
-		static_branch_disable(&ksu_boot_incomplete_key);
-#else
-		sys_execve_escape_ksud = ksud_exec_escape_noop;
-#endif
+		pr_info("sys_execve: boot completed, remove escape branch\n");
+		static_branch_disable(&ksud_escape_key);
 		smp_mb();
 		return;
 	}
+#endif
 
 	// see if its init
 	if (!is_init(current_cred()))
@@ -90,29 +88,24 @@ static noinline void sys_execve_escape_ksud_internal(void *filename)
 	if (ksu_copy_from_user_retry(path, *filename_user, sizeof(path)))
 		return;
 
-	if (memcmp(ksud_path, path, sizeof(path)))
+	if (likely(!!memcmp(ksud_path, path, sizeof(path))))
 		return;
 
 	pr_info("sys_execve: escape init executing %s with pid: %d\n", path, current->pid);
-
 	escape_to_root_forced(); // give this context all permissions
-	
 	return;
 }
 
-static noinline void kernel_execve_escape_ksud_internal(void *filename)
+__attribute__((cold)) static noinline void kernel_execve_escape_ksud_internal(void *filename)
 {
+#ifdef KSU_CAN_USE_JUMP_LABEL
 	if (ksu_boot_completed) {
-		pr_info("kernel_execve: boot completed, disable escape fn\n");
-#ifdef CONFIG_JUMP_LABEL
-		static_branch_disable(&ksu_boot_incomplete_key);
-#else
-		kernel_execve_escape_ksud = ksud_exec_escape_noop;
-#endif
+		pr_info("kernel_execve: boot completed, remove escape branch\n");
+		static_branch_disable(&ksud_escape_key);
 		smp_mb();
 		return;
 	}
-
+#endif
 	// filename is void **
 	void **filename_ptr = (void **)filename;
 
@@ -123,13 +116,11 @@ static noinline void kernel_execve_escape_ksud_internal(void *filename)
 	if (!*filename_ptr)
 		return;
 
-	if (likely(memcmp(*filename_ptr, KSUD_PATH, sizeof(KSUD_PATH))))
+	if (likely(!!memcmp(*filename_ptr, KSUD_PATH, sizeof(KSUD_PATH))))
 		return;
 
 	pr_info("kernel_execve: escape init executing %s with pid: %d\n", *(const char **)filename_ptr, current->pid);
-
 	escape_to_root_forced(); // give this context all permissions
-	
 	return;
 }
 #endif // KRETPROBES

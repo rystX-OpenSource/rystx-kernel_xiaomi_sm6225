@@ -69,12 +69,12 @@ static struct kretprobe sys_fstat64_rp = {
 static int sys_reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = PT_REAL_REGS(regs);
-	int magic1 = (int)PT_REGS_PARM1(real_regs);
+	int *magic1 = (int *)&PT_REGS_PARM1(real_regs); // ptr so we can mutate this
 	int magic2 = (int)PT_REGS_PARM2(real_regs);
 	int cmd = (int)PT_REGS_PARM3(real_regs);
 	void __user **arg = (void __user **)&PT_REGS_SYSCALL_PARM4(real_regs);
 
-	if (magic1 != KSU_INSTALL_MAGIC1)
+	if (*magic1 != KSU_INSTALL_MAGIC1)
 		return 0;
 
 	// HACK: flip preempt status inside kp
@@ -89,11 +89,14 @@ static int sys_reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 	int old_nice = task_nice(current);
 	set_user_nice(current, -10);
 
-	ksu_handle_sys_reboot(magic1, magic2, cmd, arg);
+	ksu_handle_sys_reboot(*magic1, magic2, cmd, arg);
 	set_user_nice(current, old_nice);
 
 	if (got_flipped)
 		preempt_disable();
+
+	// to prevent double hooking
+	*magic1 = 0;
 
 	return 0;
 }
