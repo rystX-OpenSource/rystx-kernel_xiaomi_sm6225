@@ -173,7 +173,7 @@ void ksu_sulog_emit_pending(struct ksu_sulog_pending_event *pending, int retval,
 	ksu_sulog_free_pending(pending);
 }
 
-int ksu_sulog_emit_grant_root(int retval, __u32 uid, __u32 euid, gfp_t gfp)
+static int ksu_sulog_emit_grant_root(int retval, __u32 uid, __u32 euid, gfp_t gfp)
 {
 	if (!ksu_sulog_is_enabled())
 		return 0;
@@ -192,7 +192,7 @@ int ksu_sulog_emit_grant_root(int retval, __u32 uid, __u32 euid, gfp_t gfp)
 	return 0;
 }
 
-int ksu_sulog_emit(__u16 event_type, const char *bprm_argv, size_t bprm_argv_len, gfp_t gfp)
+static int ksu_sulog_emit(__u16 event_type, const char *bprm_argv, size_t bprm_argv_len, gfp_t gfp)
 {
 	if (!ksu_sulog_is_enabled())
 		return 0;
@@ -207,11 +207,12 @@ int ksu_sulog_emit(__u16 event_type, const char *bprm_argv, size_t bprm_argv_len
 	return 0;
 }
 
-void ksu_sulog_emit_bprm(const char *filename)
+static void ksu_sulog_emit_bprm(const char *filename)
 {
 	if (!ksu_sulog_is_enabled())
 		return;
 
+	// maybe tag the process instead?
 	if (!is_ksu_domain())
 		return;
 
