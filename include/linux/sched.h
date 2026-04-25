@@ -595,6 +595,12 @@ struct gore_node {
    struct gore_node    *next;
    struct gore_node    *prev;
 
+   /* ---- Hook API fields (v1.2) ---- */
+	atomic_t		 score_bias;	  /* subtracted from gore_score()    */
+	u64			 boost_expire_ns; /* sched_clock() when bias → 0     */
+	bool			 type_locked;	  /* skip auto-classify when true    */
+	unsigned int		 hint_flags;	  /* GORE_HINT_* from hook callers   */
+
    /* ---- Task classification (TT-CFS) ---- */
    unsigned int         task_type;  /* GORE_{REALTIME,…,BATCH}  */
    int          rt_sticky;  /* ticks left holding RT label */
@@ -614,6 +620,111 @@ struct gore_node {
    /* ---- Yield marker (TT-CFS) ---- */
    bool             yielded;    /* skip in Gore pick until reset  */
 };
+
+/* ================================================================
+ * GoreScheduler — integer fixed-point log2 helpers  (v1.2)
+ *
+ * Q8.4 format: upper 28 bits integer, lower 4 bits fractional.
+ * Fractional part is approximated from the 4 bits immediately
+ * below the leading '1' bit — sufficient for scheduling scoring.
+ *
+ * All functions are pure integer arithmetic, safe in any context
+ * including hardirq and scheduler hot path.
+ * ================================================================ */
+
+/**
+ * gore_intfp_log2 — log2(x) in Q8.4 fixed-point
+ *
+ * @x: input value (must be > 0; caller ensures this)
+ *
+ * Returns floor(log2(x)) * 16 + fractional_nibble.
+ * Examples (approximate):
+ *   gore_intfp_log2(1)   = 0x00  (0.0)
+ *   gore_intfp_log2(2)   = 0x10  (1.0)
+ *   gore_intfp_log2(4)   = 0x20  (2.0)
+ *   gore_intfp_log2(8)   = 0x30  (3.0)
+ *   gore_intfp_log2(10)  ≈ 0x35  (3.3125)
+ *   gore_intfp_log2(16)  = 0x40  (4.0)
+ *   gore_intfp_log2(256) = 0x80  (8.0)
+ */
+static inline s32 gore_intfp_log2(u64 x)
+{
+	s32 int_part;
+	u32 frac_nibble;
+
+	if (unlikely(x <= 1ULL))
+		return 0;
+
+	int_part = ilog2(x);               /* floor(log2(x)), always ≥ 1 */
+
+	/*
+	 * Extract 4 fractional bits from the sub-leading bits.
+	 * Shift x so the leading bit is at position 4, then mask
+	 * the lower 4 bits as the fractional nibble.
+	 */
+	if (int_part >= 4)
+		frac_nibble = (u32)((x >> (int_part - 4)) & 0xFU);
+	else
+		frac_nibble = (u32)((x << (4 - int_part)) & 0xFU);
+
+	return (int_part << 4) | (s32)frac_nibble;
+}
+
+/**
+ * gore_intfp_hrrn_score — log2-domain HRRN score component
+ *
+ * @vruntime: weighted CPU runtime of the task (gore_vruntime)
+ * @total:    vruntime + wait_time
+ *
+ * Returns a score component where LOWER = more interactive = higher
+ * scheduling priority.  Range roughly 0–160 (Q8.4 units).
+ *
+ * The linear HRRN percentage (vruntime*100/total, range 0–100) has
+ * uniform sensitivity across all ratios.  The log2 version gives:
+ *   - High sensitivity at ratio 1–8  (INTERACTIVE/REALTIME boundary)
+ *   - Low sensitivity at ratio 32+   (all BATCH tasks look similar)
+ * This matches perceptual importance: distinguishing ratio 2 from 4
+ * matters; distinguishing ratio 50 from 55 does not.
+ *
+ * Derivation:
+ *   ratio  = total / vruntime   (Q16.0 shifted for precision)
+ *   score  = log2(ratio << 8)   (log2 of Q8.0 ratio)
+ *   Higher ratio (more sleep) → higher log → LOWER returned score
+ *   (we negate implicitly by returning log2(vruntime/total shifted))
+ */
+static inline s32 gore_intfp_hrrn_score(u64 vruntime, u64 total)
+{
+	u64 inv_ratio;
+
+	if (unlikely(total == 0 || vruntime == 0))
+		return 0x80; /* max score: fully CPU-bound guess */
+
+	if (vruntime >= total)
+		return 0x80; /* running 100% of the time */
+
+	/*
+	 * Compute vruntime / total in Q8.0 by shifting vruntime left.
+	 * Then take log2 — a task that is mostly running has
+	 * vruntime/total ≈ 1 → log2 ≈ 0 (high score, bad).
+	 * A task that sleeps 90% has vruntime/total ≈ 0.1 →
+	 * the shift trick: we compute log2(total/vruntime) and cap it.
+	 */
+	inv_ratio = (total << 8) / vruntime; /* total/vruntime in Q8.0 */
+	inv_ratio = min_t(u64, inv_ratio, 0xFFFFULL); /* cap overflow */
+
+	/*
+	 * log2(total/vruntime) in Q8.4:
+	 *   high = interactive task (lots of sleep) → low returned score
+	 *   low  = CPU-bound task                   → high returned score
+	 * We return the log value directly as the score component.
+	 * Caller uses it as: score += hrrn_log_score (lower wins).
+	 * An interactive task gets a small number here; a CPU hog gets large.
+	 *
+	 * Maximum: log2(0xFFFF << 8) ≈ 24 * 16 = 0x180
+	 * We clamp to 0x80 (8.0 in Q8.4) = 128 to stay within score range.
+	 */
+	return min_t(s32, gore_intfp_log2(inv_ratio), 0x80);
+}
 
 /* Convenience aliases so existing gore_* functions keep readable names */
 #define GORE_RT_WAIT_DELTA	((u64)gore_rt_wait_delta)

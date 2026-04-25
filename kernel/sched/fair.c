@@ -25,6 +25,8 @@
 
 #include <trace/events/sched.h>
 
+#include <linux/sched/gore_hook.h>
+
 #include "walt.h"
 
 #ifdef CONFIG_SMP
@@ -1448,6 +1450,14 @@ static void gore_detect_type(struct gore_node *gn, u64 now, int flags)
    struct sched_entity *se = se_of_gore(gn);
    unsigned int new_type = GORE_NO_TYPE;
 
+   /*
+    * Hook API: if type is externally locked (binder, OOM, thermal)
+    * skip the statistical classifier entirely.  The lock owner is
+    * responsible for calling gore_unlock_type() when appropriate.
+    */
+   if (READ_ONCE(gn->type_locked))
+	   return;
+
    if (!entity_is_task(se) || gn->gore_vruntime <= 1ULL) {
        gn->task_type = GORE_NO_TYPE;
        return;
@@ -1490,14 +1500,45 @@ static inline s64 gore_score(struct gore_node *gn, u64 now)
    s64 type_score, hrrn_score, burst_score, starve_score;
    u64 total, wait_ns;
 
+   /*
+    * ---- Hook API: score_bias from external boosts ----
+    *
+    * Check boost expiry lazily here rather than on a timer so there
+    * is no timer overhead.  If the boost has expired, zero it out.
+    * atomic_read is safe from scheduler context.
+    */
+   {
+	   int bias = atomic_read(&gn->score_bias);
+	   if (bias > 0) {
+		   u64 expire = READ_ONCE(gn->boost_expire_ns);
+		   if (expire > 0 && now >= expire) {
+			   atomic_set(&gn->score_bias, 0);
+			   WRITE_ONCE(gn->boost_expire_ns, 0);
+			   bias = 0;
+		   }
+		   bias_score = (s64)bias;
+	   } else {
+		   bias_score = 0;
+	   }
+   }
+
    /* [1] Type tier */
    type_score = (s64)gn->task_type * GORE_TIER_SCALE;
 
-   /* [2] HRRN percentage — 0 = fully interactive, 100 = CPU hog */
+   /* [2] Log-domain HRRN score (v1.2: replaces linear hrrn_pct)
+    *
+    * gore_intfp_hrrn_score() returns a Q8.4 log2 value:
+    *   ~0   = task sleeps almost all the time (very interactive)
+    *   ~128 = task runs almost all the time   (CPU bound)
+    *
+    * Scale factor >>2 converts Q8.4 units to a range of 0-32
+    * which is proportionate alongside burst_score and starve_score.
+    * The linear 0-100 range is replaced with log 0-32 range;
+    * within a tier this gives finer discrimination at the
+    * interactive boundary where it actually matters.
+    */
    total = gn->gore_vruntime + gn->wait_time;
-   hrrn_score = likely(total > 0)
-       ? (s64)((gn->gore_vruntime * 100ULL) / total)
-       : 100LL;
+   hrrn_score = (s64)gore_intfp_hrrn_score(gn->gore_vruntime, total) >> 2;
 
    /* [3] Burst penalty — right-shifted for coarse granularity */
    burst_score = (s64)(gn->curr_burst >> GORE_BURST_SHIFT);
@@ -1506,7 +1547,11 @@ static inline s64 gore_score(struct gore_node *gn, u64 now)
    wait_ns     = (gn->last_run > 0) ? (now - gn->last_run) : 0ULL;
    starve_score = (s64)(wait_ns >> GORE_STARVE_SHIFT);
 
-   return type_score + hrrn_score + burst_score - starve_score;
+   /*
+    * Final score: lower = higher priority.
+    * bias_score is subtracted (external boosts lower the score).
+    */
+   return type_score + hrrn_score + burst_score - starve_score - bias_score;
 }
 
 /* ------------------------------------------------------------------
@@ -1598,6 +1643,11 @@ static void gore_init_entity(struct sched_entity *se, u64 now)
    gn->burst          = 0;
    gn->prev_burst     = 0;
    gn->yielded        = false;
+   /* v1.2 hook API fields */
+   atomic_set(&gn->score_bias,    0);
+   WRITE_ONCE(gn->boost_expire_ns, 0);
+   WRITE_ONCE(gn->type_locked,    false);
+   WRITE_ONCE(gn->hint_flags,     0);
 }
 
 /* ------------------------------------------------------------------
@@ -1681,6 +1731,135 @@ next:
 
    return NULL; /* no eligible entity — caller uses EEVDF fallback */
 }
+
+/* ================================================================
+ * GoreScheduler v1.2 — Hook API implementations
+ * ================================================================ */
+
+/**
+ * gore_apply_boost — write a timed score bias into gore_node
+ *
+ * Uses atomic_set for score_bias so it is safe from softirq context
+ * (futex_wake can run in softirq on some configurations).
+ * boost_expire_ns uses WRITE_ONCE — single writer per task is
+ * guaranteed by the caller context (binder holds proc lock;
+ * futex_wake holds hb spinlock).
+ */
+void gore_apply_boost(struct task_struct *task, int boost, u64 duration_ns)
+{
+   struct gore_node *gn;
+
+   if (!task || !entity_is_task(&task->se))
+       return;
+
+   gn = &task->se.gore_node;
+
+   boost = min(boost, GORE_BOOST_BINDER); /* hard cap */
+   atomic_set(&gn->score_bias, boost);
+   WRITE_ONCE(gn->boost_expire_ns, sched_clock() + duration_ns);
+}
+EXPORT_SYMBOL_GPL(gore_apply_boost);
+
+void gore_lock_type(struct task_struct *task, unsigned int task_type)
+{
+   struct gore_node *gn;
+
+   if (!task || !entity_is_task(&task->se))
+       return;
+
+   gn = &task->se.gore_node;
+   WRITE_ONCE(gn->task_type,   task_type);
+   WRITE_ONCE(gn->type_locked, true);
+}
+EXPORT_SYMBOL_GPL(gore_lock_type);
+
+void gore_unlock_type(struct task_struct *task)
+{
+   if (!task || !entity_is_task(&task->se))
+       return;
+
+   WRITE_ONCE(task->se.gore_node.type_locked, false);
+}
+EXPORT_SYMBOL_GPL(gore_unlock_type);
+
+/* ----------------------------------------------------------------
+ * Binder hook implementations
+ * ---------------------------------------------------------------- */
+void gore_binder_wakeup(struct task_struct *server, struct task_struct *client)
+{
+   struct gore_node *gn;
+
+   if (!server || !entity_is_task(&server->se))
+       return;
+
+   gn = &server->se.gore_node;
+
+   /*
+    * Lock server to INTERACTIVE for the binder transaction window.
+    * This ensures it preempts BATCH/CPU_BOUND work on the same CPU
+    * without being able to override a REALTIME task.
+    */
+   gore_lock_type(server, GORE_INTERACTIVE);
+   gore_apply_boost(server, GORE_BOOST_BINDER, GORE_BOOST_DUR_BINDER);
+   WRITE_ONCE(gn->hint_flags,
+          READ_ONCE(gn->hint_flags) | GORE_HINT_BINDER_SERVER);
+}
+EXPORT_SYMBOL_GPL(gore_binder_wakeup);
+
+void gore_binder_done(struct task_struct *server)
+{
+   struct gore_node *gn;
+
+   if (!server || !entity_is_task(&server->se))
+       return;
+
+   gn = &server->se.gore_node;
+   gore_unlock_type(server);
+   atomic_set(&gn->score_bias, 0);
+   WRITE_ONCE(gn->boost_expire_ns, 0);
+   WRITE_ONCE(gn->hint_flags,
+          READ_ONCE(gn->hint_flags) & ~GORE_HINT_BINDER_SERVER);
+}
+EXPORT_SYMBOL_GPL(gore_binder_done);
+
+/* ----------------------------------------------------------------
+ * Futex hook implementation
+ * ---------------------------------------------------------------- */
+void gore_futex_wake_boost(struct task_struct *waker, struct task_struct *wakee)
+{
+   struct gore_node *waker_gn;
+   unsigned int waker_type;
+
+   if (!waker || !wakee)
+       return;
+
+   if (!entity_is_task(&waker->se) || !entity_is_task(&wakee->se))
+       return;
+
+   waker_gn  = &waker->se.gore_node;
+   waker_type = READ_ONCE(waker_gn->task_type);
+
+   /*
+    * Only inherit boost from high-priority wakers.
+    * BATCH or CPU_BOUND wakers are not considered latency-critical;
+    * their futex wakeups do not warrant a priority boost.
+    */
+   if (waker_type != GORE_REALTIME && waker_type != GORE_INTERACTIVE)
+       return;
+
+   /*
+    * Do not boost if wakee already has an active boost
+    * (e.g. it is already in a binder transaction window).
+    */
+   if (atomic_read(&wakee->se.gore_node.score_bias) > 0)
+       return;
+
+   gore_apply_boost(wakee, GORE_BOOST_FUTEX, GORE_BOOST_DUR_FUTEX);
+   WRITE_ONCE(wakee->se.gore_node.hint_flags,
+          READ_ONCE(wakee->se.gore_node.hint_flags)
+          | GORE_HINT_FUTEX_WAKEUP);
+}
+EXPORT_SYMBOL_GPL(gore_futex_wake_boost);
 
 #endif /* CONFIG_GORE_SCHED */
 

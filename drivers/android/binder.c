@@ -56,6 +56,7 @@
 #include <linux/rbtree.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/gore_hook.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -606,6 +607,24 @@ binder_select_thread_ilocked(struct binder_proc *proc)
 	if (thread)
 		list_del_init(&thread->waiting_thread_node);
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Gore hook — binder server thread wakeup.
+	 *
+	 * When a server thread is selected to handle an incoming
+	 * transaction, promote it to GORE_INTERACTIVE for the IPC
+	 * window so it preempts BATCH/CPU_BOUND background work.
+	 *
+	 * current is the client (caller of binder_transaction).
+	 * thread->task is the server being woken.
+	 *
+	 * We call this before returning so the boost is active by
+	 * the time the server thread is actually woken by the caller.
+	 */
+	if (thread && thread->task && thread->task != current)
+		gore_binder_wakeup(thread->task, current);
+#endif /* CONFIG_GORE_SCHED */
+	
 	return thread;
 }
 
@@ -3891,6 +3910,21 @@ static void binder_transaction(struct binder_proc *proc,
 		wake_up_interruptible_sync(&target_thread->wait);
 		trace_android_vh_binder_restore_priority(in_reply_to, current);
 		binder_restore_priority(thread, &in_reply_to->saved_priority);
+#ifdef CONFIG_GORE_SCHED
+		/*
+		 * Gore hook — binder reply complete.
+		 * thread->task is the server thread that just finished
+		 * handling the transaction. Release its binder promotion
+		 * so it re-classifies naturally on the next sleep cycle.
+		 *
+		 * Placed after binder_restore_priority() so Gore does not
+		 * interfere with the binder priority inheritance restore,
+		 * and before binder_free_transaction() so in_reply_to is
+		 * still valid if ever needed for future context.
+		 */
+		if (thread->task)
+			gore_binder_done(thread->task);
+#endif /* CONFIG_GORE_SCHED */
 		binder_free_transaction(in_reply_to);
 	} else if (!(t->flags & TF_ONE_WAY)) {
 		BUG_ON(t->buffer->async_transaction != 0);

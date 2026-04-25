@@ -64,6 +64,7 @@
 #include <linux/sched/rt.h>
 #include <linux/sched/wake_q.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/gore_hook.h>
 #include <linux/hugetlb.h>
 #include <linux/freezer.h>
 #include <linux/bootmem.h>
@@ -1672,6 +1673,22 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	if (!bitset)
 		return -EINVAL;
 
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Gore futex wakeup inheritance.
+	 *
+	 * We sample current's task type BEFORE acquiring the hash bucket
+	 * spinlock to minimise lock hold time.  The type is read with
+	 * READ_ONCE and is only advisory — a stale read causes at most
+	 * a missed boost opportunity, never incorrect behaviour.
+	 *
+	 * We only record the waker here; the actual boost is applied
+	 * per-wakee in the loop below after wake_futex() moves each
+	 * task to the wake queue.
+	 */
+	struct task_struct *gore_waker = current;
+#endif
+
 	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &key, VERIFY_READ);
 	if (unlikely(ret != 0))
 		goto out;
@@ -1700,6 +1717,16 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 				break;
 		}
 	}
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * Gore hook: apply futex wakeup inheritance boost.
+	 * p->task is the task being woken (just added to wake_q).
+	 * gore_futex_wake_boost() checks waker_type internally
+	 * and is a no-op for BATCH/CPU_BOUND wakers.
+	 */
+	gore_futex_wake_boost(gore_waker, p->task);
+#endif
 
 	spin_unlock(&hb->lock);
 	wake_up_q(&wake_q);
