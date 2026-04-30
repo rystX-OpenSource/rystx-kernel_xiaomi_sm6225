@@ -140,7 +140,7 @@ out_release_env_p:
 
 static noinline void do_ksu_adb_root_handle_execve(void *filename, void *envp_in)
 {
-	if (likely(!!current->seccomp.mode))
+	if (likely(test_thread_flag(TIF_SECCOMP)))
 		return;
 
 	uid_t uid = current_euid().val;
@@ -179,7 +179,7 @@ struct user_arg_ptr {
 
 static noinline void do_ksu_adb_root_handle_execveat(void *filename, void *envp_in)
 {
-	if (likely(!!current->seccomp.mode))
+	if (likely(test_thread_flag(TIF_SECCOMP)))
 		return;
 
 	uid_t uid = current_euid().val;
