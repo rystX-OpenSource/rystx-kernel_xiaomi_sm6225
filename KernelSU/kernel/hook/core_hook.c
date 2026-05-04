@@ -321,7 +321,7 @@ static inline void set_selinux_ops()
 }
 
 // stop_machine
-static void ksu_unregister_lsm_hook(void *data)
+static int ksu_unregister_lsm_hook(void *data)
 {
 	struct security_operations *ops = (struct security_operations *)selinux_ops_addr;
 
@@ -329,6 +329,8 @@ static void ksu_unregister_lsm_hook(void *data)
 		pr_info("%s: restoring file_permission 0x%lx -> 0x%lx\n", __func__, (long)ops->file_permission, (long)orig_file_permission);
 		ops->file_permission = orig_file_permission;
 	}
+	
+	return 0;
 }
 
 static int ksu_lsm_hook_restore(void *data)
@@ -355,7 +357,7 @@ loop_start:
 }
 
 // stop_machine
-static void ksu_register_lsm_hook(void *data)
+static int ksu_register_lsm_hook(void *data)
 {
 	struct security_operations *ops = (struct security_operations *)selinux_ops_addr;
 
@@ -377,6 +379,8 @@ static void ksu_register_lsm_hook(void *data)
 	orig_file_permission = ops->file_permission;
 	ops->file_permission = hook_file_permission;
 #endif
+
+	return 0;
 }
 
 static void ksu_lsm_hook_init(void)

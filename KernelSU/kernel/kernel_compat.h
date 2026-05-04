@@ -81,31 +81,6 @@ filp_open:
 static inline void ksu_grab_init_session_keyring() {} // no-op
 #endif // KEYS && < 5.2
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
-// https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L418
-static noinline ssize_t ksu_kernel_read_compat(struct file *p, void *buf, size_t count, loff_t *pos)
-{
-	mm_segment_t old_fs;
-	old_fs = get_fs();
-	set_fs(get_ds());
-	ssize_t result = vfs_read(p, (void __user *)buf, count, pos);
-	set_fs(old_fs);
-	return result;
-}
-// https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L512
-static noinline ssize_t ksu_kernel_write_compat(struct file *p, const void *buf, size_t count, loff_t *pos)
-{
-	mm_segment_t old_fs;
-	old_fs = get_fs();
-	set_fs(get_ds());
-	ssize_t res = vfs_write(p, (__force const char __user *)buf, count, pos);
-	set_fs(old_fs);
-	return res;
-}
-#define kernel_read ksu_kernel_read_compat
-#define kernel_write ksu_kernel_write_compat
-#endif // < 4.14
-
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
 #define d_inode(dentry) ((dentry)->d_inode)
 #endif
@@ -205,6 +180,18 @@ static inline void ksu_static_key_disable(struct static_key *key)
 
 #endif // < 4.3
 #endif // >= 3.4 && CONFIG_JUMP_LABEL
+
+struct user_arg_ptr {
+#ifdef CONFIG_COMPAT
+	bool is_compat;
+#endif
+	union {
+		const char __user *const __user *native;
+#ifdef CONFIG_COMPAT
+		const compat_uptr_t __user *compat;
+#endif
+	} ptr;
+};
 
 extern long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
 
@@ -325,6 +312,31 @@ static inline u64 ksu_ktime_get_ns(void) { return ktime_to_ns(ktime_get()); }
 #ifndef untagged_addr
 #define untagged_addr(addr) (addr)
 #endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+// https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L418
+static noinline ssize_t ksu_kernel_read_compat(struct file *p, void *buf, size_t count, loff_t *pos)
+{
+	mm_segment_t old_fs;
+	old_fs = get_fs();
+	set_fs(get_ds());
+	ssize_t result = vfs_read(p, (void __user *)buf, count, pos);
+	set_fs(old_fs);
+	return result;
+}
+// https://elixir.bootlin.com/linux/v4.14.336/source/fs/read_write.c#L512
+static noinline ssize_t ksu_kernel_write_compat(struct file *p, const void *buf, size_t count, loff_t *pos)
+{
+	mm_segment_t old_fs;
+	old_fs = get_fs();
+	set_fs(get_ds());
+	ssize_t res = vfs_write(p, (__force const char __user *)buf, count, pos);
+	set_fs(old_fs);
+	return res;
+}
+#define kernel_read ksu_kernel_read_compat
+#define kernel_write ksu_kernel_write_compat
+#endif // < 4.14
 
 static inline void ksu_kfree_byref(void *buf) { kfree(*(void **)buf); }
 

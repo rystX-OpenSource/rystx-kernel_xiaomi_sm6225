@@ -11,8 +11,8 @@ MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 $(info -- KDIR: $(KDIR))
 $(info -- MDIR: $(MDIR))
 
-# compliant to last upstream kernel change as of 7fb5fd3
-CFLAGS_ksu.o += -DKSU_VERSION=32479
+# compliant to last upstream kernel change as of cc83433
+CFLAGS_ksu.o += -DKSU_VERSION=32481
 
 ifndef KSU_EXPECTED_SIZE
 KSU_EXPECTED_SIZE := 0x033b
@@ -39,6 +39,15 @@ endif
 
 ifeq ($(shell grep -q "struct selinux_state " $(srctree)/security/selinux/include/security.h; echo $$?),0)
 CFLAGS_ksu.o += -DKSU_COMPAT_HAS_SELINUX_STATE
+endif
+
+ifeq ($(shell grep -q "struct type_datum \*\*type_val_to_struct;" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
+CFLAGS_ksu.o += -DKSU_TYPE_VAL_TO_STRUCT
+endif
+
+# half-assed-backport from 5.1
+ifeq ($(shell grep -q "struct type_datum \*\*type_val_to_struct_array;" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
+CFLAGS_ksu.o += -DKSU_TYPE_VAL_TO_STRUCT_ARRAY
 endif
 
 ifeq ($(shell grep -q "^DEFINE_RWLOCK(policy_rwlock);" $(srctree)/security/selinux/ss/services.c; echo $$?),0)
@@ -76,15 +85,6 @@ endif
 ifeq ($(shell grep -q "selinux_cred" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
 $(info -- KernelSU/compat: selinux_cred() found)
 CFLAGS_ksu.o += -DKSU_HAS_SELINUX_CRED
-endif
-
-ifeq ($(shell grep -q "struct type_datum \*\*type_val_to_struct;" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
-CFLAGS_ksu.o += -DKSU_TYPE_VAL_TO_STRUCT
-endif
-
-# half-assed-backport from 5.1
-ifeq ($(shell grep -q "struct type_datum \*\*type_val_to_struct_array;" $(srctree)/security/selinux/ss/policydb.h; echo $$?),0)
-CFLAGS_ksu.o += -DKSU_TYPE_VAL_TO_STRUCT_ARRAY
 endif
 
 CFLAGS_ksu.o += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-missing-prototypes
