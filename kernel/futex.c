@@ -1713,20 +1713,19 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 				continue;
 
 			mark_wake_futex(&wake_q, this);
+#ifdef CONFIG_GORE_SCHED
+			/*
+			* Gore hook: apply futex wakeup inheritance boost.
+			* this->task is the task being woken (just added to wake_q).
+			* gore_futex_wake_boost() checks waker_type internally
+			* and is a no-op for BATCH/CPU_BOUND wakers.
+			*/
+			gore_futex_wake_boost(gore_waker, this->task);
+#endif
 			if (++ret >= nr_wake)
 				break;
 		}
 	}
-
-#ifdef CONFIG_GORE_SCHED
-	/*
-	 * Gore hook: apply futex wakeup inheritance boost.
-	 * p->task is the task being woken (just added to wake_q).
-	 * gore_futex_wake_boost() checks waker_type internally
-	 * and is a no-op for BATCH/CPU_BOUND wakers.
-	 */
-	gore_futex_wake_boost(gore_waker, p->task);
-#endif
 
 	spin_unlock(&hb->lock);
 	wake_up_q(&wake_q);

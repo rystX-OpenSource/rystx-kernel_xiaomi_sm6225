@@ -64,6 +64,8 @@
  * ================================================================ */
 #define GORE_BOOST_BINDER      40000   /* binder server transaction    */
 #define GORE_BOOST_FUTEX       25000   /* futex wakeup inheritance     */
+#define GORE_BOOST_RENDER      40000   /* parent (Zygote)              */
+#define GORE_BOOST_LAUNCH      30000   /* child (new app)              */
 
 /* ================================================================
  * Boost duration constants (nanoseconds)

@@ -96,7 +96,7 @@
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
 #include <linux/simple_lmk.h>
-#include <linux/gore_hook.h>
+#include <linux/sched/gore_hook.h>
 
 #include <linux/pgtable.h>
 #include <asm/pgalloc.h>

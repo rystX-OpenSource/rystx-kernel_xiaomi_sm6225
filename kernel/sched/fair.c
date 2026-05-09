@@ -1568,7 +1568,7 @@ static void gore_detect_type(struct gore_node *gn, u64 now, int flags)
  * ------------------------------------------------------------------ */
 static inline s64 gore_score(struct gore_node *gn, u64 now)
 {
-	s64 type_score, hrrn_score, burst_score, starve_score;
+	s64 type_tier, hrrn_score, burst_score, starve_score, bias_score;
 	u64 total, wait_ns;
 	s64 effective_curr_bias;
 	unsigned int ps_level;
@@ -1870,13 +1870,15 @@ next:
 	* yielded curr is not immediately re-selected over a non-yielded
 	* task waiting in the wings.
     */
-   if (all_yield && yield_best)
+   if (all_yield && yield_best){
        /* yield_best was selected without curr_bias — re-apply it
 		* now if yield_best happens to be curr. */
-	   if (se_of_gore(yield_best) == curr)
+	   if (se_of_gore(yield_best) == curr){
 	      yield_sc -= GORE_CURR_BIAS;
+	   }
 	   best_gn = yield_best;
 	   best_sc = yield_sc;
+   }
 
    if (likely(best_gn))
        return se_of_gore(best_gn);
@@ -1900,11 +1902,12 @@ next:
 void gore_apply_boost(struct task_struct *task, int boost, u64 duration_ns)
 {
    struct gore_node *gn;
+   struct sched_entity *se = &task->se;
 
-   if (!task || !entity_is_task(&task->se))
+   if (!task || !entity_is_task(se))
        return;
 
-   gn = &task->se.gore_node;
+   gn = &se->gore_node;
 
    boost = min(boost, GORE_BOOST_BINDER); /* hard cap */
    atomic_set(&gn->score_bias, boost);
@@ -1915,11 +1918,12 @@ EXPORT_SYMBOL_GPL(gore_apply_boost);
 void gore_lock_type(struct task_struct *task, unsigned int task_type)
 {
    struct gore_node *gn;
+   struct sched_entity *se = &task->se;
 
-   if (!task || !entity_is_task(&task->se))
+   if (!task || !entity_is_task(se))
        return;
 
-   gn = &task->se.gore_node;
+   gn = &se->gore_node;
    WRITE_ONCE(gn->task_type,   task_type);
    WRITE_ONCE(gn->type_locked, true);
 }
@@ -1927,10 +1931,11 @@ EXPORT_SYMBOL_GPL(gore_lock_type);
 
 void gore_unlock_type(struct task_struct *task)
 {
-   if (!task || !entity_is_task(&task->se))
+   struct sched_entity *se = &task->se;
+   if (!task || !entity_is_task(se))
        return;
 
-   WRITE_ONCE(task->se.gore_node.type_locked, false);
+   WRITE_ONCE(se->gore_node.type_locked, false);
 }
 EXPORT_SYMBOL_GPL(gore_unlock_type);
 
@@ -1939,17 +1944,21 @@ EXPORT_SYMBOL_GPL(gore_unlock_type);
  * ---------------------------------------------------------------- */
 void gore_binder_wakeup(struct task_struct *server, struct task_struct *client)
 {
+	struct sched_entity *server_se, *client_se;
     struct gore_node *server_gn, *client_gn;
  	unsigned int client_type, inherited_type;
  	int inherited_bias;
  
  	if (!server || !client)
  		return;
- 	if (!entity_is_task(&server->se) || !entity_is_task(&client->se))
+
+	server_se = &server->se;
+	client_se = &client->se;
+ 	if (!entity_is_task(server_se) || !entity_is_task(client_se))
  		return;
  
- 	server_gn = &server->se.gore_node;
- 	client_gn = &client->se.gore_node;
+ 	server_gn = &server_se->gore_node;
+ 	client_gn = &client_se->gore_node;
 
 	/*
 	 * Read client's current type.
@@ -1984,11 +1993,12 @@ EXPORT_SYMBOL_GPL(gore_binder_wakeup);
 void gore_binder_done(struct task_struct *server)
 {
    struct gore_node *gn;
+   struct sched_entity *se = &server->se;
 
-   if (!server || !entity_is_task(&server->se))
+   if (!server || !entity_is_task(se))
        return;
 
-   gn = &server->se.gore_node;
+   gn = &se->gore_node;
    gore_unlock_type(server);
    atomic_set(&gn->score_bias, 0);
    WRITE_ONCE(gn->boost_expire_ns, 0);
@@ -2002,16 +2012,19 @@ EXPORT_SYMBOL_GPL(gore_binder_done);
  * ---------------------------------------------------------------- */
 void gore_futex_wake_boost(struct task_struct *waker, struct task_struct *wakee)
 {
+   struct sched_entity *waker_se, *wakee_se;
    struct gore_node *waker_gn;
    unsigned int waker_type;
 
    if (!waker || !wakee)
        return;
 
-   if (!entity_is_task(&waker->se) || !entity_is_task(&wakee->se))
+   waker_se = &waker->se;
+   wakee_se = &wakee->se;
+   if (!entity_is_task(waker_se) || !entity_is_task(wakee_se))
        return;
 
-   waker_gn  = &waker->se.gore_node;
+   waker_gn  = &waker_se->gore_node;
    waker_type = READ_ONCE(waker_gn->task_type);
 
    /*
@@ -2026,12 +2039,12 @@ void gore_futex_wake_boost(struct task_struct *waker, struct task_struct *wakee)
     * Do not boost if wakee already has an active boost
     * (e.g. it is already in a binder transaction window).
     */
-   if (atomic_read(&wakee->se.gore_node.score_bias) > 0)
+   if (atomic_read(&wakee_se->gore_node.score_bias) > 0)
        return;
 
    gore_apply_boost(wakee, GORE_BOOST_FUTEX, GORE_BOOST_DUR_FUTEX);
-   WRITE_ONCE(wakee->se.gore_node.hint_flags,
-          READ_ONCE(wakee->se.gore_node.hint_flags)
+   WRITE_ONCE(wakee_se->gore_node.hint_flags,
+          READ_ONCE(wakee_se->gore_node.hint_flags)
           | GORE_HINT_FUTEX_WAKEUP);
 }
 EXPORT_SYMBOL_GPL(gore_futex_wake_boost);
