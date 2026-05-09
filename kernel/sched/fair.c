@@ -268,6 +268,49 @@ unsigned int __read_mostly gore_max_lifetime_ms = GORE_MAX_LIFETIME_MS_DEFAULT;
 EXPORT_SYMBOL_GPL(gore_max_lifetime_ms);
 
 /* ====================================================================
+ * GoreScheduler v1.5 — Power saving and intfp input scaling variables
+ * ==================================================================== */
+
+/*
+ * gore_power_saving — power saving level (0-3)
+ *
+ * Controls tier ceiling and scoring adjustments for battery saving.
+ * See patch header for level descriptions.
+ * Range: [0, 3]  Default: 0 (disabled)
+ */
+unsigned int __read_mostly gore_power_saving = 0;
+EXPORT_SYMBOL_GPL(gore_power_saving);
+
+/*
+ * gore_hrrn_input_shift — intfp HRRN input shift (power saving OFF)
+ *
+ * Left-shift applied to total/vruntime ratio before log2.
+ * Higher = stronger discrimination between interactive/CPU-bound.
+ * Range: [4, 14]  Default: 8
+ */
+unsigned int __read_mostly gore_hrrn_input_shift
+					= GORE_HRRN_INPUT_SHIFT_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_hrrn_input_shift);
+
+/*
+ * gore_ps_hrrn_input_shift — intfp HRRN input shift (power saving ON)
+ *
+ * Used instead of gore_hrrn_input_shift when gore_power_saving > 0.
+ * Higher value makes CPU-bound tasks score higher (lower priority)
+ * more aggressively, encouraging them to complete and sleep faster.
+ * Range: [4, 14]  Default: 10
+ */
+unsigned int __read_mostly gore_ps_hrrn_input_shift
+					= GORE_HRRN_INPUT_SHIFT_PS_DEFAULT;
+EXPORT_SYMBOL_GPL(gore_ps_hrrn_input_shift);
+
+/* ---- PS level sentinels for sysctl bounds ---- */
+static unsigned int gore_ps_level_min     = 0U;
+static unsigned int gore_ps_level_max     = 3U;
+static unsigned int gore_hrrn_shift_min   = 4U;
+static unsigned int gore_hrrn_shift_max   = 14U;
+
+/* ====================================================================
 + * Helper: compute max_lifetime in nanoseconds from the ms sysctl.
 + *
 + * We shift left by 20 (× 1 048 576 ≈ × 10^6) as a fast ns-per-ms
@@ -419,6 +462,34 @@ static struct ctl_table gore_sched_table[] = {
        .extra1     = &gore_sysctl_ltms_min,
        .extra2     = &gore_sysctl_ltms_max,
    },
+   /* ---- v1.5: power saving and intfp input scaling ---- */
+	{
+		.procname	= "sched_gore_power_saving",
+		.data		= &gore_power_saving,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &gore_ps_level_min,
+		.extra2		= &gore_ps_level_max,
+	},
+	{
+		.procname	= "sched_gore_hrrn_input_shift",
+		.data		= &gore_hrrn_input_shift,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &gore_hrrn_shift_min,
+		.extra2		= &gore_hrrn_shift_max,
+	},
+	{
+		.procname	= "sched_gore_ps_hrrn_input_shift",
+		.data		= &gore_ps_hrrn_input_shift,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &gore_hrrn_shift_min,
+		.extra2		= &gore_hrrn_shift_max,
+	},
    { }  /* sentinel */
 };
 
@@ -446,7 +517,7 @@ late_initcall(gore_sysctl_init);
 
 static void __init gore_print_banner(void)
 {
-	pr_info("GoreScheduler v1.1-sysfs (BORE+CaCULE+TT-CFS+ECHO) active\n");
+	pr_info("GoreScheduler v1.5 (BORE+CaCULE+TT-CFS+ECHO) active\n");
 	pr_info("GoreScheduler: tunables at /proc/sys/kernel/sched_gore_*\n");
 }
 
@@ -1497,61 +1568,142 @@ static void gore_detect_type(struct gore_node *gn, u64 now, int flags)
  * ------------------------------------------------------------------ */
 static inline s64 gore_score(struct gore_node *gn, u64 now)
 {
-   s64 type_score, hrrn_score, burst_score, starve_score;
-   u64 total, wait_ns;
-
-   /*
-    * ---- Hook API: score_bias from external boosts ----
+	s64 type_score, hrrn_score, burst_score, starve_score;
+	u64 total, wait_ns;
+	s64 effective_curr_bias;
+	unsigned int ps_level;
+	unsigned int effective_burst_shift;
+	unsigned int effective_starve_shift;
+	unsigned int effective_type;
+	
+	/* ----------------------------------------------------------------
+	* v1.5: Power saving adjustments
+	*
+	* Read ps_level once — it is __read_mostly and changes only via
+	* sysctl (rare), so a single READ_ONCE is sufficient.
+	*
+	* Power saving does NOT affect type_locked tasks (binder server
+	* threads, Zygote child) — their locked type is always used as-is.
+	* This preserves IPC and app launch responsiveness in PS mode.
+	* ---------------------------------------------------------------- */
+	ps_level = READ_ONCE(gore_power_saving);
+	
+	/* Determine effective task type for scoring */
+	if (ps_level == 0 || READ_ONCE(gn->type_locked)) {
+		/*
+		* PS disabled or type is externally locked.
+		* Use the task's actual classified type unchanged.
+		*/
+		effective_type = gn->task_type;
+	} else if (ps_level == 1) {
+		/*
+		* Level 1 (mild): cap REALTIME to INTERACTIVE only.
+		* Other tiers are unchanged.
+		* Effect: no task beats INTERACTIVE in tier scoring,
+		* allowing CPUs to idle slightly more aggressively.
+		*/
+		effective_type = (gn->task_type == GORE_REALTIME)
+		? GORE_INTERACTIVE
+		: gn->task_type;
+	} else if (ps_level == 2) {
+		/*
+		* Level 2 (moderate): shift all tiers up by 1.
+		* REALTIME→INTERACTIVE, INTERACTIVE→NO_TYPE, etc.
+		* Clamped at GORE_BATCH (4).
+		*/
+		effective_type = min(gn->task_type + GORE_PS_TIER_SHIFT_L2,
+			(unsigned int)GORE_BATCH);
+	} else {
+		/*
+		* Level 3 (aggressive): all tasks score as GORE_BATCH.
+		* Maximum sleep aggression — CPUs idle as soon as possible.
+		* IPC and launch still work via type_locked exemption above.
+		*/
+		effective_type = GORE_BATCH;
+	}
+		
+	/* Adjust shift values based on PS level */
+	switch (ps_level) {
+		case 1:
+			effective_burst_shift  = GORE_BURST_SHIFT
+			+ GORE_PS_BURST_BONUS_L1;
+			effective_starve_shift = GORE_STARVE_SHIFT
+			+ GORE_PS_STARVE_BONUS_L1;
+			effective_curr_bias    = GORE_CURR_BIAS
+			+ GORE_PS_CURR_BIAS_L1;
+			break;
+		case 2:
+			effective_burst_shift  = GORE_BURST_SHIFT + GORE_PS_BURST_BONUS_L2;
+			effective_starve_shift = GORE_STARVE_SHIFT + GORE_PS_STARVE_BONUS_L2;
+			effective_curr_bias    = GORE_CURR_BIAS + GORE_PS_CURR_BIAS_L2;
+			break;
+		case 3:
+			effective_burst_shift  = GORE_BURST_SHIFT + GORE_PS_BURST_BONUS_L3;
+			effective_starve_shift = GORE_STARVE_SHIFT + GORE_PS_STARVE_BONUS_L3;
+			effective_curr_bias    = GORE_CURR_BIAS + GORE_PS_CURR_BIAS_L3;
+			break;
+		default:
+			effective_burst_shift  = GORE_BURST_SHIFT;
+			effective_starve_shift = GORE_STARVE_SHIFT;
+			effective_curr_bias    = GORE_CURR_BIAS;
+			break;
+	}
+		
+	/*
+	* ---- Hook API: score_bias from external boosts ----
+	*
+	* Check boost expiry lazily here rather than on a timer so there
+	* is no timer overhead.  If the boost has expired, zero it out.
+	* atomic_read is safe from scheduler context.
+	*/
+	{
+		int bias = atomic_read(&gn->score_bias);
+		if (bias > 0) {
+			u64 expire = READ_ONCE(gn->boost_expire_ns);
+			if (expire > 0 && now >= expire) {
+				atomic_set(&gn->score_bias, 0);
+				WRITE_ONCE(gn->boost_expire_ns, 0);
+				bias = 0;
+			}
+			bias_score = (s64)bias;
+		} else {
+			bias_score = 0;
+		}
+	}
+		
+	/* [1] Type tier */
+	type_tier = (s64)effective_type * GORE_TIER_SCALE;
+	
+	/* [2] Log-domain HRRN score (v1.5)
+	* gore_intfp_hrrn_score() in sched.h now selects input_shift
+	* based on gore_power_saving — higher shift in PS mode gives
+	* stronger CPU-bound penalty. See sched.h for details.
     *
-    * Check boost expiry lazily here rather than on a timer so there
-    * is no timer overhead.  If the boost has expired, zero it out.
-    * atomic_read is safe from scheduler context.
-    */
-   {
-	   int bias = atomic_read(&gn->score_bias);
-	   if (bias > 0) {
-		   u64 expire = READ_ONCE(gn->boost_expire_ns);
-		   if (expire > 0 && now >= expire) {
-			   atomic_set(&gn->score_bias, 0);
-			   WRITE_ONCE(gn->boost_expire_ns, 0);
-			   bias = 0;
-		   }
-		   bias_score = (s64)bias;
-	   } else {
-		   bias_score = 0;
-	   }
-   }
-
-   /* [1] Type tier */
-   type_score = (s64)gn->task_type * GORE_TIER_SCALE;
-
-   /* [2] Log-domain HRRN score (v1.2: replaces linear hrrn_pct)
-    *
-    * gore_intfp_hrrn_score() returns a Q8.4 log2 value:
-    *   ~0   = task sleeps almost all the time (very interactive)
-    *   ~128 = task runs almost all the time   (CPU bound)
-    *
-    * Scale factor >>2 converts Q8.4 units to a range of 0-32
-    * which is proportionate alongside burst_score and starve_score.
-    * The linear 0-100 range is replaced with log 0-32 range;
-    * within a tier this gives finer discrimination at the
-    * interactive boundary where it actually matters.
-    */
-   total = gn->gore_vruntime + gn->wait_time;
-   hrrn_score = (s64)gore_intfp_hrrn_score(gn->gore_vruntime, total) >> 2;
-
-   /* [3] Burst penalty — right-shifted for coarse granularity */
-   burst_score = (s64)(gn->curr_burst >> GORE_BURST_SHIFT);
-
-   /* [4] Starvation bonus — increases the longer a task waits */
-   wait_ns     = (gn->last_run > 0) ? (now - gn->last_run) : 0ULL;
-   starve_score = (s64)(wait_ns >> GORE_STARVE_SHIFT);
-
-   /*
-    * Final score: lower = higher priority.
-    * bias_score is subtracted (external boosts lower the score).
-    */
-   return type_score + hrrn_score + burst_score - starve_score - bias_score;
+	* gore_intfp_hrrn_score() returns a Q8.4 log2 value:
+	*   ~0   = task sleeps almost all the time (very interactive)
+	*   ~128 = task runs almost all the time   (CPU bound)
+	*
+	* Scale factor >>2 converts Q8.4 units to a range of 0-32
+	* which is proportionate alongside burst_score and starve_score.
+	* The linear 0-100 range is replaced with log 0-32 range;
+	* within a tier this gives finer discrimination at the
+	* interactive boundary where it actually matters.
+	*/
+	total = gn->gore_vruntime + gn->wait_time;
+	hrrn_score = (s64)gore_intfp_hrrn_score(gn->gore_vruntime, total) >> 2;
+	
+	/* [3] Burst penalty — uses PS-adjusted shift */
+	burst_score = (s64)(gn->curr_burst >> effective_burst_shift);
+	
+	/* [4] Starvation bonus — uses PS-adjusted shift */
+	wait_ns     = (gn->last_run > 0) ? (now - gn->last_run) : 0ULL;
+	starve_score = (s64)(wait_ns >> effective_starve_shift);
+	
+	/*
+	* Final score: lower = higher priority.
+	* bias_score is subtracted (external boosts lower the score).
+	*/
+	return type_tier + hrrn_score + burst_score - starve_score - bias_score - effective_curr_bias;
 }
 
 /* ------------------------------------------------------------------
@@ -1787,22 +1939,45 @@ EXPORT_SYMBOL_GPL(gore_unlock_type);
  * ---------------------------------------------------------------- */
 void gore_binder_wakeup(struct task_struct *server, struct task_struct *client)
 {
-   struct gore_node *gn;
+    struct gore_node *server_gn, *client_gn;
+ 	unsigned int client_type, inherited_type;
+ 	int inherited_bias;
+ 
+ 	if (!server || !client)
+ 		return;
+ 	if (!entity_is_task(&server->se) || !entity_is_task(&client->se))
+ 		return;
+ 
+ 	server_gn = &server->se.gore_node;
+ 	client_gn = &client->se.gore_node;
 
-   if (!server || !entity_is_task(&server->se))
-       return;
+	/*
+	 * Read client's current type.
+	 * READ_ONCE: client may be running on another CPU concurrently.
+ 	 */
+ 	client_type = READ_ONCE(client_gn->task_type);
 
-   gn = &server->se.gore_node;
+	/*
+	 * inherited_type = min(client_type, GORE_INTERACTIVE)
+	 * min() because lower tier number = higher priority.
+	 * This ensures REALTIME client → server inherits REALTIME.
+	 */
+ 	inherited_type = min(client_type, (unsigned int)GORE_INTERACTIVE);
 
-   /*
-    * Lock server to INTERACTIVE for the binder transaction window.
-    * This ensures it preempts BATCH/CPU_BOUND work on the same CPU
-    * without being able to override a REALTIME task.
-    */
-   gore_lock_type(server, GORE_INTERACTIVE);
-   gore_apply_boost(server, GORE_BOOST_BINDER, GORE_BOOST_DUR_BINDER);
-   WRITE_ONCE(gn->hint_flags,
-          READ_ONCE(gn->hint_flags) | GORE_HINT_BINDER_SERVER);
+	/*
+	 * Inherit score bias: half of client's active boost,
+	 * at least GORE_BOOST_BINDER, capped at GORE_BOOST_BINDER.
+	 * The cap prevents progressive escalation through long call chains.
+ 	 */
+ 	inherited_bias = atomic_read(&client_gn->score_bias) / 2;
+ 	inherited_bias = max(inherited_bias, GORE_BOOST_BINDER);
+ 	inherited_bias = min(inherited_bias, GORE_BOOST_BINDER);
+ 
+ 	gore_lock_type(server, inherited_type);
+ 	gore_apply_boost(server, inherited_bias, GORE_BOOST_DUR_BINDER);
+ 
+ 	WRITE_ONCE(server_gn->hint_flags,
+ 		   READ_ONCE(server_gn->hint_flags) | GORE_HINT_BINDER_SERVER);
 }
 EXPORT_SYMBOL_GPL(gore_binder_wakeup);
 

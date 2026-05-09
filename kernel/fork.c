@@ -96,6 +96,7 @@
 #include <linux/cpufreq_times.h>
 #include <linux/scs.h>
 #include <linux/simple_lmk.h>
+#include <linux/gore_hook.h>
 
 #include <linux/pgtable.h>
 #include <asm/pgalloc.h>
@@ -2380,6 +2381,75 @@ long _do_fork(unsigned long clone_flags,
 		lru_gen_add_mm(p->mm);
 		task_unlock(p);
 	}
+
+#ifdef CONFIG_GORE_SCHED
+	/*
+	 * GoreScheduler Zygote fork hook.
+	 *
+	 * Detection criteria (all must be true):
+	 *   1. parent comm == "main"
+	 *      Zygote's main thread is named "main" in all AOSP versions.
+	 *      Custom ROMs (crDroid, LineageOS, etc.) preserve this name
+	 *      since it comes from the Android runtime, not the ROM.
+	 *
+	 *   2. !(clone_flags & CLONE_THREAD)
+	 *      Zygote forks full processes, not threads.
+	 *      Thread creations (pthread_create) use CLONE_THREAD and
+	 *      must not trigger the Zygote boost.
+	 *
+	 *   3. !(clone_flags & CLONE_VM)
+	 *      Zygote does a real copy-on-write fork.
+	 *      CLONE_VM is set for vfork() and thread creation.
+	 *      A real fork (app process creation) never sets CLONE_VM.
+	 *
+	 *   4. uid_eq(task_uid(current), GLOBAL_ROOT_UID)
+	 *      Zygote runs as root (uid 0) on all Android versions.
+	 *      This prevents random root daemons named "main" from
+	 *      accidentally triggering the boost (rare but possible).
+	 *
+	 * Boost strategy:
+	 *   Parent (Zygote): brief GORE_BOOST_RENDER for 2ms.
+	 *     Ensures the fork() system call completes uninterrupted
+	 *     through copy-on-write page table setup without being
+	 *     preempted by background BATCH tasks.
+	 *     Does NOT lock type — Zygote re-classifies normally after.
+	 *
+	 *   Child (new app process): lock to GORE_INTERACTIVE + 500ms.
+	 *     The child starts as GORE_NO_TYPE (set by gore_init_entity
+	 *     in task_fork_fair). Locking to GORE_INTERACTIVE immediately
+	 *     ensures it wins scheduling decisions over BATCH/CPU_BOUND
+	 *     background work during:
+	 *       - dex2oat / class linking
+	 *       - Application.onCreate() execution
+	 *       - First frame rendering setup
+	 *     Using GORE_INTERACTIVE (not GORE_REALTIME) preserves the
+	 *     launcher's RenderThread REALTIME priority during the app
+	 *     open animation. The lock expires after 500ms and the child
+	 *     re-classifies naturally from its own burst/sleep pattern.
+	 *
+	 * Placement: after copy_process() succeeds, before wake_up_new_task(p).
+	 *   The child's gore_node is already initialised by task_fork_fair()
+	 *   which is called inside sched_post_fork() inside copy_process().
+	 *   wake_up_new_task() must come after so the boost is active
+	 *   before the child is placed on a run queue for the first time.
+	 */
+	if (!(clone_flags & CLONE_THREAD) &&
+	    !(clone_flags & CLONE_VM) &&
+	    uid_eq(task_uid(current), GLOBAL_ROOT_UID) &&
+	    !strncmp(current->comm, GORE_ZYGOTE_COMM, GORE_ZYGOTE_COMM_LEN)) {
+
+		/* Boost parent (Zygote) for the fork window */
+		gore_apply_boost(current,
+				 GORE_BOOST_RENDER,
+				 GORE_BOOST_DUR_ZYGOTE_PARENT);
+
+		/* Boost child (new app) for the full launch window */
+		gore_lock_type(p, GORE_INTERACTIVE);
+		gore_apply_boost(p,
+				 GORE_BOOST_LAUNCH,
+				 GORE_BOOST_DUR_ZYGOTE_CHILD);
+	}
+#endif /* CONFIG_GORE_SCHED */
 
 	wake_up_new_task(p);
 

@@ -22,6 +22,14 @@
 
 #ifdef CONFIG_GORE_SCHED
 
+/* ---- Zygote detection ---- */
+/*
+ * Comm name of Zygote's main thread (stable across all AOSP versions).
+ * Used for Zygote fork detection in _do_fork().
+ */
+#define GORE_ZYGOTE_COMM		"main"
+#define GORE_ZYGOTE_COMM_LEN		4
+
 /* ================================================================
  * Hint flags (written to gore_node.hint_flags)
  * ================================================================ */
@@ -62,6 +70,10 @@
  * ================================================================ */
 #define GORE_BOOST_DUR_BINDER      2000000ULL  /* 2 ms — IPC RTT    */
 #define GORE_BOOST_DUR_FUTEX       1000000ULL  /* 1 ms — one frame  */
+/* Duration of Zygote parent boost (covers fork + CoW setup) */
+#define GORE_BOOST_DUR_ZYGOTE_PARENT	2000000ULL	/* 2ms  */
+/* Duration of Zygote child boost (covers class loading + onCreate) */
+#define GORE_BOOST_DUR_ZYGOTE_CHILD	500000000ULL	/* 500ms */
 
 /* ================================================================
  * Public API — implementations in kernel/sched/fair.c

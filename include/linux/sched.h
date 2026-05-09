@@ -570,6 +570,36 @@ struct sched_statistics {
 /* Maximum task age before HRRN counters are renormalised (~22 s).*/
 #define GORE_MAX_LIFETIME_MS_DEFAULT   22000U
 
+/* ---- Power saving defaults ---- */
+
+/*
+ * Tier shift applied per power saving level.
+ * Level N adds (N-1) to effective task_type tier in gore_score().
+ * Level 3 overrides to GORE_BATCH regardless of shift.
+ */
+#define GORE_PS_TIER_SHIFT_L1		0U	/* level 1: cap only, no shift  */
+#define GORE_PS_TIER_SHIFT_L2		1U	/* level 2: shift all tiers +1  */
+#define GORE_PS_TIER_SHIFT_L3		4U	/* level 3: force BATCH (0+4≥4) */
+
+/* Extra starve_shift added per PS level (weakens starvation prevention) */
+#define GORE_PS_STARVE_BONUS_L1		2U
+#define GORE_PS_STARVE_BONUS_L2		4U
+#define GORE_PS_STARVE_BONUS_L3		6U
+
+/* Extra burst_shift added per PS level (softens burst penalty) */
+#define GORE_PS_BURST_BONUS_L1		0U
+#define GORE_PS_BURST_BONUS_L2		2U
+#define GORE_PS_BURST_BONUS_L3		4U
+
+/* Extra curr_bias added per PS level (stickier running task) */
+#define GORE_PS_CURR_BIAS_L1		0
+#define GORE_PS_CURR_BIAS_L2		2000
+#define GORE_PS_CURR_BIAS_L3		8000
+
+/* ---- intfp input shift defaults ---- */
+#define GORE_HRRN_INPUT_SHIFT_DEFAULT		8U  /* PS off: balanced        */
+#define GORE_HRRN_INPUT_SHIFT_PS_DEFAULT	10U /* PS on:  stronger penalty */
+
 /*
  * External declarations for the runtime sysctl variables.
  * The actual definitions live in kernel/sched/fair.c.
@@ -586,6 +616,9 @@ extern int          gore_curr_bias;
 extern unsigned int gore_burst_shift;
 extern unsigned int gore_starve_shift;
 extern unsigned int gore_max_lifetime_ms;
+extern unsigned int gore_power_saving;
+extern unsigned int gore_hrrn_input_shift;
+extern unsigned int gore_ps_hrrn_input_shift;
 
 struct gore_node {
    /*
@@ -627,6 +660,11 @@ struct gore_node {
  * Q8.4 format: upper 28 bits integer, lower 4 bits fractional.
  * Fractional part is approximated from the 4 bits immediately
  * below the leading '1' bit — sufficient for scheduling scoring.
+ *
+ * v1.5: gore_intfp_hrrn_score() now accepts input_shift parameter.
+ * The shift controls how aggressively the ratio is scaled before
+ * the log2 — higher shift = wider score range = more discrimination
+ * between tasks with different CPU/sleep ratios.
  *
  * All functions are pure integer arithmetic, safe in any context
  * including hardirq and scheduler hot path.
@@ -671,6 +709,46 @@ static inline s32 gore_intfp_log2(u64 x)
 }
 
 /**
+ * gore_intfp_hrrn_score_scaled — log2-domain HRRN score with input scaling
+ *
+ * @vruntime:    weighted CPU runtime (gore_vruntime)
+ * @total:       vruntime + wait_time
+ * @input_shift: left-shift applied to ratio before log2 (default 8)
+ *
+ * Higher input_shift values produce a wider output range:
+ *   shift 8  → output 0–128 (default, original v1.4 behaviour)
+ *   shift 10 → output 0–160 (power saving mode)
+ *   shift 12 → output 0–192 (aggressive PS)
+ *
+ * The wider range is then clamped to 0x80 (128) and right-shifted
+ * by 2 at the call site — so the effective contribution to gore_score
+ * scales with the input_shift, making CPU-bound tasks score higher
+ * (lower scheduling priority) in power saving mode.
+ */
+static inline s32 gore_intfp_hrrn_score_scaled(u64 vruntime, u64 total,
+						unsigned int input_shift)
+{
+	u64 inv_ratio;
+
+	if (unlikely(total == 0 || vruntime == 0))
+		return 0x80;
+
+	if (vruntime >= total)
+		return 0x80;
+
+	/*
+	 * Compute total/vruntime in Q(input_shift).0 by left-shifting.
+	 * Higher input_shift amplifies the ratio before log2, producing
+	 * a larger log score for the same HRRN ratio — this is the
+	 * "input scaling" that makes PS mode penalise CPU use more.
+	 */
+	inv_ratio = (total << input_shift) / vruntime;
+	inv_ratio = min_t(u64, inv_ratio, 0xFFFFULL);
+
+	return min_t(s32, gore_intfp_log2(inv_ratio), 0x80);
+}
+
+/**
  * gore_intfp_hrrn_score — log2-domain HRRN score component
  *
  * @vruntime: weighted CPU runtime of the task (gore_vruntime)
@@ -691,39 +769,20 @@ static inline s32 gore_intfp_log2(u64 x)
  *   score  = log2(ratio << 8)   (log2 of Q8.0 ratio)
  *   Higher ratio (more sleep) → higher log → LOWER returned score
  *   (we negate implicitly by returning log2(vruntime/total shifted))
+ *
+ * Backward-compatible wrapper using the runtime input_shift sysctl
  */
 static inline s32 gore_intfp_hrrn_score(u64 vruntime, u64 total)
 {
-	u64 inv_ratio;
-
-	if (unlikely(total == 0 || vruntime == 0))
-		return 0x80; /* max score: fully CPU-bound guess */
-
-	if (vruntime >= total)
-		return 0x80; /* running 100% of the time */
-
 	/*
-	 * Compute vruntime / total in Q8.0 by shifting vruntime left.
-	 * Then take log2 — a task that is mostly running has
-	 * vruntime/total ≈ 1 → log2 ≈ 0 (high score, bad).
-	 * A task that sleeps 90% has vruntime/total ≈ 0.1 →
-	 * the shift trick: we compute log2(total/vruntime) and cap it.
+	 * Select input_shift based on current power saving level.
+	 * gore_power_saving and gore_hrrn_input_shift are __read_mostly
+	 * globals — read is always safe here.
 	 */
-	inv_ratio = (total << 8) / vruntime; /* total/vruntime in Q8.0 */
-	inv_ratio = min_t(u64, inv_ratio, 0xFFFFULL); /* cap overflow */
-
-	/*
-	 * log2(total/vruntime) in Q8.4:
-	 *   high = interactive task (lots of sleep) → low returned score
-	 *   low  = CPU-bound task                   → high returned score
-	 * We return the log value directly as the score component.
-	 * Caller uses it as: score += hrrn_log_score (lower wins).
-	 * An interactive task gets a small number here; a CPU hog gets large.
-	 *
-	 * Maximum: log2(0xFFFF << 8) ≈ 24 * 16 = 0x180
-	 * We clamp to 0x80 (8.0 in Q8.4) = 128 to stay within score range.
-	 */
-	return min_t(s32, gore_intfp_log2(inv_ratio), 0x80);
+	unsigned int shift = (gore_power_saving > 0)
+			     ? gore_ps_hrrn_input_shift
+			     : gore_hrrn_input_shift;
+	return gore_intfp_hrrn_score_scaled(vruntime, total, shift);
 }
 
 /* Convenience aliases so existing gore_* functions keep readable names */
