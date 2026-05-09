@@ -3826,7 +3826,6 @@ static bool age_lruvec(struct lruvec *lruvec, struct scan_control *sc,
 
         if (time_before(ts, birth)) {
             birth = ts;
-            oldest_type = type;
         }
 	}
 
