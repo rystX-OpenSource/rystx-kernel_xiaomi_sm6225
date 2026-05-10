@@ -2915,7 +2915,7 @@ static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
 			walk->full_scan = true;
 		}
 
-		mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
+		mm = list_entry(mm_state->head[type], struct mm_struct, lru_gen.list);
 		if (should_skip_mm(mm, walk))
 			mm = NULL;
 	} while (!mm);
