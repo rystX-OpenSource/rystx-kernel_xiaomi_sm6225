@@ -429,6 +429,11 @@
 			record-size = <0x80000>;
 			pmsg-size = <0x200000>;
 			console-size = <0x100000>;
+			ftrace-size = <0x0>;
+			ecc-size = <0>;
+			max-reason = <4>;
+
+			no-map;
 		};
 	};
 
