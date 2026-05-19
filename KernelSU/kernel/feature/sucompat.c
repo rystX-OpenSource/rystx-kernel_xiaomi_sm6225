@@ -138,7 +138,7 @@ static __always_inline void ksu_sucompat_user_common(const char __user **filenam
 
 	// sugar prep
 	uintptr_t *su_p = (uintptr_t *)su;
-	uintptr_t __user *fn_p = (uintptr_t *)*(char **)filename_user;
+	uintptr_t __user *fn_p = (uintptr_t *)untagged_addr(*(char **)filename_user);
 
 	// assert /system/bin/su\0 = 15 bytes.
 	BUILD_BUG_ON(sizeof(su) > 16); // compielr might to pad
@@ -242,7 +242,7 @@ SUCOMPAT_HOOK_TYPE ksu_handle_stat(int *dfd, const char __user **filename_user, 
 }
 
 // sys_execve, compat_sys_execve
-SUCOMPAT_HOOK_TYPE ksu_handle_execve_sucompat(int *fd, const char __user **filename_user, void *argv, void *envp, int *flags)
+SUCOMPAT_HOOK_TYPE ksu_handle_execve(const char __user **filename_user, void *argv, void *envp)
 {
 	sys_execve_escape_ksud((void *)filename_user);
 

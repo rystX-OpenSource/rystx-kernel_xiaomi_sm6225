@@ -81,6 +81,10 @@ filp_open:
 static inline void ksu_grab_init_session_keyring() {} // no-op
 #endif // KEYS && < 5.2
 
+#ifndef __ro_after_init
+#define __ro_after_init
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
 #define d_inode(dentry) ((dentry)->d_inode)
 #endif
@@ -193,6 +197,10 @@ struct user_arg_ptr {
 	} ptr;
 };
 
+#ifndef untagged_addr
+#define untagged_addr(addr) (addr)
+#endif
+
 extern long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
 
 /**
@@ -255,11 +263,8 @@ __weak char *bin2hex(char *dst, const void *src, size_t count)
 #define file_inode(f) ((f)->f_path.dentry->d_inode)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(KSU_HAS_SELINUX_INODE)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(CONFIG_LSM)
 #define selinux_inode(inode) ((inode)->i_security)
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0) && !defined(KSU_HAS_SELINUX_CRED)
 #define selinux_cred(cred) ((cred)->security)
 #endif
 
@@ -307,10 +312,6 @@ static inline u64 ksu_ktime_get_ns(void) { return ktime_to_ns(ktime_get()); }
 #ifndef ALIGN_DOWN
 #define ALIGN_DOWN(x, a) __ALIGN_KERNEL((x) - ((a) - 1), (a))
 #endif
-#endif
-
-#ifndef untagged_addr
-#define untagged_addr(addr) (addr)
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)

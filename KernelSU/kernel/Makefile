@@ -11,8 +11,8 @@ MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 $(info -- KDIR: $(KDIR))
 $(info -- MDIR: $(MDIR))
 
-# compliant to last upstream kernel change as of cc83433
-CFLAGS_ksu.o += -DKSU_VERSION=32481
+# compliant to last upstream kernel change as of da8e0ab
+CFLAGS_ksu.o += -DKSU_VERSION=32493
 
 ifndef KSU_EXPECTED_SIZE
 KSU_EXPECTED_SIZE := 0x033b
@@ -32,6 +32,18 @@ $(info -- KernelSU Manager signature hash: $(KSU_EXPECTED_HASH))
 
 CFLAGS_ksu.o += -DEXPECTED_SIZE=$(KSU_EXPECTED_SIZE)
 CFLAGS_ksu.o += -DEXPECTED_HASH=\"$(KSU_EXPECTED_HASH)\"
+
+# uncommon, but wont hurt, check for 3-arg security_add_hooks
+ifeq ($(shell grep -A1 "void security_add_hooks" $(srctree)/include/linux/lsm_hooks.h 2>/dev/null | grep -q lsm 2>/dev/null; echo $$?),0)
+$(info -- KernelSU/compat: security_add_hooks v2 found!)
+CFLAGS_ksu.o += -DKSU_COMPAT_SECURITY_ADD_HOOKS_V2
+endif
+
+# see security_delete_hooks
+ifeq ($(shell grep -A5 "^struct security_hook_list" $(srctree)/include/linux/lsm_hooks.h 2>/dev/null | grep -q "struct hlist_node" 2>/dev/null; echo $$?),0)
+$(info -- KernelSU/compat: security_hook_list - hlist_node found!)
+CFLAGS_ksu.o += -DKSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST
+endif
 
 ifeq ($(shell grep -q " current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
 CFLAGS_ksu.o += -DKSU_COMPAT_HAS_CURRENT_SID
@@ -77,20 +89,13 @@ $(info -- KernelSU/compat: iterate_dir found!)
 CFLAGS_ksu.o += -DKSU_HAS_ITERATE_DIR
 endif
 
-ifeq ($(shell grep -q "selinux_inode" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
-$(info -- KernelSU/compat: selinux_inode() found)
-CFLAGS_ksu.o += -DKSU_HAS_SELINUX_INODE
-endif
-
-ifeq ($(shell grep -q "selinux_cred" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
-$(info -- KernelSU/compat: selinux_cred() found)
-CFLAGS_ksu.o += -DKSU_HAS_SELINUX_CRED
-endif
-
-CFLAGS_ksu.o += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-int-conversion -Wno-missing-prototypes
-CFLAGS_ksu.o += -Wno-declaration-after-statement -Wno-unused-function -Wno-format -Wno-incompatible-pointer-types
-CFLAGS_ksu.o += -Wno-unused-variable -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast
+CFLAGS_ksu.o += -Wno-implicit-function-declaration -Wno-strict-prototypes -Wno-declaration-after-statement 
+CFLAGS_ksu.o += -Wno-int-conversion -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast
+CFLAGS_ksu.o += -Wno-unused-variable -Wno-unused-function -Wno-format
 CFLAGS_ksu.o += -Wno-macro-redefined
+
+# dont be too strict
+CFLAGS_REMOVE_ksu.o += -Werror
 
 # so we can see stack use atleast, as we disable all stack safety here
 CFLAGS_ksu.o += $(call cc-option, -Wframe-larger-than=1024)

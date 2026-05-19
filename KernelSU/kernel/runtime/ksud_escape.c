@@ -131,13 +131,15 @@ __attribute__((cold)) static noinline void kernel_execve_escape_ksud_internal(vo
 static uintptr_t selinux_ops_addr;
 static int (*orig_bprm_set_creds)(struct linux_binprm *bprm) = NULL;
 
-static void ksu_unregister_bprm_set_creds(void *data)
+static int ksu_unregister_bprm_set_creds(void *data)
 {
 	struct security_operations *ops = (struct security_operations *)selinux_ops_addr;
 	if (orig_bprm_set_creds) {
 		pr_info("%s: restoring: bprm_set_creds 0x%lx -> 0x%lx\n", __func__, (long)ops->bprm_set_creds, (long)orig_bprm_set_creds);
 		ops->bprm_set_creds = orig_bprm_set_creds;
 	}
+	
+	return 0;
 }
 
 static int hook_bprm_set_creds(struct linux_binprm *bprm)
@@ -184,8 +186,6 @@ unreg_bprm_set_creds:
 
 bprm_set_creds:
 	return orig_bprm_set_creds(bprm);
-
-
 }
 #endif
 
