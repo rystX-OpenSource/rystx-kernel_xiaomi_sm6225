@@ -22,11 +22,9 @@ LSM_HANDLER_TYPE ksu_task_fix_setuid(struct cred *new, const struct cred *old, i
 
 LSM_HANDLER_TYPE ksu_bprm_check(struct linux_binprm *bprm)
 {
-
 #ifdef CONFIG_KSU_FEATURE_SULOG
 	ksu_sulog_emit_bprm((const char *)bprm->filename);
 #endif
-
 	return 0;
 }
 
@@ -53,15 +51,12 @@ static struct security_hook_list ksu_hooks[] __ro_after_init = {
 #ifdef CONFIG_KSU_FEATURE_SULOG
 	LSM_HOOK_INIT(bprm_check_security, ksu_bprm_check),
 #endif
-#if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
-	LSM_HOOK_INIT(file_permission, ksu_file_permission),
-#endif
 };
 
-
-#ifndef __nocfi
-#define __nocfi
-#endif
+// vfs_read hook
+static struct security_hook_list ksu_hooks_file_permission[] __ro_after_init = {
+	LSM_HOOK_INIT(file_permission, ksu_file_permission),
+};
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0) || defined(KSU_COMPAT_SECURITY_ADD_HOOKS_V2)
 static int (*selinux_setprocattr_fn)(const char *name, void *value, size_t size) __read_mostly = NULL;
@@ -94,11 +89,10 @@ static __nocfi int ksu_setprocattr_wrapper(struct task_struct *p, char *name, vo
  *  however this is not an issue for us on 3.x as we are hijacking selinux_ops on it
  *
  */
+#define SETPROCATTR_HOOK_NAME "ksu_setprocattr"
 static struct security_hook_list ksu_hooks_setprocattr[] __ro_after_init = {
 	LSM_HOOK_INIT(setprocattr, ksu_setprocattr_wrapper),
 };
-
-#define SETPROCATTR_HOOK_NAME "ksu_setprocattr"
 
 /**
  * LSMs are actually unhookable, however, it requires CONFIG_SECURITY_SELINUX_DISABLE
@@ -218,6 +212,14 @@ static void ksu_hlist_del_safe(struct hlist_node *n)
 	smp_mb();
 }
 
+// see security_delete_hooks
+static inline void ksu_security_delete_hooks(struct security_hook_list *hooks, int count)
+{
+	int i;
+	for (i = 0; i < count; i++)
+		ksu_hlist_del_safe(&hooks[i].list);
+}
+
 static void ksu_dethrone_selinux_setprocattr()
 {
 	struct hlist_head *head = ksu_hooks_setprocattr[0].head; 
@@ -244,7 +246,9 @@ static void ksu_dethrone_selinux_setprocattr()
 		}
 	}
 }
+
 #else // ! KSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST 
+
 static void ksu_list_del_safe(struct list_head *entry)
 {
 	struct list_head *next = entry->next;
@@ -313,6 +317,14 @@ static void ksu_list_del_safe(struct list_head *entry)
 
 }
 
+// see security_delete_hooks
+static inline void ksu_security_delete_hooks(struct security_hook_list *hooks, int count)
+{
+	int i;
+	for (i = 0; i < count; i++)
+		ksu_list_del_safe(&hooks[i].list);
+}
+
 static void ksu_dethrone_selinux_setprocattr()
 {
 	struct list_head *head = ksu_hooks_setprocattr[0].head;
@@ -340,13 +352,36 @@ static void ksu_dethrone_selinux_setprocattr()
 		ksu_list_del_safe(&pos->list);
 	}
 }
+
 #endif // KSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST
+
+static int ksu_lsm_hook_restore(void *data)
+{
+	set_user_nice(current, 19); // low prio
+
+loop_start:
+	msleep(1000);
+	if (*(volatile bool *)&ksu_vfs_read_hook)
+		goto loop_start;
+
+	msleep(1000);
+
+	pr_info("ksu_file_permission: unhook!\n");
+
+	ksu_security_delete_hooks(ksu_hooks_file_permission, ARRAY_SIZE(ksu_hooks_file_permission));
+
+	return 0;
+}
 
 static __init void ksu_lsm_hook_init(void)
 {
 	ksu_security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");
-
 	pr_info("core_hook: initialized %d LSMs \n", ARRAY_SIZE(ksu_hooks));
+
+#if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
+	ksu_security_add_hooks(ksu_hooks_file_permission, ARRAY_SIZE(ksu_hooks_file_permission), "ksu_file_permission");
+	kthread_run(ksu_lsm_hook_restore, NULL, "kthread");
+#endif
 
 	ksu_security_add_hooks(ksu_hooks_setprocattr, ARRAY_SIZE(ksu_hooks_setprocattr), SETPROCATTR_HOOK_NAME);
 	ksu_dethrone_selinux_setprocattr();

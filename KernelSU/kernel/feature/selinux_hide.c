@@ -37,21 +37,6 @@ static inline int ksu_selinux_get_sids()
 	return 0;
 }
 
-// deprecate in a month
-int ksu_handle_slow_avc_audit_new(u32 tsid, u16 *tclass)
-{
-	if (!ksu_selinux_hide_enabled)
-		return 0;
-
-	if (tsid != ksu_sid)
-		return 0;
-
-	pr_info("selinux_hide: prevent log for sid: %u\n", tsid);
-	*tclass = 0;
-
-	return 0;
-}
-
 void ksu_slow_avc_audit(u32 *tsid)
 {
 	if (!ksu_selinux_hide_enabled)
@@ -71,12 +56,12 @@ static inline bool ksu_should_destroy_context(char *str)
 	if (!str)
 		return false;
 
-	read_lock(&ksu_sepolicy_shitlist_lock);
+	down_read(&ksu_sepolicy_shitlist_lock);
 
 	struct ksu_type_node *t_node;
 	list_for_each_entry(t_node, &ksu_hide_type_list, list) {
 		if (strstr(str, t_node->padded_name)) {
-			read_unlock(&ksu_sepolicy_shitlist_lock);
+			up_read(&ksu_sepolicy_shitlist_lock);
 			return true;
 		}
 	}
@@ -84,19 +69,19 @@ static inline bool ksu_should_destroy_context(char *str)
 	// double strstr
 	char *str2 = strchr(str, ' ');
 	if (!str2) {
-		read_unlock(&ksu_sepolicy_shitlist_lock);
+		up_read(&ksu_sepolicy_shitlist_lock);
 		return false;
 	}		
 
 	struct ksu_rule_node *r_node;
 	list_for_each_entry(r_node, &ksu_hide_rule_list, list) {
 		if (strstr(str, r_node->src) && strstr(str2, r_node->tgt)) {
-			read_unlock(&ksu_sepolicy_shitlist_lock);
+			up_read(&ksu_sepolicy_shitlist_lock);
 			return true;
 		}
 	}
 
-	read_unlock(&ksu_sepolicy_shitlist_lock);
+	up_read(&ksu_sepolicy_shitlist_lock);
 	return false;
 }
 
@@ -143,7 +128,7 @@ int ksu_hide_setprocattr(const char *name, void *value, size_t size)
 	return 0;
 }
 
-// for manual hook
+// for manual hook, remove this in a month
 void ksu_sel_write_context(struct file **file, char **buf, size_t *size)
 {
 	if (!ksu_selinux_hide_enabled)
@@ -179,8 +164,6 @@ void ksu_sel_write_context(struct file **file, char **buf, size_t *size)
 
 #include <linux/kprobes.h>
 static struct kprobe *slow_avc_audit_kp;
-static struct kprobe *sel_write_context_kp;
-static struct kprobe *sel_write_access_kp;
 
 static int slow_avc_audit_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
@@ -195,75 +178,6 @@ static int slow_avc_audit_pre_handler(struct kprobe *p, struct pt_regs *regs)
 
 	return 0;
 }
-
-static int sel_write_context_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
-	char **buf = (char **)&PT_REGS_PARM2(regs);
-
-	ksu_sel_write_context(NULL, buf, NULL);
-	return 0;
-}
-
-// this deals with __user, this is here in case its really needed.
-#if 0
-static int selinux_transaction_write_pre_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	
-	bool *should_destroy = (bool *)ri->data;
-	*should_destroy = false;
-
-	if (!test_thread_flag(TIF_SECCOMP))
-		return 0;
-
-	if (current_uid().val < 10000)
-		return 0;
-
-	if (!ksu_uid_should_umount(current_uid().val))
-		return 0;
-
-	const char __user **buf = (const char __user **)&PT_REGS_PARM2(regs);
-	char __user *uptr = *(char **)buf;
-
-	char kbuf[128] = { 0 };
-
-	if (ksu_copy_from_user_retry(kbuf, uptr, 127))
-		return 0;
-
-	// move ptr to the next one after space
-	char *target = strchr(kbuf, ' ');
-	if (likely(target))
-		target++;
-	else
-		target = kbuf;
-
-	if (!ksu_should_destroy_context(target))
-		return 0;
-
-	pr_info("selinux_transaction_write: destroy: %s \n", kbuf);
-	*should_destroy = true;
-
-	return 0;
-}
-
-static int selinux_transaction_write_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	// if bool is true, mod PT_REGS_RC to ret EINVAL
-	bool *should_destroy = (bool *)ri->data;
-	
-	if (*should_destroy)
-		PT_REGS_RC(regs) = -EINVAL;
-
-	return 0;
-}
-
-static struct kretprobe selinux_transaction_write_rp = {
-	.kp.symbol_name = "selinux_transaction_write",
-	.handler = selinux_transaction_write_ret_handler,
-	.entry_handler = selinux_transaction_write_pre_handler,
-	.data_size = sizeof(bool),
-	.maxactive = 20,
-};
-#endif
 
 // copied from upstream
 static struct kprobe *init_kprobe(const char *name, kprobe_pre_handler_t handler)
@@ -304,10 +218,6 @@ static void ksu_selinux_hide_enable()
 
 #if defined(CONFIG_KPROBES)
 	slow_avc_audit_kp = init_kprobe("slow_avc_audit", slow_avc_audit_pre_handler);
-	sel_write_context_kp = init_kprobe("sel_write_context", sel_write_context_pre_handler);
-	sel_write_access_kp = init_kprobe("sel_write_access", sel_write_context_pre_handler);
-#else
-	pr_info("selinux_hide: started without kprobes! make sure manual hooks are in-place!\n");
 #endif
 
 	ksu_selinux_hide_enabled = true;
@@ -318,17 +228,97 @@ static void ksu_selinux_hide_disable()
 #if defined(CONFIG_KPROBES)
 	pr_info("selinux_hide: unregister slow_avc_audit kprobe!\n");
 	destroy_kprobe(&slow_avc_audit_kp);
-
-	pr_info("selinux_hide: unregister sel_write_context kprobe!\n");
-	destroy_kprobe(&sel_write_context_kp);
-
-	pr_info("selinux_hide: unregister sel_write_access kprobe!\n");
-	destroy_kprobe(&sel_write_access_kp);
 #endif
 
 	pr_info("selinux_hide: closing down hooks!\n");
 
 	ksu_selinux_hide_enabled = false;
+}
+
+// selinux_transaction_write hijack
+
+static ssize_t (*selinux_transaction_write_fn)(struct file *file, const char __user *buf, size_t size, loff_t *pos) __read_mostly = NULL;
+static __nocfi ssize_t ksu_selinux_transaction_write(struct file *file, const char __user *buf, size_t size, loff_t *pos)
+{
+	if (!test_thread_flag(TIF_SECCOMP))
+		goto skip_destroy;
+
+	if (current_uid().val < 10000)
+		goto skip_destroy;
+
+	char kbuf[128] = { 0 };
+	if (ksu_copy_from_user_retry(kbuf, buf, 127))
+		goto skip_destroy;
+
+	if (!ksu_should_destroy_context(kbuf))
+		goto skip_destroy;
+
+	// or copy_to_user? is it writable? or we vm_mmap? or hunt for writable section on start_stack again?
+	// NOTE: if this is 'timeable', to equalize, we should call selinux_transaction_write_fn before ret EINVAL
+	pr_info("selinux_hide: selinux_transaction_write: destroy: %s \n", kbuf);
+	return -EINVAL;
+
+skip_destroy:
+	return selinux_transaction_write_fn(file, buf, size, pos);
+}
+
+#define FORCE_VOLATILE(x) *(volatile typeof(x) *)&(x)
+
+static void ksu_init_hook_selinux_transaction_write()
+{
+	struct path path;
+
+	int error = kern_path("/sys/fs/selinux/context", LOOKUP_FOLLOW, &path);
+	if (error) {
+		pr_info("selinux_hide: kern_path err: %d\n", error);
+		return;
+	}
+
+	if (!path.dentry)
+		goto bail_out;
+
+	if (!d_inode(path.dentry))
+		goto bail_out;		
+
+	struct file_operations *fops = (struct file_operations *)d_inode(path.dentry)->i_fop;
+	if (!fops)
+		goto bail_out;
+
+	if (!fops->write)
+		goto bail_out;
+
+	pr_info("selinux_hide: found selinuxfs fop->write at 0x%lx \n", (uintptr_t)fops->write);
+	selinux_transaction_write_fn = fops->write;
+
+	unsigned long addr = (unsigned long)&fops->write;
+	unsigned long base = addr & PAGE_MASK;
+	unsigned long offset = addr & ~PAGE_MASK;
+
+	struct page *page = phys_to_page(__pa(base));
+	if (!page)
+		goto bail_out;
+
+	void *writable_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+	if (!writable_addr)
+		goto bail_out;
+
+	void **target_slot = (void **)((unsigned long)writable_addr + offset);
+				
+	preempt_disable();
+	local_irq_disable();
+					
+	FORCE_VOLATILE(*target_slot) = (void *)ksu_selinux_transaction_write;
+					
+	local_irq_enable();
+	preempt_enable();
+
+	vunmap(writable_addr);
+	smp_mb();
+
+	pr_info("selinux_hide: selinuxfs f_op->write hijacked!\n");
+
+bail_out:
+	path_put(&path);
 }
 
 // init kthread
@@ -361,11 +351,13 @@ bail:
 	const char *init_adb_args[] = { "init", "adb_data_file", NULL };
 	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_NORMAL_PERM, init_adb_args);
 
-	// extra, but lets take care of this
-	const char *adbroot_args[] = { "adbroot", NULL };
-	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, adbroot_args);
+	// we move this to a module instead
+	// const char *adbroot_args[] = { "adbroot", NULL };
+	// ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, adbroot_args);
 
 	ksu_selinux_hide_enable();
+	
+	ksu_init_hook_selinux_transaction_write();
 	return 0;
 }
 

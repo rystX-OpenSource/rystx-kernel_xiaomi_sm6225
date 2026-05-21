@@ -8,7 +8,7 @@ void ksu_selinux_hide_exit();
 LIST_HEAD(ksu_hide_type_list);
 LIST_HEAD(ksu_hide_rule_list);
 
-DEFINE_RWLOCK(ksu_sepolicy_shitlist_lock);
+DECLARE_RWSEM(ksu_sepolicy_shitlist_lock);
 
 struct ksu_type_node {
 	struct list_head list;
@@ -29,7 +29,7 @@ static void ksu_add_shit_to_list(u32 cmd, const char *args[])
 		return;
 
 	int argc = sepol_expected_argc(cmd);
-	write_lock(&ksu_sepolicy_shitlist_lock);
+	down_write(&ksu_sepolicy_shitlist_lock);
 
 	size_t len;
 
@@ -48,11 +48,11 @@ static void ksu_add_shit_to_list(u32 cmd, const char *args[])
 				goto out_unlock;
 		}
 
-		t_node = kmalloc(sizeof(*t_node), GFP_ATOMIC);
+		t_node = kmalloc(sizeof(*t_node), GFP_KERNEL);
 		if (!t_node)
 			goto out_unlock;
 		
-		t_node->padded_name = kmalloc(len + 3, GFP_ATOMIC);
+		t_node->padded_name = kmalloc(len + 3, GFP_KERNEL);
 		if (!t_node->padded_name) {
 			kfree(t_node);
 			goto out_unlock;
@@ -78,18 +78,18 @@ static void ksu_add_shit_to_list(u32 cmd, const char *args[])
 				goto out_unlock;
 		}
 
-		r_node = kmalloc(sizeof(*r_node), GFP_ATOMIC);
+		r_node = kmalloc(sizeof(*r_node), GFP_KERNEL);
 		if (!r_node)
 			goto out_unlock;
 
-		r_node->src = kmalloc(strlen(src) + 3, GFP_ATOMIC);
+		r_node->src = kmalloc(strlen(src) + 3, GFP_KERNEL);
 		if (!r_node->src) {
 			kfree(r_node);
 			goto out_unlock;
 		}		
 		snprintf(r_node->src, strlen(src) + 3, ":%s:", src);
 
-		r_node->tgt = kmalloc(strlen(tgt) + 3, GFP_ATOMIC);
+		r_node->tgt = kmalloc(strlen(tgt) + 3, GFP_KERNEL);
 		if (!r_node->tgt) {
 			kfree(r_node->src);
 			kfree(r_node);
@@ -105,7 +105,7 @@ static void ksu_add_shit_to_list(u32 cmd, const char *args[])
 	}
 
 out_unlock:
-	write_unlock(&ksu_sepolicy_shitlist_lock);
+	up_write(&ksu_sepolicy_shitlist_lock);
 }
 
 

@@ -11,8 +11,8 @@ MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 $(info -- KDIR: $(KDIR))
 $(info -- MDIR: $(MDIR))
 
-# compliant to last upstream kernel change as of da8e0ab
-CFLAGS_ksu.o += -DKSU_VERSION=32493
+# compliant to last upstream kernel change as of b11be25
+CFLAGS_ksu.o += -DKSU_VERSION=32497
 
 ifndef KSU_EXPECTED_SIZE
 KSU_EXPECTED_SIZE := 0x033b
@@ -112,6 +112,14 @@ CFLAGS_REMOVE_ksu.o += -pg
 
 # if cflags can be macro'd, this will be called 'TRUST_ME'
 CFLAGS_ksu.o += -fno-stack-protector -fno-stack-check
+
+CFLAGS_ksu.o += $(call cc-option, -fno-sanitize=cfi)
+CFLAGS_REMOVE_ksu.o += -fsanitize=cfi
+CFLAGS_REMOVE_ksu.o += -fsanitize=cfi-vcall
+CFLAGS_REMOVE_ksu.o += -fsanitize=cfi-nvcall
+CFLAGS_REMOVE_ksu.o += -fsanitize=cfi-derived-cast
+CFLAGS_REMOVE_ksu.o += -fsanitize=cfi-unrelated-cast
+CFLAGS_REMOVE_ksu.o += -fshadow-call-stack
 CFLAGS_REMOVE_ksu.o += -fsanitize=shadow-call-stack
 endif # CONFIG_KSU_DEBUG
 

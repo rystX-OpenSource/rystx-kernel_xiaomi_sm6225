@@ -220,6 +220,10 @@ static __always_inline long ksu_copy_from_user_retry(void *to, const void __user
 	return copy_from_user(to, from, count);
 }
 
+#ifndef __nocfi
+#define __nocfi
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0) // caller is reponsible for sanity!
 static inline void ksu_zeroed_strncpy(char *dest, const char *src, size_t count)
 {
