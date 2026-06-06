@@ -3416,11 +3416,8 @@ static int copy_siginfo_from_user_any(siginfo_t *kinfo, siginfo_t __user *info)
 
 static struct pid *pidfd_to_pid(const struct file *file)
 {
-	struct pid *pid;
-
-	pid = pidfd_pid(file);
-	if (!IS_ERR(pid))
-		return pid;
+	if (file->f_op == &pidfd_fops)
+		return file->private_data;
 
 	return tgid_pidfd_to_pid(file);
 }
