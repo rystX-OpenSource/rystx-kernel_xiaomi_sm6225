@@ -39,7 +39,7 @@ static inline int ksu_selinux_get_sids()
 
 void ksu_slow_avc_audit(u32 *tsid)
 {
-	if (!ksu_selinux_hide_enabled)
+	if (unlikely(!ksu_selinux_hide_enabled))
 		return;
 
 	if (*tsid != ksu_sid)
@@ -138,7 +138,7 @@ static inline bool ksu_should_destroy_context(char *str)
 // NOTE: this is also available as manual hook for 6.8+
 int ksu_hide_setprocattr(const char *name, void *value, size_t size)
 {
-	if (!ksu_selinux_hide_enabled)
+	if (unlikely(!ksu_selinux_hide_enabled))
 		return 0;
 
 	// only hook when seccomp is enabled
@@ -264,7 +264,7 @@ static void ksu_selinux_hide_disable()
 static ssize_t (*selinux_transaction_write_fn)(struct file *file, const char __user *buf, size_t size, loff_t *pos) __read_mostly = NULL;
 static __nocfi ssize_t ksu_selinux_transaction_write(struct file *file, const char __user *buf, size_t size, loff_t *pos)
 {
-	if (!ksu_selinux_hide_enabled)
+	if (unlikely(!ksu_selinux_hide_enabled))
 		goto skip_destroy;
 
 	if (!test_thread_flag(TIF_SECCOMP))
@@ -298,7 +298,7 @@ extern struct selinux_state selinux_state;
 
 static struct page *ksu_fake_status_page __read_mostly = NULL;
 
-static int ksu_init_fake_status_page()
+static int ksu_prepare_fake_status_page()
 {
 	struct page *real_page = ksu_selinux_kernel_status_page();
 	if (!real_page)
@@ -309,7 +309,8 @@ static int ksu_init_fake_status_page()
 	if (!new_page)
 		return -ENOMEM;
 
-	// we will leak one reference but thats fine, lifetime os forever
+	// we will leak one page but thats fine
+	// not a leak when it is used forever :)
 	struct selinux_kernel_status *real_status = page_address(real_page);
 	struct selinux_kernel_status *fake_status = page_address(new_page);
     
@@ -334,7 +335,7 @@ static int ksu_init_fake_status_page()
 static int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp) __read_mostly = NULL;
 static __nocfi int ksu_sel_open_handle_status(struct inode *inode, struct file *filp)
 {
-	if (!ksu_selinux_hide_enabled)
+	if (unlikely(!ksu_selinux_hide_enabled))
 		goto orig_page;
 
 	if (!test_thread_flag(TIF_SECCOMP))
@@ -343,10 +344,13 @@ static __nocfi int ksu_sel_open_handle_status(struct inode *inode, struct file *
 	if (current_uid().val < 10000)
 		goto orig_page;
 
-	if (unlikely(!ksu_fake_status_page))
-		goto orig_page;
+	// won't happen! we check this on hook init!
+	// if (unlikely(!ksu_fake_status_page))
+	//	goto orig_page;
 
 	filp->private_data = ksu_fake_status_page;
+
+	pr_info("selinux_hide: sel_open_handle_status: served fake_page\n");
 	return 0;
 
 orig_page:
@@ -481,16 +485,16 @@ static int ksu_hide_init_thread(void *data)
 {
 	set_user_nice(current, 19); // low prio
 
-start:
+wait_start:
 	// in input hook got turned off means we have ksud!
 	if (!*(volatile bool *)&ksu_input_hook)
-		goto bail;
+		goto init_hooks;
 
 	msleep(5000);
 
-	goto start;
+	goto wait_start;
 
-bail:
+init_hooks:
 	;
 	// apply_kernelsu_rules_fn
 	const char *ksu_domain_args[] = { KERNEL_SU_DOMAIN, NULL };
@@ -507,10 +511,21 @@ bail:
 	// ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, adbroot_args);
 
 	ksu_selinux_hide_enable();
-
 	ksu_init_hook_selinux_transaction_write();
 
-	ksu_init_fake_status_page();
+	int tries = 0;
+try_again:
+	if (!ksu_prepare_fake_status_page())
+		goto page_ok;
+		
+	msleep(1000);
+	tries = tries + 1;
+	if (tries > 10)
+		return 0;
+
+	goto try_again;
+
+page_ok:
 	ksu_init_hook_selinux_status_open();
 
 	return 0;

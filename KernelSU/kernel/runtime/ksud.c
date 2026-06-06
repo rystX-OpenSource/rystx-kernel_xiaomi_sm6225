@@ -190,6 +190,12 @@ static void free_module_rc(void)
 
 static inline void set_module_rc_len_vfs()
 {
+	static bool loaded = false;
+	if (loaded)
+		return;
+
+	loaded = true;
+
 	struct path path;
 
 	int err = kern_path(MODULE_RC_PATH_WATCHDOG, LOOKUP_FOLLOW, &path);
@@ -360,11 +366,15 @@ static bool is_init_rc(struct file *fp)
 	return true;
 }
 
-__attribute__((cold))
 static noinline void ksu_install_rc_hook(struct file *file)
 {
 	if (!is_init(current_cred()))
 		return;
+
+	// if init process is running, always try to grab module_rc length
+	// this is because we are also running newfstat hook on kprobe
+	// and we really cannot kern_path on it
+	set_module_rc_len_vfs();
 
 	if (!is_init_rc(file)) {
 		return;
@@ -415,7 +425,6 @@ static noinline void ksu_install_rc_hook(struct file *file)
 }
 
 // for sys_read kp / syscall table
-__attribute__((cold))
 static noinline void ksu_handle_sys_read_fd(unsigned int fd)
 {
 	if (likely(!ksu_vfs_read_hook))
@@ -435,10 +444,17 @@ static noinline void ksu_handle_sys_read_fd(unsigned int fd)
 #define STAT_NATIVE 0
 #define STAT_STAT64 1
 
-__attribute__((cold))
 static noinline void ksu_common_newfstat_ret(unsigned int fd_int, void **statbuf_ptr, 
 			const int type, const char *syscall_name)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 0)
+// TODO: fix for OABI. this part has some issues with it
+// however it works on kretprobe. so this issue is really weird.
+// not that important as kernels this old does not have A17
+	if (preemptible())
+		return;
+#endif
+
 	if (!is_init(current_cred()))
 		return;
 
@@ -480,10 +496,6 @@ static noinline void ksu_common_newfstat_ret(unsigned int fd_int, void **statbuf
 		preempt_enable();
 		got_flipped = true;
 	}
-
-	// stat happens first, ksu cred isnt set yet
-	// so grab size via vfs instead
-	set_module_rc_len_vfs();
 
 	if (ksu_copy_from_user_retry(&size, st_size_ptr, len)) {
 		pr_info("%s: read statbuf 0x%lx failed \n", syscall_name, (unsigned long)st_size_ptr);

@@ -63,7 +63,6 @@ static long hook_armeabi_fstatat64(const struct pt_regs *regs)
 }
 
 static syscall_fn_t armeabi_fstat64 __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_fstat64_ret(const struct pt_regs *regs)
 {
 	// we handle it like rp
@@ -76,7 +75,6 @@ static long hook_armeabi_fstat64_ret(const struct pt_regs *regs)
 }
 
 static syscall_fn_t armeabi_read __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_read(const struct pt_regs *regs)
 {
 	unsigned int fd = (unsigned int)regs->regs[0];	
@@ -170,7 +168,6 @@ static long hook_armeabi_fstatat64(int dfd, const char __user * filename, struct
 }
 
 static uintptr_t armeabi_fstat64 __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_fstat64_ret(unsigned long fd, struct stat64 __user * statbuf)
 {
 	// we handle it like rp
@@ -180,7 +177,6 @@ static long hook_armeabi_fstat64_ret(unsigned long fd, struct stat64 __user * st
 }
 
 static uintptr_t armeabi_read __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_read(unsigned int fd, char __user *buf, size_t count)
 {
 	ksu_handle_sys_read_fd(fd);
@@ -380,13 +376,7 @@ static __init int ksu_syscall_table_hook_init()
 
 	read_and_replace_syscall((void *)&armeabi_reboot, __ARMEABI_reboot, (void *)hook_armeabi_reboot, (void *)sys_call_table);
 
-	// theres an issue on fstat64 on oabi, so lets not hook it
-	// this is not that much of a loss since 3.0 / 3.4 devices aren't really running A17
-	// TODO: fix and handle this
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
 	read_and_replace_syscall((void *)&armeabi_fstat64, __ARMEABI_fstat64, (void *)hook_armeabi_fstat64_ret, (void *)sys_call_table);
-#endif
-
 	read_and_replace_syscall((void *)&armeabi_read, __ARMEABI_read, (void *)hook_armeabi_read, (void *)sys_call_table);
 
 	// start unreg kthread

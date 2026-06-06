@@ -71,7 +71,6 @@ static long hook_aarch64_newfstatat(const struct pt_regs *regs)
 }
 
 static syscall_fn_t aarch64_newfstat __read_mostly = NULL;
-__attribute__((cold))
 static long hook_aarch64_newfstat_ret(const struct pt_regs *regs)
 {
 	// we handle it like rp
@@ -84,7 +83,6 @@ static long hook_aarch64_newfstat_ret(const struct pt_regs *regs)
 }
 
 static syscall_fn_t aarch64_read __read_mostly = NULL;
-__attribute__((cold))
 static long hook_aarch64_read(const struct pt_regs *regs)
 {
 	unsigned int fd = (unsigned int)regs->regs[0];
@@ -139,7 +137,6 @@ static long hook_armeabi_fstatat64(const struct pt_regs *regs)
 }
 
 static syscall_fn_t armeabi_fstat64 __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_fstat64_ret(const struct pt_regs *regs)
 {
 	// we handle it like rp
@@ -152,7 +149,6 @@ static long hook_armeabi_fstat64_ret(const struct pt_regs *regs)
 }
 
 static syscall_fn_t armeabi_read __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_read(const struct pt_regs *regs)
 {
 	unsigned int fd = (unsigned int)regs->regs[0];	
@@ -205,7 +201,6 @@ static long hook_aarch64_newfstatat(int dfd, const char __user * filename, struc
 }
 
 static uintptr_t aarch64_newfstat __read_mostly = NULL;
-__attribute__((cold))
 static long hook_aarch64_newfstat_ret(unsigned int fd, struct stat __user * statbuf)
 {
 	// we handle it like rp
@@ -215,7 +210,6 @@ static long hook_aarch64_newfstat_ret(unsigned int fd, struct stat __user * stat
 }
 
 static uintptr_t aarch64_read __read_mostly = NULL;
-__attribute__((cold))
 static long hook_aarch64_read(unsigned int fd, char __user *buf, size_t count)
 {
 	ksu_handle_sys_read_fd(fd);
@@ -259,7 +253,6 @@ static long hook_armeabi_fstatat64(int dfd, const char __user * filename, struct
 }
 
 static uintptr_t armeabi_fstat64 __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_fstat64_ret(unsigned long fd, struct stat64 __user * statbuf)
 {
 	// we handle it like rp
@@ -269,7 +262,6 @@ static long hook_armeabi_fstat64_ret(unsigned long fd, struct stat64 __user * st
 }
 
 static uintptr_t armeabi_read __read_mostly = NULL;
-__attribute__((cold))
 static long hook_armeabi_read(unsigned int fd, char __user *buf, size_t count)
 {
 	ksu_handle_sys_read_fd(fd);
