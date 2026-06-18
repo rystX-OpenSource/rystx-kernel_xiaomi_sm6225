@@ -650,7 +650,7 @@ int amdgpu_bo_backup_to_shadow(struct amdgpu_device *adev,
 	bo_addr = amdgpu_bo_gpu_offset(bo);
 	shadow_addr = amdgpu_bo_gpu_offset(bo->shadow);
 
-	r = reservation_object_reserve_shared(bo->tbo.resv, 1);
+	r = reservation_object_reserve_shared(bo->tbo.resv);
 	if (r)
 		goto err;
 
@@ -732,7 +732,7 @@ int amdgpu_bo_restore_from_shadow(struct amdgpu_device *adev,
 	bo_addr = amdgpu_bo_gpu_offset(bo);
 	shadow_addr = amdgpu_bo_gpu_offset(bo->shadow);
 
-	r = reservation_object_reserve_shared(bo->tbo.resv, 1);
+	r = reservation_object_reserve_shared(bo->tbo.resv);
 	if (r)
 		goto err;
 
