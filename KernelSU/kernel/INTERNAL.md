@@ -7,6 +7,7 @@
 - theres no guarantee for kallsyms even!
 - lots have random backports left and right, theres no abi stability guarantee at all!
 - theres partial kp/rp support on boot-time hooks
+- theres also experimental ARM64 bl insn inline hooking support. Verified on 6.12 GKI.
 
 ## sucompat
 - tweaked for downstream
