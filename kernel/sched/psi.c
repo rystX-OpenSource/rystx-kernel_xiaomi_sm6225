@@ -141,12 +141,20 @@
 #include <linux/poll.h>
 #include <linux/psi.h>
 
+#ifdef CONFIG_TRACEPOINTS
+#ifdef CONFIG_PSI_FTRACE
 #define CREATE_TRACE_POINTS
 #include <trace/events/psi.h>
+#endif /* CONFIG_PSI_FTRACE */
+#endif /* CONFIG_TRACEPOINTS */
 #include "sched.h"
 
+#ifdef CONFIG_TRACEPOINTS
+#ifdef CONFIG_PSI_FTRACE
 #define CREATE_TRACE_POINTS
 #include <trace/events/psi.h>
+#endif /* CONFIG_PSI_FTRACE */
+#endif /* CONFIG_TRACEPOINTS */
 
 static int psi_bug __read_mostly;
 
@@ -452,6 +460,7 @@ static void psi_avgs_work(struct work_struct *work)
 	mutex_unlock(&group->avgs_lock);
 }
 
+#ifdef CONFIG_TRACEPOINTS
 #ifdef CONFIG_PSI_FTRACE
 
 #define TOKB(x) ((x) * (PAGE_SIZE / 1024))
@@ -486,6 +495,7 @@ static void trace_event_helper(struct psi_group *group)
 {
 }
 #endif /* CONFIG_PSI_FTRACE */
+#endif /* CONFIG_PSI_TRACEPOINTS */
 
 /* Trigger tracking window manupulations */
 static void window_reset(struct psi_window *win, u64 now, u64 value,
@@ -572,7 +582,12 @@ static u64 update_triggers(struct psi_group *group, u64 now)
 
 		/* Calculate growth since last update */
 		growth = window_update(&t->win, now, total[t->state]);
+
+#ifdef CONFIG_TRACEPOINTS
+#ifdef CONFIG_PSI_FTRACE
 		trace_psi_update_trigger_growth(t, now, growth);
+#endif /* CONFIG_PSI_FTRACE */
+#endif /* CONFIG_TRACEPOINTS */
 
 		if (growth < t->threshold)
 			continue;
@@ -581,7 +596,11 @@ static u64 update_triggers(struct psi_group *group, u64 now)
 		if (now < t->last_event_time + t->win.size)
 			continue;
 
+#ifdef CONFIG_TRACEPOINTS
+#ifdef CONFIG_PSI_FTRACE
 		trace_psi_event(t->state, t->threshold);
+#endif /* CONFIG_PSI_FTRACE */
+#endif /* CONFIG_TRACEPOINTS */
 
 		/* Generate an event */
 		if (cmpxchg(&t->event, 0, 1) == 0)
@@ -589,7 +608,11 @@ static u64 update_triggers(struct psi_group *group, u64 now)
 		t->last_event_time = now;
 	}
 
+#ifdef CONFIG_TRACEPOINTS
+#ifdef CONFIG_PSI_FTRACE
 	trace_event_helper(group);
+#endif /* CONFIG_PSI_FTRACE */
+#endif /* CONFIG_TRACEPOINTS */
 	if (new_stall)
 		memcpy(group->polling_total, total,
 				sizeof(group->polling_total));
