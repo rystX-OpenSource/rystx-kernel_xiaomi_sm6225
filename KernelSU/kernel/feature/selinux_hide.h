@@ -190,6 +190,10 @@ static void ksu_add_shit_to_list(u32 cmd, const char *args[])
 			pr_info("selinux_hide: tracking type: %s \n", t_node->padded_name);
 
 	} else if (argc >= 2) {
+
+		if (!args[1])
+			goto out_unlock;
+
 		const char *src = args[0];
 		const char *tgt = args[1];
 
