@@ -1,0 +1,29 @@
+menuconfig MULTI_KERNELSU
+    bool "Enable Multi-Tree KernelSU Support"
+    default y
+    help
+      Enables runtime cmdline switching between multiple KernelSU forks.
+
+if MULTI_KERNELSU
+
+config KSU_NEXT
+    bool "Enable KernelSU-Next Tree"
+    default y
+    source "drivers/KernelSU/ksunext/Kconfig"
+
+config KSU_RKSU
+    bool "Enable rsuntk KernelSU (rksu) Tree"
+    default y
+    source "drivers/KernelSU/rksu/Kconfig"
+
+config KSU_SUKISU_ULTRA
+    bool "Enable SukiSU-Ultra Tree"
+    default y
+    source "drivers/KernelSU/sukisu-ultra/Kconfig"
+
+config KSU_XXKSU
+    bool "Enable backslashxx (xxksu) Tree"
+    default y
+    source "drivers/KernelSU/xxksu/Kconfig"
+
+endif # MULTI_KERNELSU
