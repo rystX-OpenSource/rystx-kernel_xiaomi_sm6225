@@ -7,6 +7,8 @@
 
 #include "pelt.h"
 
+#include "infinity_sched.h"
+
 #include <trace/events/sched.h>
 #include <linux/interrupt.h>
 
@@ -1017,6 +1019,9 @@ static void update_curr_rt(struct rq *rq)
 	if (unlikely((s64)delta_exec <= 0))
 		return;
 
+	/* Infinity: RT EMA climbs with runtime for adaptive RR timeslice */
+	infinity_rt_consume(curr->infinity, delta_exec);
+
 	schedstat_set(curr->se.statistics.exec_max,
 		      max(curr->se.statistics.exec_max, delta_exec));
 
@@ -1411,8 +1416,17 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 	schedtune_enqueue_task(p, cpu_of(rq));
 
-	if (flags & ENQUEUE_WAKEUP)
+	if (flags & ENQUEUE_WAKEUP) {
 		rt_se->timeout = 0;
+		
+		/* Infinity: RR EMA decay on wakeup for adaptive timeslice */
+		if (p->infinity->rt_last_sleep_ns) {
+			u64 now = rq_clock(rq);
+			if (now > p->infinity->rt_last_sleep_ns)
+				infinity_rt_wakeup(p->infinity,
+					now - p->infinity->rt_last_sleep_ns);
+		}
+	}
 
 	enqueue_rt_entity(rt_se, flags);
 
@@ -1429,6 +1443,10 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 	update_curr_rt(rq);
 	dequeue_rt_entity(rt_se, flags);
+
+	/* Infinity: record sleep timestamp for RR EMA decay */
+	if ((flags & DEQUEUE_SLEEP) && p)
+		p->infinity->rt_last_sleep_ns = rq_clock(rq);
 
 	dequeue_pushable_task(rq, p);
 
@@ -2535,7 +2553,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	if (--p->rt.time_slice)
 		return;
 
-	p->rt.time_slice = sched_rr_timeslice;
+	p->rt.time_slice = infinity_rr_timeslice(p, sched_rr_timeslice);
 
 	/*
 	 * Requeue to the end of queue if we (and all of our ancestors) are not

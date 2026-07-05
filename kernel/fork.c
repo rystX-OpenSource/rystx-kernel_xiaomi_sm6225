@@ -106,6 +106,8 @@
 
 #include <trace/events/sched.h>
 
+#include "sched/infinity_sched.h"
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
 
@@ -406,6 +408,9 @@ void free_task(struct task_struct *tsk)
 {
 	cpufreq_task_times_exit(tsk);
 	scs_release(tsk);
+
+	/* Infinity: release per-task scheduler context */
+	infinity_ctx_free(tsk->infinity);
 
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -831,6 +836,13 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	stack_vm_area = task_stack_vm_area(tsk);
 
 	err = arch_dup_task_struct(tsk, orig);
+
+	/* Infinity: allocate scheduler context ( fix Android critical bug )*/
+	tsk->infinity = kzalloc(sizeof(struct infinity_ctx), GFP_KERNEL);
+	if (!tsk->infinity) {
+		err = -ENOMEM;
+		goto free_stack;
+	}
 
 	/*
 	 * arch_dup_task_struct() clobbers the stack-related fields.  Make

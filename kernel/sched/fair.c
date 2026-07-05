@@ -26,6 +26,7 @@
 #include <trace/events/sched.h>
 
 #include "walt.h"
+#include "infinity_sched.h"
 
 #ifdef CONFIG_SMP
 static inline bool task_fits_max(struct task_struct *p, int cpu);
@@ -72,6 +73,26 @@ unsigned int sysctl_sched_sync_hint_enable = 1;
  * Enable/disable using cstate knowledge in idle sibling selection
  */
 unsigned int sysctl_sched_cstate_aware = 1;
+
+static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+			    unsigned long weight);
+
+/* Infinity: update EEVDF weight from EMA */
+static void infinity_update_weight(struct cfs_rq *cfs_rq,
+				   struct sched_entity *se,
+				   struct task_struct *p)
+{
+	u64 ema;
+	u32 new_weight;
+
+	ema = p->infinity->ema;
+	if (ema > INFINITY_BUDGET_MAX_NS)
+		ema = INFINITY_BUDGET_MAX_NS;
+	new_weight = infinity_calc_weight(p, ema);
+
+	if (new_weight != se->load.weight)
+		reweight_entity(cfs_rq, se, new_weight);
+}
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -1244,9 +1265,23 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	 * For EEVDF the virtual time slope is determined by w_i (iow.
 	 * nice) while the request time r_i is determined by
 	 * sysctl_sched_base_slice.
+	 *
+	 * Infinity: replace the fixed slice with an EMA-modulated slice
+	 * for fair-class tasks.  CPU-bound tasks (high EMA) get shorter
+	 * slices; interactive tasks (low EMA) retain the full share.
 	 */
-	if (!se->custom_slice)
+	if (!se->custom_slice) {
 		se->slice = sysctl_sched_base_slice;
+		
+		/*
+		 * Cut-version of Infinity Scheduler:
+		 * Remove SMT-related scheduler code
+		 */
+		if (entity_is_task(se)) {
+			struct task_struct *p__ = task_of(se);
+			infinity_update_weight(cfs_rq, se, p__);
+		}
+    }
 
 	/*
 	 * EEVDF: vd_i = ve_i + r_i / w_i
@@ -1383,6 +1418,13 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	delta_exec = now - curr->exec_start;
 	if (unlikely((s64)delta_exec <= 0))
 		return;
+
+	/* Infinity: EMA budget consumption and two-pole correction */
+	/* Infinity: EMA budget consumption */
+	if (entity_is_task(curr)) {
+		struct task_struct *p__ = task_of(curr);
+		infinity_consume(p__->infinity, delta_exec);
+	}
 
 	curr->exec_start = now;
 
@@ -5145,6 +5187,20 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		vslice /= 2;
 
 	/*
+	 * Reduce the vslice for wakeups. Low-EMA (interactive) tasks
+	 * get a shorter vslice, placing their deadline earlier in the
+	 * EEVDF tree so they are picked sooner after wakeup.
+	 */
+	/*
+	 * Infinity: when a task wakes from a futex (futex_waiting is true)
+	 * halve its vslice so it gets an earlier deadline and runs sooner,
+	 * reducing IPC wakeup latency.
+	 */
+	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
+		task_of(se)->infinity->futex_waiting)
+		vslice >>= 1;
+
+	/*
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
 	se->deadline = se->vruntime + vslice;
@@ -5424,6 +5480,12 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *se = pick_eevdf(cfs_rq);
 
+	if (unlikely(!se)) {
+		WARN_ON_ONCE(cfs_rq->nr_queued > 0);
+		se = __pick_first_entity(cfs_rq);
+		if (!se)
+			return NULL;
+	}
 	if (se->sched_delayed) {
 		dequeue_entities(rq, se, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 		/*
@@ -6548,6 +6610,15 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se;
+
+	/* Infinity: EMA decay on wakeup and futex clear */
+	if (flags & ENQUEUE_WAKEUP) {
+		u64 now = rq_clock(rq_of(task_cfs_rq(p)));
+		if (p->infinity->last_sleep_ns && now > p->infinity->last_sleep_ns)
+			infinity_wakeup(p->infinity, now - p->infinity->last_sleep_ns);
+		p->infinity->futex_waiting = false;
+	}
+
 	int h_nr_idle = task_has_idle_policy(p);
 	int h_nr_runnable = 1;
 	int task_new = !(flags & ENQUEUE_WAKEUP);
@@ -6776,6 +6847,8 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	/* Infinity: record sleep start */
+	if (flags & DEQUEUE_SLEEP) p->infinity->last_sleep_ns = rq_clock(rq_of(task_cfs_rq(p)));
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
@@ -13261,6 +13334,9 @@ static void task_fork_fair(struct task_struct *p)
 
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
+
+	/* Infinity: init child */
+	infinity_fork_init(p->infinity, READ_ONCE(rq->clock));
 
 	set_task_max_allowed_capacity(p);
 

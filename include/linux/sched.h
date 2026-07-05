@@ -811,6 +811,14 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
+struct infinity_ctx {
+	u64		ema;
+	u64		rt_ema;
+	u64		last_sleep_ns;
+	u64		rt_last_sleep_ns;
+	bool		futex_waiting;
+};
+
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -1530,7 +1538,8 @@ struct task_struct {
 #else
 	ANDROID_KABI_RESERVE(7);
 #endif
-	ANDROID_KABI_RESERVE(8);
+	/* Infinity scheduler critical fix!! */
+	ANDROID_KABI_USE(8, struct infinity_ctx *infinity);
 
 	/*
 	 * New fields for task_struct should be added above here, so that

@@ -51,6 +51,17 @@ static struct sighand_struct init_sighand = {
 	.signalfd_wqh	= __WAIT_QUEUE_HEAD_INITIALIZER(init_sighand.signalfd_wqh),
 };
 
+/* Infinity: static per-task context for init_task, since init_task
+ * never goes through dup_task_struct()/free_task() — it's never
+ * allocated or freed through the normal task lifecycle.
+ */
+static struct infinity_ctx init_infinity_ctx = {
+	.ema		= 0,
+	.rt_ema		= 0,
+	.last_sleep_ns	= 0,
+	.rt_last_sleep_ns = 0,
+};
+
 /*
  * Set up the first task table, touch at your own risk!. Base=0,
  * limit=0x1fffff (=2MB)
@@ -105,6 +116,7 @@ struct task_struct init_task
 	.children	= LIST_HEAD_INIT(init_task.children),
 	.sibling	= LIST_HEAD_INIT(init_task.sibling),
 	.group_leader	= &init_task,
+	.infinity		= &init_infinity_ctx,
 	RCU_POINTER_INITIALIZER(real_cred, &init_cred),
 	RCU_POINTER_INITIALIZER(cred, &init_cred),
 	.comm		= INIT_TASK_COMM,
