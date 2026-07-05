@@ -20,7 +20,7 @@ get_repo_branch() {
     repo_url="${repo_url%/}"
     case "$repo_url" in
         *KernelSU-Next*)        echo "legacy"    ;;
-        *resukisu*)         echo "builtin"   ;;
+        *resukisu*)         echo "main"   ;;
         *rsuntk/KernelSU*)       echo "main"   ;;
         *backslashxx/KernelSU*)  echo "master" ;;
         *)                       echo "main"   ;;
