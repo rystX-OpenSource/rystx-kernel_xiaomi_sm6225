@@ -4,7 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 KERNELSU_REPOS=(
     "https://github.com/KernelSU-Next/KernelSU-Next"
-    "https://github.com/sukisu-ultra/sukisu-ultra"
+    "https://github.com/ReSukiSU/ReSukiSU"
     "https://github.com/rsuntk/KernelSU"
     "https://github.com/backslashxx/KernelSU/"
 )
@@ -19,8 +19,8 @@ get_repo_branch() {
     local repo_url=$1
     repo_url="${repo_url%/}"
     case "$repo_url" in
-        *KernelSU-Next*)        echo "dev"    ;;
-        *sukisu-ultra*)         echo "main"   ;;
+        *KernelSU-Next*)        echo "legacy"    ;;
+        *resukisu*)         echo "builtin"   ;;
         *rsuntk/KernelSU*)       echo "main"   ;;
         *backslashxx/KernelSU*)  echo "master" ;;
         *)                       echo "main"   ;;
@@ -32,7 +32,7 @@ get_local_folder_name() {
     repo_url="${repo_url%/}"
     case "$repo_url" in
         *KernelSU-Next*)        echo "ksunext"     ;;
-        *sukisu-ultra*)         echo "sukisu-ultra" ;;
+        *resukisu*)         echo "resukisu" ;;
         *rsuntk/KernelSU*)       echo "rksu"        ;;
         *backslashxx/KernelSU*)  echo "xxksu"       ;;
         *)                       basename "$repo_url" .git | tr '[:upper:]' '[:lower:]' ;;

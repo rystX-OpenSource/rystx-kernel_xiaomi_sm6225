@@ -1,5 +1,3 @@
-#include <linux/kprobes.h>
-
 // sys_newfstat rp
 // upstream: https://github.com/tiann/KernelSU/commit/df640917d11dd0eff1b34ea53ec3c0dc49667002
 
