@@ -16,10 +16,10 @@ config KSU_RKSU
     default y
     source "drivers/KernelSU/rksu/Kconfig"
 
-config KSU_SUKISU_ULTRA
-    bool "Enable SukiSU-Ultra Tree"
+config KSU_RESUKISU
+    bool "Enable ReSukiSU Tree"
     default y
-    source "drivers/KernelSU/sukisu-ultra/Kconfig"
+    source "drivers/KernelSU/resukisu/Kconfig"
 
 config KSU_XXKSU
     bool "Enable backslashxx (xxksu) Tree"
