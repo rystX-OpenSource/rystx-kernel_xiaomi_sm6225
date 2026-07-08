@@ -708,6 +708,10 @@ struct cfs_rq {
 	struct list_head	leaf_cfs_rq_list;
 	struct task_group	*tg;	/* group that "owns" this runqueue */
 
+	/* Infinity: aggregate group EMA and idle timestamp */
+	u64			group_ema;
+	u64			group_ema_sleep_start;
+
 #ifdef CONFIG_CFS_BANDWIDTH
 #ifdef CONFIG_SCHED_WALT
 	struct walt_sched_stats walt_stats;
@@ -1736,6 +1740,11 @@ DECLARE_PER_CPU(struct sched_domain *, sd_numa);
 DECLARE_PER_CPU(struct sched_domain *, sd_asym_packing);
 DECLARE_PER_CPU(struct sched_domain *, sd_asym_cpucapacity);
 extern struct static_key_false sched_asym_cpucapacity;
+
+static __always_inline bool sched_asym_cpucap_active(void)
+{
+	return static_branch_unlikely(&sched_asym_cpucapacity);
+}
 
 struct sched_group_capacity {
 	atomic_t		ref;
