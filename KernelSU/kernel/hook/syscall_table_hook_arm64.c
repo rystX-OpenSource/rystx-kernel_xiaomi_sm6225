@@ -26,6 +26,7 @@
 // on 4.19+ its is no longer just a void *sys_call_table[]
 // it becomes syscall_fn_t sys_call_table[];
 
+extern long __arm64_sys_reboot(const struct pt_regs *regs);
 static syscall_fn_t aarch64_reboot __read_mostly = NULL; 
 static noinline long hook_aarch64_reboot(const struct pt_regs *regs)
 {
@@ -35,9 +36,11 @@ static noinline long hook_aarch64_reboot(const struct pt_regs *regs)
 	void __user **arg = (void __user **)&regs->regs[3];
 
 	ksu_handle_sys_reboot(magic1, magic2, cmd, arg);
-	return aarch64_reboot(regs);
+
+	return __arm64_sys_reboot(regs);
 }
 
+extern long __arm64_sys_execve(const struct pt_regs *regs);
 static syscall_fn_t aarch64_execve __read_mostly = NULL;
 static noinline long hook_aarch64_execve(const struct pt_regs *regs)
 {
@@ -46,27 +49,33 @@ static noinline long hook_aarch64_execve(const struct pt_regs *regs)
 	void ***envp = (void ***)&regs->regs[2];
 
 	ksu_handle_execve(filename, argv, envp);
-	return aarch64_execve(regs);
+
+	return __arm64_sys_execve(regs);
 }
 
+extern long __arm64_sys_faccessat(const struct pt_regs *regs);
 static syscall_fn_t aarch64_faccessat __read_mostly = NULL;
 static noinline long hook_aarch64_faccessat(const struct pt_regs *regs)
 {
 	const char __user **filename = (const char __user **)&regs->regs[1];
 
 	ksu_handle_faccessat(NULL, filename, NULL, NULL);
-	return aarch64_faccessat(regs);
+
+	return __arm64_sys_faccessat(regs);
 }
 
+extern long __arm64_sys_newfstatat(const struct pt_regs *regs);
 static syscall_fn_t aarch64_newfstatat __read_mostly = NULL;
 static noinline long hook_aarch64_newfstatat(const struct pt_regs *regs)
 {
 	const char __user **filename = (const char __user **)&regs->regs[1];
 
 	ksu_handle_stat(NULL, filename, NULL);
-	return aarch64_newfstatat(regs);
+
+	return __arm64_sys_newfstatat(regs);
 }
 
+extern long __arm64_sys_newfstat(const struct pt_regs *regs);
 static syscall_fn_t aarch64_newfstat __read_mostly = NULL;
 static noinline long hook_aarch64_newfstat_ret(const struct pt_regs *regs)
 {
@@ -74,18 +83,20 @@ static noinline long hook_aarch64_newfstat_ret(const struct pt_regs *regs)
 	unsigned int *fd = (unsigned int *)&regs->regs[0];
 	struct stat __user **statbuf = (struct stat __user **)&regs->regs[1];
 
-	long ret = aarch64_newfstat(regs);
+	long ret = __arm64_sys_newfstat(regs);
 	ksu_handle_newfstat_ret(fd, statbuf);
 	return ret;
 }
 
+extern long __arm64_sys_read(const struct pt_regs *regs);
 static syscall_fn_t aarch64_read __read_mostly = NULL;
 static noinline long hook_aarch64_read(const struct pt_regs *regs)
 {
 	unsigned int fd = (unsigned int)regs->regs[0];
 
 	ksu_handle_sys_read_fd(fd);
-	return aarch64_read(regs);
+
+	return __arm64_sys_read(regs);
 }
 
 #ifdef CONFIG_COMPAT
@@ -101,6 +112,7 @@ static noinline long hook_armeabi_reboot(const struct pt_regs *regs)
 	return armeabi_reboot(regs);
 }
 
+extern long __arm64_compat_sys_execve(const struct pt_regs *regs);
 static syscall_fn_t armeabi_execve __read_mostly = NULL;
 static noinline long hook_armeabi_execve(const struct pt_regs *regs)
 {
@@ -109,7 +121,7 @@ static noinline long hook_armeabi_execve(const struct pt_regs *regs)
 	void ***envp = (void ***)&regs->regs[2];
 
 	ksu_handle_execve(filename, argv, envp);
-	return armeabi_execve(regs);
+	return __arm64_compat_sys_execve(regs);
 }
 
 static syscall_fn_t armeabi_faccessat __read_mostly = NULL;

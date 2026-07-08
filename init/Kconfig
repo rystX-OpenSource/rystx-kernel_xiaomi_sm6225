@@ -652,7 +652,7 @@ config PSI_DEFAULT_DISABLED
 config PSI_FTRACE
 	bool "Insert debug hooks for PSI ftrace events"
 	default n
-	depends on PSI
+	depends on PSI && TRACEPOINTS
 	help
 	  If not set, PSI ftrace events will be disabled and
 	  will not incur any performance penalty.

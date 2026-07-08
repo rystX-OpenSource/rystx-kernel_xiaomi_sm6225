@@ -224,7 +224,7 @@ struct user_arg_ptr {
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
-// not 1:1, no alignment optimization/guardchecks, but it should be fine for our use case.
+// not 1:1, no aligned/per-word optimization
 // https://elixir.bootlin.com/linux/v4.3/source/lib/string.c#L154
 __weak ssize_t strscpy(char *dest, const char *src, size_t count)
 {
