@@ -1064,7 +1064,6 @@ static int __init ramoops_memreserve(char *p)
 	ramoops_data.mem_address = 0x5D000000;
 	ramoops_data.console_size = size / 2;
 	ramoops_data.pmsg_size = size / 2;
-	ramoops_data.dump_oops = 1;
 
 	pr_info("msm_reserve_ramoops_memory addr=%llx,size=%lx\n",
 		ramoops_data.mem_address, ramoops_data.mem_size);
