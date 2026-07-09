@@ -19,12 +19,23 @@
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/init.h>
 #include <uapi/linux/ntsync.h>
 
 #include <linux/uaccess.h>
 #include <linux/compat.h>
 
 #define NTSYNC_NAME	"ntsync"
+unsigned int ntsync_enabled = 0;
+
+static int __init ntsync_enabled_setup(char *s)
+{
+	if (s)
+		ntsync_enabled = simple_strtoul(s, NULL, 0);
+
+	return 1;
+}
+__setup("ntsync.enabled=", ntsync_enabled_setup);
 
 enum ntsync_type {
 	NTSYNC_TYPE_SEM,
@@ -1214,7 +1225,17 @@ static struct miscdevice ntsync_misc = {
 	.mode		= 0666,
 };
 
-module_misc_device(ntsync_misc);
+static int __init ntsync_init(void)
+{
+	if (ntsync_enabled < 1) {
+		pr_info("ntsync: driver disabled via cmdline (ntsync.enabled=1 not set)\n");
+		return -ENODEV; /* Prevents driver registration safely */
+	}
+
+	pr_info("ntsync: initializing driver...\n");
+	return misc_register(&ntsync_misc);
+}
+device_initcall(ntsync_init);
 
 MODULE_AUTHOR("Elizabeth Figura <zfigura@codeweavers.com>");
 MODULE_DESCRIPTION("Kernel driver for NT synchronization primitives");
