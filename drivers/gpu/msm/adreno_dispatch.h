@@ -11,6 +11,14 @@
 
 extern unsigned int adreno_drawobj_timeout;
 
+/* Infinity Scheduler: GPU EMA tuning constants.
+ * Tick->ns conversion uses the GPU always-on XO clock (19.2MHz),
+ * not the DCVS-scaled core clock -- see KGSL_XO_CLK_FREQ.
+ */
+#define INFINITY_GPU_EMA_CLIMB_NS	8000000ULL	/* 8ms ceiling, tune */
+#define INFINITY_GPU_EMA_ALPHA		3072ULL		/* climb rate, tune */
+#define INFINITY_GPU_EMA_HALFLIFE_NS	24000000ULL	/* 24ms decay, tune */
+
 /*
  * Maximum size of the dispatcher ringbuffer - the actual inflight size will be
  * smaller then this but this size will allow for a larger range of inflight
