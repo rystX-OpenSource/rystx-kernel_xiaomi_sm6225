@@ -29,7 +29,7 @@
 
 unsigned long infinity_tune_smt_divisor = INFINITY_SMT_DIVISOR_DEFAULT;
 static int infinity_running_flag = 1;
-static char infinity_version[] = "v4.6-adreno/kgsl-K4.19";
+static char infinity_version[] = "v4.6-gpu/kgsl_compat-K4.19";
 
 static int clamp_smt_divisor(struct ctl_table *table, int write,
                 void *buf, size_t *lenp, loff_t *ppos)

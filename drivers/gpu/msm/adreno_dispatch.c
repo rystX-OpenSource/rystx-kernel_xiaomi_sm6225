@@ -5,6 +5,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/math64.h>
 
 #include "adreno.h"
 #include "adreno_trace.h"
@@ -506,6 +507,47 @@ static inline int adreno_dispatcher_requeue_cmdobj(
 	return 0;
 }
 
+/*
++ * infinity_gpu_effective_prio - compute EMA-adjusted plist priority
++ * @drawctxt: context being queued for dispatch
++ *
++ * Applies a priority penalty (higher plist value = served later) that
++ * grows with this context's GPU-busy EMA, mirroring the CPU-side
++ * infinity_calc_weight() shape. If the owning task is currently
++ * CPU-interactive (futex_waiting, or has no CPU EMA penalty of its
++ * own), the GPU-side penalty is bypassed so the same task doesn't get
++ * doubly punished across both schedulers.
++ *
++ * Layer 2 of the Infinity GPU compat patch.
++ */
+static int infinity_gpu_effective_prio(struct adreno_context *drawctxt)
+{
+	int base_prio = drawctxt->base.priority;
+	u64 ema = drawctxt->gpu_time_ema;
+	int penalty;
+
+	if (!ema)
+		return base_prio;
+
+	penalty = (int)div64_u64(ema * 8, infinity_gpu_ema_climb_ns);
+	if (penalty > 8)
+		penalty = 8;
+
+	if (drawctxt->base.proc_priv && drawctxt->base.proc_priv->pid) {
+		struct task_struct *inf_p;
+
+		rcu_read_lock();
+		inf_p = pid_task(drawctxt->base.proc_priv->pid, PIDTYPE_PID);
+		if (inf_p &&
+			(READ_ONCE(inf_p->infinity.futex_waiting) ||
+			READ_ONCE(inf_p->infinity.ema) == 0))
+			penalty = 0;
+		rcu_read_unlock();
+	}
+
+	return base_prio + penalty;
+}
+
 /**
  * dispatcher_queue_context() - Queue a context in the dispatcher pending list
  * @dispatcher: Pointer to the adreno dispatcher struct
@@ -527,6 +569,7 @@ static void  dispatcher_queue_context(struct adreno_device *adreno_dev,
 	if (plist_node_empty(&drawctxt->pending)) {
 		/* Get a reference to the context while it sits on the list */
 		if (_kgsl_context_get(&drawctxt->base)) {
+			drawctxt->pending.prio = infinity_gpu_effective_prio(drawctxt);
 			trace_dispatch_queue_context(drawctxt);
 			plist_add(&drawctxt->pending, &dispatcher->pending);
 		}
@@ -2376,6 +2419,51 @@ static void cmdobj_profile_ticks(struct adreno_device *adreno_dev,
 	*retire = entry->retired;
 }
 
+/*
+ * infinity_gpu_charge_ema - charge retired GPU busy time to the EMA
+ * @drawctxt: context that owned the retired command
+ * @start: CP always-on-counter tick at submission start
+ * @end: CP always-on-counter tick at retirement
+ *
+ * Decays the EMA for idle time elapsed since the last retirement
+ * (shift-decay, same shape as infinity_wakeup() on the CPU side),
+ * then climbs it by the busy time just retired. Ticks are converted
+ * to ns via the fixed 19.2MHz XO clock (KGSL_XO_CLK_FREQ), which is
+ * DCVS-independent -- do not substitute the scaled core clock here.
+ *
+ * Layer 3 of the Infinity GPU compat patch.
+ */
+static void infinity_gpu_charge_ema(struct adreno_context *drawctxt,
+		uint64_t start, uint64_t end)
+{
+	u64 gpu_ns, idle_ns, periods;
+	ktime_t now;
+
+	if (end <= start)
+		return;
+
+	gpu_ns = div64_u64((end - start) * 1000000000ULL, KGSL_XO_CLK_FREQ);
+	now = ktime_get();
+
+	if (drawctxt->gpu_time_last_active) {
+		idle_ns = ktime_to_ns(ktime_sub(now, drawctxt->gpu_time_last_active));
+		periods = div64_u64(idle_ns, infinity_gpu_ema_halflife_ns);
+		if (periods > 63)
+			drawctxt->gpu_time_ema = 0;
+		else if (periods)
+			drawctxt->gpu_time_ema >>= periods;
+	}
+	drawctxt->gpu_time_last_active = now;
+
+	if (gpu_ns > infinity_gpu_ema_climb_ns)
+		gpu_ns = infinity_gpu_ema_climb_ns;
+	drawctxt->gpu_time_total += gpu_ns;
+	drawctxt->gpu_time_ema += div64_u64(
+		(infinity_gpu_ema_climb_ns - drawctxt->gpu_time_ema) *
+		gpu_ns * infinity_gpu_ema_alpha,
+		infinity_gpu_ema_climb_ns * 256ULL);
+}
+
 static void retire_cmdobj(struct adreno_device *adreno_dev,
 		struct kgsl_drawobj_cmd *cmdobj)
 {
@@ -2389,8 +2477,10 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 		_print_recovery(KGSL_DEVICE(adreno_dev), cmdobj);
 	}
 
-	if (test_bit(CMDOBJ_PROFILE, &cmdobj->priv))
+	if (test_bit(CMDOBJ_PROFILE, &cmdobj->priv)) {
 		cmdobj_profile_ticks(adreno_dev, cmdobj, &start, &end);
+		infinity_gpu_charge_ema(drawctxt, start, end);
+	}
 
 	/*
 	 * For A3xx we still get the rptr from the CP_RB_RPTR instead of
