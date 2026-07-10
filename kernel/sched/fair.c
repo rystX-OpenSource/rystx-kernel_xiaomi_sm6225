@@ -8953,7 +8953,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			rcu_read_lock();
 			list_for_each_entry_rcu(entry, &asym_cap_list, link) {
 				int cpu = cpumask_first_and(cpu_capacity_span(entry),
-							    p->cpus_ptr);
+							    &p->cpus_allowed);
 				if (cpu < nr_cpu_ids) {
 					rcu_read_unlock();
 					return cpu;

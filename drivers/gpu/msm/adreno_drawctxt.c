@@ -401,6 +401,11 @@ adreno_drawctxt_create(struct kgsl_device_private *dev_priv,
 	 */
 	plist_node_init(&drawctxt->pending, drawctxt->base.priority);
 
+	/* Infinity Scheduler: zero-init GPU EMA state for this context */
+	drawctxt->gpu_time_ema = 0;
+	drawctxt->gpu_time_total = 0;
+	drawctxt->gpu_time_last_active = 0;
+
 	/*
 	 * Now initialize the common part of the context. This allocates the
 	 * context id, and then possibly another thread could look it up.
