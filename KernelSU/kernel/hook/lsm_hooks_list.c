@@ -1,3 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2026 \xx
+ *
+ * This file is a downstream extension and NOT affiliated, endorsed by,
+ * or maintained by the official KernelSU developers.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+
 static int ksu_inode_rename(struct inode *old_inode, struct dentry *old_dentry,
 			    struct inode *new_inode, struct dentry *new_dentry)
 {
@@ -25,13 +38,8 @@ static int ksu_bprm_check(struct linux_binprm *bprm)
 static int ksu_file_permission(struct file *file, int mask)
 {
 #if !defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
-#ifdef KSU_CAN_USE_JUMP_LABEL
-	if (static_branch_likely(&ksud_vfs_read_key))
-		ksu_install_rc_hook(file);
-#else
 	if (unlikely(ksu_vfs_read_hook))
 		ksu_install_rc_hook(file);
-#endif
 #endif
 
 	return 0;
@@ -320,8 +328,8 @@ static void ksu_grab_cap_bprm_set_creds_slot()
 
 	preempt_disable();
 	local_irq_disable();
-					
-	FORCE_VOLATILE(*target_slot) = (void *)ksu_bprm_set_creds;
+
+	WRITE_ONCE(*target_slot, ksu_bprm_set_creds);
 					
 	local_irq_enable();
 	preempt_enable();
@@ -481,7 +489,7 @@ static void ksu_grab_cap_bprm_set_creds_slot()
 	preempt_disable();
 	local_irq_disable();
 					
-	FORCE_VOLATILE(*target_slot) = (void *)ksu_bprm_set_creds;
+	WRITE_ONCE(*target_slot, ksu_bprm_set_creds);
 					
 	local_irq_enable();
 	preempt_enable();
