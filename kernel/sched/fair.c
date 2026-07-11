@@ -1275,8 +1275,39 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		se->slice = sysctl_sched_base_slice;
 		
 		if (entity_is_task(se)) {
-			/* Infinity: remove SCHED_SMT */
 			struct task_struct *p__ = task_of(se);
+#ifndef CONFIG_SCHED_SMT
+			/*
+			* Infinity: ARM heterogeneous-capacity compensation.
+			*
+			* No SMT siblings exist on ARM, but the same dwell-time problem
+			* does: a task sitting on a lower-capacity core is executing at
+			* reduced throughput for the same wall-clock slice. Shortening
+			* its slice in proportion to how far below max capacity this
+			* core is gives the scheduler another placement decision sooner,
+			* mirroring the SMT divisor's actual purpose (limit dwell time
+			* on a weaker execution resource) rather than its mechanism
+			* (sibling-thread detection).
+			*
+			* arch_scale_cpu_capacity() returns a value normalized against
+			* SCHED_CAPACITY_SCALE (1024) for the system's fastest core, per
+			* the EAS capacity model -- not raw clock frequency.
+			*/
+			{
+				int cpu = cpu_of(rq_of(cfs_rq));
+				unsigned long cap = arch_scale_cpu_capacity(cpu);
+
+				if (cap < SCHED_CAPACITY_SCALE) {
+					unsigned long divisor = READ_ONCE(infinity_tune_smt_divisor);
+					u64 scaled_divisor = div_u64((u64)divisor *
+							SCHED_CAPACITY_SCALE, cap);
+
+					if (scaled_divisor < 1)
+						scaled_divisor = 1;
+					se->slice = div_u64(se->slice, scaled_divisor);
+				}
+			}
+#endif
 			infinity_update_weight(cfs_rq, se, p__);
 		}
 	}
