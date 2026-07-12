@@ -13,6 +13,9 @@
 #include <linux/component.h>
 #include <linux/regmap.h>
 #include <linux/pm_runtime.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/mutex.h>
 #include <sound/soc.h>
 #include <sound/tlv.h>
 #include <soc/soundwire.h>
@@ -56,6 +59,337 @@ enum {
 
 static const DECLARE_TLV_DB_SCALE(line_gain, 0, 7, 1);
 static const DECLARE_TLV_DB_SCALE(analog_gain, 0, 25, 1);
+
+/*
+ * ---------------------------------------------------------------------
+ * rystx_component sysfs interface
+ *
+ * Exposes a small set of runtime tunables under /sys/kernel/rystx_component:
+ *   standard_hifi      - enable/disable CLS_AB hph_mode
+ *   maxed_hifi         - enable/disable CLS_AB_HIFI hph_mode
+ *                        (standard_hifi and maxed_hifi are mutually
+ *                         exclusive - enabling one disables the other)
+ *   multi_channel_gain - "<left_db> <right_db>" HPH PA gain, +-14dB
+ *   microphone_boost   - headset mic analog boost applied when the
+ *                        plug-in mic path is active, +-8dB
+ * ---------------------------------------------------------------------
+ */
+
+#define RYSTX_HPH_GAIN_MIN_DB      (-14)
+#define RYSTX_HPH_GAIN_MAX_DB      (14)
+#define RYSTX_HPH_GAIN_REG_MAX     (20)    /* WCD937X_HPH_{L,R}_EN[4:0] */
+#define RYSTX_HPH_GAIN_MASK        (0x1F)
+
+#define RYSTX_MIC_BOOST_MIN_DB     (-8)
+#define RYSTX_MIC_BOOST_MAX_DB     (8)
+#define RYSTX_MIC_BOOST_REG_MAX    (20)    /* WCD937X_ANA_TX_CH2[4:0] */
+#define RYSTX_MIC_BOOST_MASK       (0x1F)
+
+enum rystx_hifi_mode {
+	RYSTX_HIFI_NONE = 0,
+	RYSTX_HIFI_STANDARD,    /* CLS_AB */
+	RYSTX_HIFI_MAXED,       /* CLS_AB_HIFI */
+};
+
+static DEFINE_MUTEX(rystx_lock);
+static enum rystx_hifi_mode rystx_hifi_mode = RYSTX_HIFI_STANDARD;
+static int rystx_gain_left_db;
+static int rystx_gain_right_db;
+static int rystx_mic_boost_db;
+
+static struct kobject *rystx_kobj;
+static struct wcd937x_priv *rystx_active_priv;
+
+/*
+ * Convert a +-14dB request into the inverted 0..20 HPH gain field
+ * (0 = +14dB / max gain, 20 = -14dB / min gain).
+ */
+static u8 rystx_hph_db_to_reg(int db)
+{
+	int clamped = clamp(db, RYSTX_HPH_GAIN_MIN_DB, RYSTX_HPH_GAIN_MAX_DB);
+
+	return (u8)DIV_ROUND_CLOSEST(
+		(RYSTX_HPH_GAIN_MAX_DB - clamped) * RYSTX_HPH_GAIN_REG_MAX,
+		(RYSTX_HPH_GAIN_MAX_DB - RYSTX_HPH_GAIN_MIN_DB));
+}
+
+/*
+ * Convert a +-8dB request into the 0..20 mic boost field
+ * (0 = -8dB / min boost, 20 = +8dB / max boost).
+ */
+static u8 rystx_mic_db_to_reg(int db)
+{
+	int clamped = clamp(db, RYSTX_MIC_BOOST_MIN_DB, RYSTX_MIC_BOOST_MAX_DB);
+
+	return (u8)DIV_ROUND_CLOSEST(
+		(clamped - RYSTX_MIC_BOOST_MIN_DB) * RYSTX_MIC_BOOST_REG_MAX,
+		(RYSTX_MIC_BOOST_MAX_DB - RYSTX_MIC_BOOST_MIN_DB));
+}
+
+/*
+ * Push the currently stored hifi mode to the codec's hph_mode field.
+ * Caller must hold rystx_lock.
+ */
+static void rystx_apply_hifi_mode_locked(struct wcd937x_priv *wcd937x)
+{
+	if (!wcd937x)
+		return;
+
+	if (rystx_hifi_mode == RYSTX_HIFI_MAXED)
+		wcd937x->hph_mode = CLS_AB_HIFI;
+	else
+		wcd937x->hph_mode = CLS_AB;
+}
+
+/*
+ * Push the currently stored L/R gain to WCD937X_HPH_L_EN/R_EN.
+ * Caller must hold rystx_lock.
+ */
+static void rystx_apply_hph_gain_locked(struct wcd937x_priv *wcd937x)
+{
+	struct snd_soc_component *component;
+
+	if (!wcd937x || !wcd937x->component)
+		return;
+	component = wcd937x->component;
+
+	snd_soc_component_update_bits(component, WCD937X_HPH_L_EN,
+				      RYSTX_HPH_GAIN_MASK,
+				      rystx_hph_db_to_reg(rystx_gain_left_db));
+	snd_soc_component_update_bits(component, WCD937X_HPH_R_EN,
+				      RYSTX_HPH_GAIN_MASK,
+				      rystx_hph_db_to_reg(rystx_gain_right_db));
+}
+
+/*
+ * Push the currently stored mic boost to WCD937X_ANA_TX_CH2 (headset mic).
+ * Caller must hold rystx_lock.
+ */
+static void rystx_apply_mic_boost_locked(struct wcd937x_priv *wcd937x)
+{
+	struct snd_soc_component *component;
+
+	if (!wcd937x || !wcd937x->component)
+		return;
+	component = wcd937x->component;
+
+	snd_soc_component_update_bits(component, WCD937X_ANA_TX_CH2,
+				      RYSTX_MIC_BOOST_MASK,
+				      rystx_mic_db_to_reg(rystx_mic_boost_db));
+}
+
+/* Re-apply every stored tunable to a (newly probed or resumed) codec. */
+static void rystx_apply_all(struct wcd937x_priv *wcd937x)
+{
+	mutex_lock(&rystx_lock);
+	rystx_apply_hifi_mode_locked(wcd937x);
+	rystx_apply_hph_gain_locked(wcd937x);
+	rystx_apply_mic_boost_locked(wcd937x);
+	mutex_unlock(&rystx_lock);
+}
+
+static struct wcd937x_priv *rystx_get_active_priv(void)
+{
+	struct wcd937x_priv *priv;
+
+	mutex_lock(&rystx_lock);
+	priv = rystx_active_priv;
+	mutex_unlock(&rystx_lock);
+
+	return priv;
+}
+
+static ssize_t standard_hifi_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	int val;
+
+	mutex_lock(&rystx_lock);
+	val = (rystx_hifi_mode == RYSTX_HIFI_STANDARD) ? 1 : 0;
+	mutex_unlock(&rystx_lock);
+
+	return sysfs_emit(buf, "%d\n", val);
+}
+
+static ssize_t standard_hifi_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	mutex_lock(&rystx_lock);
+	/*
+	 * CLS_AB and CLS_AB_HIFI are locked/mutually exclusive: enabling
+	 * standard_hifi always wins over maxed_hifi. Disabling it simply
+	 * falls back to CLS_AB, since one of the two must always be active.
+	 */
+	rystx_hifi_mode = RYSTX_HIFI_STANDARD;
+	rystx_apply_hifi_mode_locked(rystx_active_priv);
+	mutex_unlock(&rystx_lock);
+
+	return count;
+}
+
+static ssize_t maxed_hifi_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	int val;
+
+	mutex_lock(&rystx_lock);
+	val = (rystx_hifi_mode == RYSTX_HIFI_MAXED) ? 1 : 0;
+	mutex_unlock(&rystx_lock);
+
+	return sysfs_emit(buf, "%d\n", val);
+}
+
+static ssize_t maxed_hifi_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	mutex_lock(&rystx_lock);
+	rystx_hifi_mode = enable ? RYSTX_HIFI_MAXED : RYSTX_HIFI_STANDARD;
+	rystx_apply_hifi_mode_locked(rystx_active_priv);
+	mutex_unlock(&rystx_lock);
+
+	return count;
+}
+
+static ssize_t multi_channel_gain_show(struct kobject *kobj,
+				       struct kobj_attribute *attr,
+				       char *buf)
+{
+	int left, right;
+
+	mutex_lock(&rystx_lock);
+	left = rystx_gain_left_db;
+	right = rystx_gain_right_db;
+	mutex_unlock(&rystx_lock);
+
+	return sysfs_emit(buf, "left=%d right=%d\n", left, right);
+}
+
+static ssize_t multi_channel_gain_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, size_t count)
+{
+	int left, right;
+	int ret;
+
+	/* Accept "<left> <right>" in whole dB, e.g. "echo 6 -3 > ..." */
+	ret = sscanf(buf, "%d %d", &left, &right);
+	if (ret != 2)
+		return -EINVAL;
+
+	left = clamp(left, RYSTX_HPH_GAIN_MIN_DB, RYSTX_HPH_GAIN_MAX_DB);
+	right = clamp(right, RYSTX_HPH_GAIN_MIN_DB, RYSTX_HPH_GAIN_MAX_DB);
+
+	mutex_lock(&rystx_lock);
+	rystx_gain_left_db = left;
+	rystx_gain_right_db = right;
+	rystx_apply_hph_gain_locked(rystx_active_priv);
+	mutex_unlock(&rystx_lock);
+
+	return count;
+}
+
+static ssize_t microphone_boost_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	int val;
+
+	mutex_lock(&rystx_lock);
+	val = rystx_mic_boost_db;
+	mutex_unlock(&rystx_lock);
+
+	return sysfs_emit(buf, "%d\n", val);
+}
+
+static ssize_t microphone_boost_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	int val;
+	int ret;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	val = clamp(val, RYSTX_MIC_BOOST_MIN_DB, RYSTX_MIC_BOOST_MAX_DB);
+
+	mutex_lock(&rystx_lock);
+	rystx_mic_boost_db = val;
+	rystx_apply_mic_boost_locked(rystx_active_priv);
+	mutex_unlock(&rystx_lock);
+
+	return count;
+}
+
+static struct kobj_attribute rystx_attr_standard_hifi =
+	__ATTR(standard_hifi, 0664, standard_hifi_show, standard_hifi_store);
+static struct kobj_attribute rystx_attr_maxed_hifi =
+	__ATTR(maxed_hifi, 0664, maxed_hifi_show, maxed_hifi_store);
+static struct kobj_attribute rystx_attr_multi_channel_gain =
+	__ATTR(multi_channel_gain, 0664, multi_channel_gain_show,
+	       multi_channel_gain_store);
+static struct kobj_attribute rystx_attr_microphone_boost =
+	__ATTR(microphone_boost, 0664, microphone_boost_show,
+	       microphone_boost_store);
+
+static struct attribute *rystx_attrs[] = {
+	&rystx_attr_standard_hifi.attr,
+	&rystx_attr_maxed_hifi.attr,
+	&rystx_attr_multi_channel_gain.attr,
+	&rystx_attr_microphone_boost.attr,
+	NULL,
+};
+
+static const struct attribute_group rystx_attr_group = {
+	.attrs = rystx_attrs,
+};
+
+static int rystx_sysfs_init(void)
+{
+	int ret;
+
+	if (rystx_kobj)
+		return 0;
+
+	rystx_kobj = kobject_create_and_add("rystx_component", kernel_kobj);
+	if (!rystx_kobj)
+		return -ENOMEM;
+
+	ret = sysfs_create_group(rystx_kobj, &rystx_attr_group);
+	if (ret) {
+		kobject_put(rystx_kobj);
+		rystx_kobj = NULL;
+		return ret;
+	}
+
+	return 0;
+}
+
+static void rystx_sysfs_deinit(void)
+{
+	if (!rystx_kobj)
+		return;
+
+	sysfs_remove_group(rystx_kobj, &rystx_attr_group);
+	kobject_put(rystx_kobj);
+	rystx_kobj = NULL;
+}
 
 static int wcd937x_handle_post_irq(void *data);
 static int wcd937x_reset(struct device *dev);
@@ -1426,6 +1760,15 @@ static int wcd937x_codec_enable_adc(struct snd_soc_dapm_widget *w,
 			wcd937x_tx_connect_port(component, MBHC, true);
 			set_bit(AMIC2_BCS_ENABLE, &wcd937x->status_mask);
 		}
+		/* Headset mic (AMIC2) is going active on plug-in: (re)apply
+		 * the rystx_component "microphone_boost" tunable so it takes
+		 * effect for this mic session.
+		 */
+		if (w->shift == 1) {
+			mutex_lock(&rystx_lock);
+			rystx_apply_mic_boost_locked(wcd937x);
+			mutex_unlock(&rystx_lock);
+		}
 		wcd937x_tx_connect_port(component, ADC1 + (w->shift), true);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
@@ -1861,13 +2204,27 @@ static int wcd937x_rx_hph_mode_put(struct snd_kcontrol *kcontrol,
 	mode_val = ucontrol->value.enumerated.item[0];
 
 	dev_dbg(component->dev, "%s: mode: %d\n", __func__, mode_val);
-
-	if (mode_val == 0) {
-		dev_warn(component->dev, "%s:Invalid HPH Mode, default to class_AB\n",
-			__func__);
-		mode_val = 3; /* enum will be updated later */
+	
+	/*
+	 * hph_mode is locked to CLS_AB / CLS_AB_HIFI: only one of the two
+	 * can ever be active. Any other requested mode (including an
+	 * invalid/zero value) falls back to CLS_AB. This mirrors the
+	 * mutual-exclusion enforced by the rystx_component sysfs
+	 * (standard_hifi / maxed_hifi) attributes.
+	 */
+	if (mode_val != CLS_AB && mode_val != CLS_AB_HIFI) {
+		dev_warn(component->dev,
+			 "%s: hph_mode %d not permitted, locking to CLS_AB\n",
+			 __func__, mode_val);
+		mode_val = CLS_AB;
+	
 	}
+	
+	mutex_lock(&rystx_lock);
+	rystx_hifi_mode = (mode_val == CLS_AB_HIFI) ?
+				RYSTX_HIFI_MAXED : RYSTX_HIFI_STANDARD;
 	wcd937x->hph_mode = mode_val;
+	mutex_unlock(&rystx_lock);
 	return 0;
 }
 
@@ -2960,6 +3317,15 @@ static int wcd937x_soc_codec_probe(struct snd_soc_component *component)
 		snd_soc_dapm_sync(dapm);
 	}
 	wcd937x->version = WCD937X_VERSION_1_0;
+
+	mutex_lock(&rystx_lock);
+	rystx_active_priv = wcd937x;
+	mutex_unlock(&rystx_lock);
+	/* Sync current rystx_component sysfs tunables (hifi mode, gains,
+	 * mic boost) onto this newly probed codec instance.
+	 */
+	rystx_apply_all(wcd937x);
+
        /* Register event notifier */
 	wcd937x->nblock.notifier_call = wcd937x_event_notify;
 	if (wcd937x->register_notifier) {
@@ -2988,6 +3354,11 @@ static void wcd937x_soc_codec_remove(struct snd_soc_component *component)
 
 	if (!wcd937x)
 		return;
+
+	mutex_lock(&rystx_lock);
+	if (rystx_active_priv == wcd937x)
+		rystx_active_priv = NULL;
+	mutex_unlock(&rystx_lock);
 
 	if (wcd937x->register_notifier)
 		wcd937x->register_notifier(wcd937x->handle,
@@ -3495,6 +3866,12 @@ static int wcd937x_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = rystx_sysfs_init();
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "%s: failed to create rystx_component sysfs (%d)\n",
+			 __func__, ret);
+
 	return component_master_add_with_match(&pdev->dev,
 					&wcd937x_comp_ops, match);
 }
@@ -3503,6 +3880,7 @@ static int wcd937x_remove(struct platform_device *pdev)
 {
 	component_master_del(&pdev->dev, &wcd937x_comp_ops);
 	dev_set_drvdata(&pdev->dev, NULL);
+	rystx_sysfs_deinit();
 
 	return 0;
 }
