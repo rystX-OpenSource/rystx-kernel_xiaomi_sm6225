@@ -8,6 +8,8 @@
 #include <sound/soc.h>
 #include <linux/regmap.h>
 
+struct kobject;
+
 #define BOLERO_VERSION_1_0 0x0001
 #define BOLERO_VERSION_1_1 0x0002
 #define BOLERO_VERSION_1_2 0x0003
@@ -127,6 +129,22 @@ int bolero_tx_mclk_enable(struct snd_soc_component *c, bool enable);
 int bolero_get_version(struct device *dev);
 int bolero_dmic_clk_enable(struct snd_soc_component *component,
 			   u32 dmic, u32 tx_mode, bool enable);
+
+/*
+ * rystx_component shared sysfs support.
+ *
+ * bolero-cdc owns the /sys/kernel/rystx_component kobject (it hosts the
+ * digital RX macro registers the "multi_channel_gain" and "dsd_forcer"
+ * tunables act on). Other codec drivers bound to this bolero instance
+ * (e.g. wcd937x, the analog codec on the other end of the soundwire link)
+ * can attach their own sysfs attribute groups to the same kobject, and can
+ * hook into the dsd_forcer toggle to force their own analog-side DSD/DAC
+ * direct settings in lockstep with the digital RX macro.
+ */
+struct kobject *bolero_get_rystx_kobj(void);
+void bolero_put_rystx_kobj(void);
+void bolero_register_dsd_force_cb(void (*cb)(bool enable));
+void bolero_unregister_dsd_force_cb(void (*cb)(bool enable));
 #else
 static inline int bolero_register_res_clk(struct device *dev, rsc_clk_cb_t cb)
 {
@@ -226,6 +244,22 @@ static int bolero_dmic_clk_enable(struct snd_soc_component *component,
 static int bolero_tx_mclk_enable(struct snd_soc_component *c, bool enable)
 {
 	return 0;
+}
+static inline struct kobject *bolero_get_rystx_kobj(void)
+{
+	return NULL;
+}
+
+static inline void bolero_put_rystx_kobj(void)
+{
+}
+
+static inline void bolero_register_dsd_force_cb(void (*cb)(bool enable))
+{
+}
+
+static inline void bolero_unregister_dsd_force_cb(void (*cb)(bool enable))
+{
 }
 #endif /* CONFIG_SND_SOC_BOLERO */
 #endif /* BOLERO_CDC_H */

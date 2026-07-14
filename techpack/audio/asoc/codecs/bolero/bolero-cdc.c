@@ -12,6 +12,9 @@
 #include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/clk.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/mutex.h>
 #include <soc/snd_event.h>
 #include <linux/pm_runtime.h>
 #include <soc/swr-common.h>
@@ -39,6 +42,334 @@ static u16 bolero_mclk_mux_tbl[MAX_MACRO][MCLK_MUX_MAX] = {
 };
 
 static bool bolero_is_valid_codec_dev(struct device *dev);
+
+/*
+ * ---------------------------------------------------------------------
+ * rystx_component sysfs interface (bolero side)
+ *
+ * bolero-cdc owns /sys/kernel/rystx_component since it owns the regmap
+ * for the digital RX macro registers these tunables act on. Other bound
+ * codec drivers (wcd937x) attach their own attribute groups to the same
+ * kobject via bolero_get_rystx_kobj(), and can hook the dsd_forcer toggle
+ * via bolero_register_dsd_force_cb() to keep their analog-side settings
+ * in lockstep.
+ *
+ * multi_channel_gain - keyed "<chan>=<db>" pairs for as many of the
+ * RX macro's digital RX paths as this target
+ * exposes: rx0, rx1, rx2 (headset/lineout paths)
+ * and wsa0, wsa1 (speaker paths). +-14dB each.
+ * dsd_forcer          - force the RX macro's DSD interpolator paths
+ * (and any registered analog-side hook) on,
+ * independent of normal DAPM-driven routing.
+ * ---------------------------------------------------------------------
+ */
+
+#define RYSTX_GAIN_MIN_DB  (-14)
+#define RYSTX_GAIN_MAX_DB  (14)
+
+enum rystx_gain_chan {
+   RYSTX_CHAN_RX0 = 0,
+   RYSTX_CHAN_RX1,
+   RYSTX_CHAN_RX2,
+   RYSTX_CHAN_WSA0,
+   RYSTX_CHAN_WSA1,
+   RYSTX_CHAN_MAX,
+};
+
+struct rystx_gain_chan_info {
+   const char *name;
+   u16 reg;
+};
+
+static const struct rystx_gain_chan_info rystx_gain_chans[RYSTX_CHAN_MAX] = {
+   [RYSTX_CHAN_RX0]  = { "rx0",  BOLERO_CDC_RX_RX0_RX_VOL_CTL },
+   [RYSTX_CHAN_RX1]  = { "rx1",  BOLERO_CDC_RX_RX1_RX_VOL_CTL },
+   [RYSTX_CHAN_RX2]  = { "rx2",  BOLERO_CDC_RX_RX2_RX_VOL_CTL },
+   [RYSTX_CHAN_WSA0] = { "wsa0", BOLERO_CDC_WSA_RX0_RX_VOL_CTL },
+   [RYSTX_CHAN_WSA1] = { "wsa1", BOLERO_CDC_WSA_RX1_RX_VOL_CTL },
+};
+
+static DEFINE_MUTEX(rystx_lock);
+static int rystx_gain_db[RYSTX_CHAN_MAX];
+static bool rystx_dsd_force_enabled;
+
+static struct kobject *rystx_kobj;
+static DEFINE_MUTEX(rystx_kobj_lock);
+
+static void (*rystx_dsd_force_cb)(bool enable);
+static DEFINE_MUTEX(rystx_dsd_cb_lock);
+
+static struct bolero_priv *rystx_active_priv;
+
+static void rystx_kobj_release(struct kobject *kobj)
+{
+   kfree(kobj);
+   /* Only called while rystx_kobj_lock is already held by the last
+    * bolero_put_rystx_kobj() caller, so it is safe to clear directly.
+    */
+   rystx_kobj = NULL;
+}
+
+static struct kobj_type rystx_kobj_ktype = {
+   .release = rystx_kobj_release,
+   .sysfs_ops = &kobj_sysfs_ops,
+};
+
+struct kobject *bolero_get_rystx_kobj(void)
+{
+   int ret;
+
+   mutex_lock(&rystx_kobj_lock);
+   if (!rystx_kobj) {
+       struct kobject *kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+
+       if (!kobj) {
+           mutex_unlock(&rystx_kobj_lock);
+           return NULL;
+       }
+       ret = kobject_init_and_add(kobj, &rystx_kobj_ktype,
+                       kernel_kobj, "rystx_component");
+       if (ret) {
+           kobject_put(kobj);
+           mutex_unlock(&rystx_kobj_lock);
+           return NULL;
+       }
+       rystx_kobj = kobj;
+   }
+   kobject_get(rystx_kobj);
+   mutex_unlock(&rystx_kobj_lock);
+
+   return rystx_kobj;
+}
+EXPORT_SYMBOL(bolero_get_rystx_kobj);
+
+void bolero_put_rystx_kobj(void)
+{
+   mutex_lock(&rystx_kobj_lock);
+   if (rystx_kobj)
+       kobject_put(rystx_kobj);
+   mutex_unlock(&rystx_kobj_lock);
+}
+EXPORT_SYMBOL(bolero_put_rystx_kobj);
+
+void bolero_register_dsd_force_cb(void (*cb)(bool enable))
+{
+   mutex_lock(&rystx_dsd_cb_lock);
+   rystx_dsd_force_cb = cb;
+   mutex_unlock(&rystx_dsd_cb_lock);
+}
+EXPORT_SYMBOL(bolero_register_dsd_force_cb);
+
+void bolero_unregister_dsd_force_cb(void (*cb)(bool enable))
+{
+   mutex_lock(&rystx_dsd_cb_lock);
+   if (rystx_dsd_force_cb == cb)
+       rystx_dsd_force_cb = NULL;
+   mutex_unlock(&rystx_dsd_cb_lock);
+}
+EXPORT_SYMBOL(bolero_unregister_dsd_force_cb);
+
+/* 0.5dB per LSB, signed byte, matching this codec family's RX_VOL_CTL
+ * convention. Range is deliberately capped at +-14dB here (not the
+ * register's full span) to keep the tunable sane from userspace.
+ */
+static s8 rystx_db_to_s8(int db)
+{
+   int clamped = clamp(db, RYSTX_GAIN_MIN_DB, RYSTX_GAIN_MAX_DB);
+
+   return (s8)(clamped * 2);
+}
+
+/* Caller must hold rystx_lock. */
+static void rystx_apply_gain_locked(struct bolero_priv *priv)
+{
+   int i;
+
+   if (!priv || !priv->component)
+       return;
+
+   for (i = 0; i < RYSTX_CHAN_MAX; i++)
+       snd_soc_component_write(priv->component,
+                    rystx_gain_chans[i].reg,
+                    (u8)rystx_db_to_s8(rystx_gain_db[i]));
+}
+
+/* Caller must hold rystx_lock. */
+static void rystx_apply_dsd_force_locked(struct bolero_priv *priv)
+{
+   void (*cb)(bool enable);
+   u8 val = rystx_dsd_force_enabled ? 0x1 : 0x0;
+
+   if (priv && priv->component) {
+       /* Force (or release) the RX macro's DSD clock/reset control
+        * and both DSD interpolator paths, independent of whatever
+        * the normal DAPM-driven routing would otherwise select.
+        */
+       snd_soc_component_update_bits(priv->component,
+               BOLERO_CDC_RX_CLK_RST_CTRL_DSD_CONTROL,
+               0x03, val ? 0x03 : 0x00);
+       snd_soc_component_update_bits(priv->component,
+               BOLERO_CDC_RX_DSD0_PATH_CTL, 0x01, val);
+       snd_soc_component_update_bits(priv->component,
+               BOLERO_CDC_RX_DSD1_PATH_CTL, 0x01, val);
+   }
+
+   mutex_lock(&rystx_dsd_cb_lock);
+   cb = rystx_dsd_force_cb;
+   mutex_unlock(&rystx_dsd_cb_lock);
+   if (cb)
+       cb(rystx_dsd_force_enabled);
+}
+
+/* Re-apply every stored rystx tunable to a newly probed bolero instance. */
+static void rystx_apply_all(struct bolero_priv *priv)
+{
+   mutex_lock(&rystx_lock);
+   rystx_apply_gain_locked(priv);
+   rystx_apply_dsd_force_locked(priv);
+   mutex_unlock(&rystx_lock);
+}
+
+static ssize_t multi_channel_gain_show(struct kobject *kobj,
+                   struct kobj_attribute *attr,
+                   char *buf)
+{
+   ssize_t len = 0;
+   int i;
+
+   mutex_lock(&rystx_lock);
+   for (i = 0; i < RYSTX_CHAN_MAX; i++)
+       len += scnprintf(buf + len, PAGE_SIZE - len, "%s=%d%s",
+                 rystx_gain_chans[i].name, rystx_gain_db[i],
+                 (i == RYSTX_CHAN_MAX - 1) ? "\n" : " ");
+   mutex_unlock(&rystx_lock);
+
+   return len;
+}
+
+static ssize_t multi_channel_gain_store(struct kobject *kobj,
+                    struct kobj_attribute *attr,
+                    const char *buf, size_t count)
+{
+   char *buf_dup, *cursor, *token;
+   int i;
+
+   buf_dup = kstrndup(buf, count, GFP_KERNEL);
+   if (!buf_dup)
+       return -ENOMEM;
+   cursor = buf_dup;
+
+   mutex_lock(&rystx_lock);
+   /* Accept any number of "<chan>=<db>" pairs, e.g.
+    * echo "rx0=4 rx1=4 wsa0=-2 wsa1=-2" > multi_channel_gain
+    * Unlisted channels keep their current value.
+    */
+   while ((token = strsep(&cursor, " \t\n")) != NULL) {
+       char *eq;
+       int db;
+
+       if (!*token)
+           continue;
+
+       eq = strchr(token, '=');
+       if (!eq)
+           continue;
+       *eq = '\0';
+
+       if (kstrtoint(eq + 1, 0, &db))
+           continue;
+
+       for (i = 0; i < RYSTX_CHAN_MAX; i++) {
+           if (!strcmp(token, rystx_gain_chans[i].name)) {
+               rystx_gain_db[i] = clamp(db,
+                             RYSTX_GAIN_MIN_DB,
+                             RYSTX_GAIN_MAX_DB);
+               break;
+           }
+       }
+   }
+   rystx_apply_gain_locked(rystx_active_priv);
+   mutex_unlock(&rystx_lock);
+
+   kfree(buf_dup);
+   return count;
+}
+
+static ssize_t dsd_forcer_show(struct kobject *kobj,
+               struct kobj_attribute *attr, char *buf)
+{
+   int val;
+
+   mutex_lock(&rystx_lock);
+   val = rystx_dsd_force_enabled ? 1 : 0;
+   mutex_unlock(&rystx_lock);
+
+   return sysfs_emit(buf, "%d\n", val);
+}
+
+static ssize_t dsd_forcer_store(struct kobject *kobj,
+                struct kobj_attribute *attr,
+                const char *buf, size_t count)
+{
+   bool enable;
+   int ret;
+
+   ret = kstrtobool(buf, &enable);
+   if (ret)
+       return ret;
+
+   mutex_lock(&rystx_lock);
+   rystx_dsd_force_enabled = enable;
+   rystx_apply_dsd_force_locked(rystx_active_priv);
+   mutex_unlock(&rystx_lock);
+
+   return count;
+}
+
+static struct kobj_attribute rystx_attr_multi_channel_gain =
+   __ATTR(multi_channel_gain, 0664, multi_channel_gain_show,
+          multi_channel_gain_store);
+static struct kobj_attribute rystx_attr_dsd_forcer =
+   __ATTR(dsd_forcer, 0664, dsd_forcer_show, dsd_forcer_store);
+
+static struct attribute *rystx_bolero_attrs[] = {
+   &rystx_attr_multi_channel_gain.attr,
+   &rystx_attr_dsd_forcer.attr,
+   NULL,
+};
+
+static const struct attribute_group rystx_bolero_attr_group = {
+   .attrs = rystx_bolero_attrs,
+};
+
+static int rystx_sysfs_init(void)
+{
+   struct kobject *kobj;
+   int ret;
+
+   kobj = bolero_get_rystx_kobj();
+   if (!kobj)
+       return -ENOMEM;
+
+   ret = sysfs_create_group(kobj, &rystx_bolero_attr_group);
+   if (ret)
+       bolero_put_rystx_kobj();
+
+   return ret;
+}
+
+static void rystx_sysfs_deinit(void)
+{
+   struct kobject *kobj;
+
+   mutex_lock(&rystx_kobj_lock);
+   kobj = rystx_kobj;
+   mutex_unlock(&rystx_kobj_lock);
+
+   if (kobj)
+       sysfs_remove_group(kobj, &rystx_bolero_attr_group);
+   bolero_put_rystx_kobj();
+}
 
 int bolero_set_port_map(struct snd_soc_component *component,
 			u32 size, void *data)
@@ -1198,6 +1529,14 @@ static int bolero_soc_codec_probe(struct snd_soc_component *component)
 	}
 	priv->component = component;
 
+	mutex_lock(&rystx_lock);
+	rystx_active_priv = priv;
+	mutex_unlock(&rystx_lock);
+	/* Sync current rystx_component sysfs tunables (per-channel gain,
+	 * DSD forcer) onto this newly probed bolero instance.
+	 */
+	rystx_apply_all(priv);
+
 	ret = snd_event_client_register(priv->dev, &bolero_ssr_ops, priv);
 	if (!ret) {
 		snd_event_notify(priv->dev, SND_EVENT_UP);
@@ -1218,6 +1557,11 @@ static void bolero_soc_codec_remove(struct snd_soc_component *component)
 {
 	struct bolero_priv *priv = dev_get_drvdata(component->dev);
 	int macro_idx;
+
+	mutex_lock(&rystx_lock);
+	if (rystx_active_priv == priv)
+		rystx_active_priv = NULL;
+	mutex_unlock(&rystx_lock);
 
 	snd_event_client_deregister(priv->dev);
 	/* call exit for supported macros */
@@ -1402,6 +1746,13 @@ static int bolero_probe(struct platform_device *pdev)
 	priv->lpass_audio_hw_vote = lpass_audio_hw_vote;
 
 	schedule_work(&priv->bolero_add_child_devices_work);
+
+	ret = rystx_sysfs_init();
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "%s: failed to create rystx_component sysfs (%d)\n",
+			 __func__, ret);
+
 	return 0;
 }
 
@@ -1411,6 +1762,8 @@ static int bolero_remove(struct platform_device *pdev)
 
 	if (!priv)
 		return -EINVAL;
+
+	rystx_sysfs_deinit();
 
 	of_platform_depopulate(&pdev->dev);
 	mutex_destroy(&priv->io_lock);
