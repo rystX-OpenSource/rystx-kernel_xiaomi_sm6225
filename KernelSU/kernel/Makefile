@@ -11,8 +11,8 @@ MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 $(info -- KDIR: $(KDIR))
 $(info -- MDIR: $(MDIR))
 
-# compliant to last upstream kernel change as of 5517191
-CFLAGS_ksu.o += -DKSU_VERSION=32522
+# compliant to last upstream kernel change as of e9e5b61
+CFLAGS_ksu.o += -DKSU_VERSION=32558
 
 ifndef KSU_EXPECTED_SIZE
 KSU_EXPECTED_SIZE := 0x033b
@@ -39,15 +39,15 @@ $(info -- KernelSU/compat: security_add_hooks v2 found!)
 CFLAGS_ksu.o += -DKSU_COMPAT_SECURITY_ADD_HOOKS_V2
 endif
 
-ifeq ($(shell grep -q "^struct security_operations selinux_ops" $(srctree)/security/selinux/hooks.c; echo $$?),0)
-$(info -- KernelSU/compat: exported selinux_ops found!)
-CFLAGS_ksu.o += -DKSU_HAS_EXPORTED_SELINUX_OPS
-endif
-
 # see security_delete_hooks
 ifeq ($(shell grep -A5 "^struct security_hook_list" $(srctree)/include/linux/lsm_hooks.h 2>/dev/null | grep -q "struct hlist_node" 2>/dev/null; echo $$?),0)
 $(info -- KernelSU/compat: security_hook_list - hlist_node found!)
 CFLAGS_ksu.o += -DKSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST
+endif
+
+ifeq ($(shell grep -q "^struct security_operations selinux_ops" $(srctree)/security/selinux/hooks.c; echo $$?),0)
+$(info -- KernelSU/compat: exported selinux_ops found!)
+CFLAGS_ksu.o += -DKSU_HAS_EXPORTED_SELINUX_OPS
 endif
 
 ifeq ($(shell grep -q " current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
@@ -102,6 +102,7 @@ CFLAGS_ksu.o += $(call cc-option, -Wno-int-to-pointer-cast)
 CFLAGS_ksu.o += $(call cc-option, -Wno-pointer-to-int-cast)
 CFLAGS_ksu.o += $(call cc-option, -Wno-unused-variable)
 CFLAGS_ksu.o += $(call cc-option, -Wno-unused-function)
+CFLAGS_ksu.o += $(call cc-option, -Wno-unused-label)
 CFLAGS_ksu.o += $(call cc-option, -Wno-format)
 CFLAGS_ksu.o += $(call cc-option, -Wno-macro-redefined)
 CFLAGS_ksu.o += $(call cc-option, -Wno-incompatible-pointer-types-discards-qualifiers)
@@ -119,7 +120,9 @@ CFLAGS_REMOVE_ksu.o += -fno-builtin
 ifneq ($(CONFIG_KSU_DEBUG),y)
 # strip, remove tracing / profiling
 # comment out if proper backtrace is needed
+CFLAGS_ksu.o += -O3
 CFLAGS_ksu.o += -g0 -fno-unwind-tables -fno-asynchronous-unwind-tables -fomit-frame-pointer
+CFLAGS_ksu.o += $(call cc-option, -momit-leaf-frame-pointer)
 CFLAGS_REMOVE_ksu.o = $(CC_FLAGS_FTRACE)
 CFLAGS_REMOVE_ksu.o += -pg
 
@@ -127,5 +130,11 @@ CFLAGS_REMOVE_ksu.o += -pg
 CFLAGS_ksu.o += -fno-stack-protector -fno-stack-check
 CFLAGS_REMOVE_ksu.o += -fsanitize=shadow-call-stack
 endif # CONFIG_KSU_DEBUG
+
+# Native fallback targets matching the traditional out-of-tree build method
+all:
+	$(MAKE) -C $(KDIR) M=$(MDIR) modules
+clean:
+	$(MAKE) -C $(KDIR) M=$(MDIR) clean
 
 # Keep a new line here!! Because someone may append config
