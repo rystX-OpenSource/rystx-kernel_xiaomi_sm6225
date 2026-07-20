@@ -28,7 +28,6 @@
 #include <linux/signal_types.h>
 #include <linux/mm_types_task.h>
 #include <linux/mm_event.h>
-#include <linux/llist.h>
 #include <linux/task_io_accounting.h>
 #include <linux/rseq.h>
 #include <linux/android_kabi.h>
@@ -812,14 +811,6 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
-struct infinity_ctx {
-	u64		ema;
-	u64		rt_ema;
-	u64		last_sleep_ns;
-	u64		rt_last_sleep_ns;
-	bool		futex_waiting;
-};
-
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -874,7 +865,6 @@ struct task_struct {
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
-	struct infinity_ctx		infinity;
 	u64				last_sleep_ts;
 
 	int				boost;
