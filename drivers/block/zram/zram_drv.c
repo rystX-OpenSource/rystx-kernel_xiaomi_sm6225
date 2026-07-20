@@ -33,6 +33,7 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
+#include <linux/sysctl.h>
 
 #include "zram_drv.h"
 
@@ -52,6 +53,24 @@ static unsigned int num_devices = 1;
 static size_t huge_class_size;
 
 static const struct block_device_operations zram_devops;
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+static int __maybe_unused one = 1;
+static int __maybe_unused three = 3;
+u8 __read_mostly sysctl_zram_recomp_immediate = 1;
+
+static struct ctl_table zram_sysctl_table[] = {
+	{
+		.procname	= "zram_recomp_immediate",
+		.data		= &sysctl_zram_recomp_immediate,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= proc_dou8vec_minmax,
+		.extra1		= &one,
+		.extra2		= &three,
+	},
+};
+#endif //CONFIG_ZRAM_MULTI_COMP
 
 static void zram_free_page(struct zram *zram, size_t index);
 static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
@@ -246,6 +265,74 @@ static bool page_same_filled(void *ptr, unsigned long *element)
 	*element = val;
 
 	return true;
+}
+
+static bool zram_can_store_page(struct zram *zram)
+{
+	unsigned long alloced_pages;
+
+	alloced_pages = zs_get_total_pages(zram->mem_pool);
+	update_used_max(zram, alloced_pages);
+
+	return !zram->limit_pages || alloced_pages <= zram->limit_pages;
+}
+
+static int write_same_filled_page(struct zram *zram, unsigned long fill,
+				  u32 index)
+{
+	zram_slot_lock(zram, index);
+	zram_free_page(zram, index);
+	zram_set_flag(zram, index, ZRAM_SAME);
+	zram_set_handle(zram, index, fill);
+	zram_slot_unlock(zram, index);
+
+	atomic64_inc(&zram->stats.same_pages);
+	atomic64_inc(&zram->stats.pages_stored);
+
+	return 0;
+}
+
+static int write_incompressible_page(struct zram *zram, struct page *page,
+				     u32 index, u8 prio)
+{
+	unsigned long handle;
+	void *src, *dst;
+
+	/*
+	 * This function is called from preemptible context so we don't need
+	 * to do optimistic and fallback to pessimistic handle allocation,
+	 * like we do for compressible pages.
+	 */
+	handle = zs_malloc(zram->mem_pool, PAGE_SIZE,
+			   GFP_NOIO | __GFP_HIGHMEM | __GFP_MOVABLE);
+	if (!handle)
+		return PTR_ERR((void *)handle);
+
+	if (!zram_can_store_page(zram)) {
+		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+		zs_free(zram->mem_pool, handle);
+		return -ENOMEM;
+	}
+
+	dst = zs_map_object(zram->mem_pool, handle, ZS_MM_WO);
+	src = kmap_atomic(page);
+	memcpy(dst, src, PAGE_SIZE);
+	kunmap_atomic(src);
+	zs_unmap_object(zram->mem_pool, handle);
+
+	zram_slot_lock(zram, index);
+	zram_set_flag(zram, index, ZRAM_HUGE);
+	zram_set_handle(zram, index, handle);
+	zram_set_obj_size(zram, index, PAGE_SIZE);
+	zram_set_priority(zram, index, prio);
+	zram_slot_unlock(zram, index);
+
+	atomic64_add(PAGE_SIZE, &zram->stats.compr_data_size);
+	atomic64_inc(&zram->stats.huge_pages);
+	atomic64_inc(&zram->stats.huge_pages_since);
+	atomic64_inc(&zram->stats.pages_stored);
+
+	return 0;
 }
 
 static ssize_t initstate_show(struct device *dev,
@@ -1524,36 +1611,59 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	unsigned long handle = 0;
 	unsigned int comp_len = 0;
 	void *src, *dst, *mem;
-	struct zcomp_strm *zstrm;
+	struct zcomp_strm *zstrm = NULL;
 	struct page *page = bvec->bv_page;
 	unsigned long element = 0;
 	enum zram_pageflags flags = 0;
+	u8 prio, prio_max = zram->num_active_comps;
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	prio_max = min(prio_max, sysctl_zram_recomp_immediate + 1);
+#endif //CONFIG_ZRAM_MULTI_COMP
 
 	mem = kmap_atomic(page);
-	if (page_same_filled(mem, &element)) {
-		kunmap_atomic(mem);
-		/* Free memory associated with this sector now. */
-		flags = ZRAM_SAME;
-		atomic64_inc(&zram->stats.same_pages);
-		goto out;
-	}
+	if (page_same_filled(mem, &element))
+		return write_same_filled_page(zram, element, index);
 	kunmap_atomic(mem);
 
 compress_again:
 	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
-	src = kmap_atomic(page);
-	ret = zcomp_compress(zstrm, src, &comp_len);
-	kunmap_atomic(src);
+	mem = kmap_atomic(page);
+	ret = zcomp_compress(zstrm, mem, &comp_len);
+	kunmap_atomic(mem);
 
-	if (unlikely(ret)) {
+	for (prio = ZRAM_PRIMARY_COMP; prio < prio_max; prio++) {
+		if (!zram->comps[prio])
+			continue;
+
+		zstrm = zcomp_stream_get(zram->comps[prio]);
+		mem = kmap_atomic(page);
+		ret = zcomp_compress(zstrm,
+			     mem, &comp_len);
+		kunmap_atomic(mem);
+
+		if (unlikely(ret)) {
+			pr_err("Compression failed! err=%d\n", ret);
+			goto out;
+		}
+
+		if (comp_len < huge_class_size)
+			break;
+
 		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
-		pr_err("Compression failed! err=%d\n", ret);
 		zs_free(zram->mem_pool, handle);
-		return ret;
+		zstrm = NULL;
 	}
 
-	if (comp_len >= huge_class_size)
-		comp_len = PAGE_SIZE;
+	if (!zstrm) {
+		if (prio >= zram->num_active_comps) {
+			zram_slot_lock(zram, index);
+			zram_set_flag(zram, index, ZRAM_INCOMPRESSIBLE);
+			zram_slot_unlock(zram, index);
+		}
+
+		ret = write_incompressible_page(zram, page, index, prio - 1);
+		goto out;
+	}
 	/*
 	 * handle allocation has 2 paths:
 	 * a) fast path is executed with preemption disabled (for
@@ -1585,28 +1695,16 @@ compress_again:
 		return -ENOMEM;
 	}
 
-	alloced_pages = zs_get_total_pages(zram->mem_pool);
-	update_used_max(zram, alloced_pages);
-
-	if (zram->limit_pages && alloced_pages > zram->limit_pages) {
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
-		zs_free(zram->mem_pool, handle);
-		return -ENOMEM;
+	if (!zram_can_store_page(zram)) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
 	dst = zs_map_object(zram->mem_pool, handle, ZS_MM_WO);
 
-	src = zstrm->buffer;
-	if (comp_len == PAGE_SIZE)
-		src = kmap_atomic(page);
-	memcpy(dst, src, comp_len);
-	if (comp_len == PAGE_SIZE)
-		kunmap_atomic(src);
-
-	zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+	memcpy(dst, zstrm->buffer, comp_len);
 	zs_unmap_object(zram->mem_pool, handle);
-	atomic64_add(comp_len, &zram->stats.compr_data_size);
-out:
+
 	/*
 	 * Free memory associated with this sector
 	 * before overwriting unused sectors.
@@ -1627,10 +1725,16 @@ out:
 		zram_set_handle(zram, index, handle);
 		zram_set_obj_size(zram, index, comp_len);
 	}
+	zram_set_priority(zram, index, prio);
 	zram_slot_unlock(zram, index);
 
 	/* Update stats */
 	atomic64_inc(&zram->stats.pages_stored);
+	atomic64_add(comp_len, &zram->stats.compr_data_size);
+
+out:
+	if (zstrm)
+		zcomp_stream_put(zram->comps[prio]);
 	return ret;
 }
 
@@ -2640,6 +2744,16 @@ static int __init zram_init(void)
 			goto out_error;
 		num_devices--;
 	}
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+#define ZRAM_IR_VERSION "1.2-K4.19-backport]"
+#define ZRAM_IR_PROGNAME "ZRAM Immediate Recompression (ZRAM-IR)"
+#define ZRAM_IR_AUTHOR   "Masahito Suzuki"
+	printk(KERN_INFO "%s %s by %s\n",
+		ZRAM_IR_PROGNAME, ZRAM_IR_VERSION, ZRAM_IR_AUTHOR);
+	__register_sysctl_init("vm", zram_sysctl_table,
+                 "zram_ir_sysctl_table");
+#endif //CONFIG_ZRAM_MULTI_COMP
 
 	return 0;
 
