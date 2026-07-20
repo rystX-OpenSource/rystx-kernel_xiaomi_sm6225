@@ -3251,7 +3251,7 @@ int proc_douintvec_minmax(struct ctl_table *table, int write,
  *
  * Returns 0 on success or an error on write when the range check fails.
  */
-int proc_dou8vec_minmax(const struct ctl_table *table, int write,
+int proc_dou8vec_minmax(struct ctl_table *table, int write,
 			void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	struct ctl_table tmp;
@@ -3842,7 +3842,7 @@ int proc_douintvec_minmax(struct ctl_table *table, int write,
 	return -ENOSYS;
 }
 
-int proc_dou8vec_minmax(const struct ctl_table *table, int write,
+int proc_dou8vec_minmax(struct ctl_table *table, int write,
 			void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	return -ENOSYS;
