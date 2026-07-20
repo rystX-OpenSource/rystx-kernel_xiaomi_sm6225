@@ -309,7 +309,6 @@ static int write_incompressible_page(struct zram *zram, struct page *page,
 		return PTR_ERR((void *)handle);
 
 	if (!zram_can_store_page(zram)) {
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
 		zs_free(zram->mem_pool, handle);
 		return -ENOMEM;
 	}
@@ -1611,6 +1610,7 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	unsigned long handle = 0;
 	unsigned int comp_len = 0;
 	void *src, *dst, *mem;
+	struct zcomp *comp = NULL;
 	struct zcomp_strm *zstrm = NULL;
 	struct page *page = bvec->bv_page;
 	unsigned long element = 0;
@@ -1621,24 +1621,21 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 #endif //CONFIG_ZRAM_MULTI_COMP
 
 	mem = kmap_atomic(page);
-	if (page_same_filled(mem, &element))
+	if (page_same_filled(mem, &element)) {
+		kunmap_atomic(mem);
 		return write_same_filled_page(zram, element, index);
+	}
 	kunmap_atomic(mem);
 
 compress_again:
-	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
-	mem = kmap_atomic(page);
-	ret = zcomp_compress(zstrm, mem, &comp_len);
-	kunmap_atomic(mem);
-
 	for (prio = ZRAM_PRIMARY_COMP; prio < prio_max; prio++) {
 		if (!zram->comps[prio])
 			continue;
 
-		zstrm = zcomp_stream_get(zram->comps[prio]);
+		comp = zram->comps[prio];
+		zstrm = zcomp_stream_get(comp);
 		mem = kmap_atomic(page);
-		ret = zcomp_compress(zstrm,
-			     mem, &comp_len);
+		ret = zcomp_compress(zstrm, mem, &comp_len);
 		kunmap_atomic(mem);
 
 		if (unlikely(ret)) {
@@ -1649,9 +1646,9 @@ compress_again:
 		if (comp_len < huge_class_size)
 			break;
 
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
-		zs_free(zram->mem_pool, handle);
+		zcomp_stream_put(comp);
 		zstrm = NULL;
+		comp = NULL;
 	}
 
 	if (!zstrm) {
@@ -1685,7 +1682,9 @@ compress_again:
 				__GFP_MOVABLE |
 				__GFP_CMA);
 	if (!handle) {
-		zcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);
+		zcomp_stream_put(comp);
+		zstrm = NULL;
+		comp = NULL;
 		atomic64_inc(&zram->stats.writestall);
 		handle = zs_malloc(zram->mem_pool, comp_len,
 				GFP_NOIO | __GFP_HIGHMEM |
@@ -1734,7 +1733,7 @@ compress_again:
 
 out:
 	if (zstrm)
-		zcomp_stream_put(zram->comps[prio]);
+		zcomp_stream_put(comp);
 	return ret;
 }
 
