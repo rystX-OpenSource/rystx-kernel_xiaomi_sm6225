@@ -51,7 +51,195 @@ void set_lcd_reset_gpio_keep_high(bool en)
 	lcd_reset_keep_high = en;
 }
 EXPORT_SYMBOL(set_lcd_reset_gpio_keep_high);
-#endif
+
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+static struct dsi_panel *rr_global_panel = NULL;
+unsigned int refresh_rate_cus = 60;
+
+#define RR_MIN_HZ 48
+#define RR_MAX_HZ 76
+
+static int __init read_refresh_rate_cmd(char *s)
+{
+	if (s)
+		refresh_rate_cus = simple_strtoul(s, NULL, 0);
+
+	if (refresh_rate_cus < RR_MIN_HZ || refresh_rate_cus > RR_MAX_HZ)
+		refresh_rate_cus = 60;
+
+	return 1;
+}
+__setup("rystx.rr=", read_refresh_rate_cmd);
+
+/**
+ * dsi_panel_apply_custom_rr - Re-target a fixed (non-DFPS) panel's single
+ * mode to boot at refresh_rate_cus instead of its devicetree-native rate.
+ *
+ * Two unrelated mechanisms drive the on-screen refresh rate on Qualcomm
+ * DSI panels, and only one applies to any given panel:
+ *
+ *  - Video mode: the DSI bit clock and h/v porches ARE the frame timing.
+ *    clk_rate_hz has to be recalculated to hit the target fps.
+ *
+ *  - Command mode (the normal case for a panel with no DFPS support):
+ *    the panel free-runs on its own internal timing controller. What
+ *    paces frames on our side is priv_info->mdp_transfer_time_us, which
+ *    dsi_panel_calc_dsi_transfer_time() consumes later in
+ *    dsi_display.c. Touching clk_rate_hz/porches does very little for
+ *    these panels and is actively harmful: if clk_rate_hz ends up
+ *    non-zero, that function's "force update mdp xfer time" branch
+ *    throws away its own freshly-computed transfer time and replaces it
+ *    with whatever priv_info->mdp_transfer_time_us still holds - which,
+ *    without this fix, is the untouched budget for the ORIGINAL native
+ *    framerate. MDP then keeps pushing frames on the old cadence while
+ *    the panel is told to run at a different rate, which is what
+ *    produces the post-boot stutter.
+ */
+static void dsi_panel_apply_custom_rr(struct dsi_display_mode *display_mode)
+{
+	struct dsi_mode_info *mode = &display_mode->timing;
+	struct dsi_display_mode_priv_info *priv_info = display_mode->priv_info;
+	char clean_name[32] = "Generic Panel";
+	const char *full_name = NULL;
+	u32 old_fps;
+	bool is_cmd_mode = false;
+
+	if (refresh_rate_cus < RR_MIN_HZ || refresh_rate_cus > RR_MAX_HZ)
+		return;
+
+	if (!priv_info)
+		return;
+
+	old_fps = mode->refresh_rate ? mode->refresh_rate : 60;
+
+	if (refresh_rate_cus == old_fps)
+		return;
+
+	if (rr_global_panel) {
+		is_cmd_mode = (rr_global_panel->panel_mode == DSI_OP_CMD_MODE);
+		full_name = rr_global_panel->name;
+	}
+
+	if (full_name) {
+		if (strnstr(full_name, "nt36525b", strlen(full_name)))
+			strlcpy(clean_name, "Novatek NT36525B", sizeof(clean_name));
+		else if (strnstr(full_name, "ft8006s", strlen(full_name)))
+			strlcpy(clean_name, "FocalTech FT8006S", sizeof(clean_name));
+		else
+			strlcpy(clean_name, "OEM Custom", sizeof(clean_name));
+	}
+
+	DSI_INFO("custom_rr: panel=%s mode=%s %uHz -> %uHz\n", clean_name,
+		 is_cmd_mode ? "cmd" : "video", old_fps, refresh_rate_cus);
+
+	if (is_cmd_mode) {
+		/*
+		 * Scale the MDP transfer-time budget proportionally instead
+		 * of fabricating a bit clock. This is the value that
+		 * actually governs frame pacing for command-mode panels,
+		 * and is the piece the original patch never updated.
+		 */
+		if (priv_info->mdp_transfer_time_us) {
+			u64 new_transfer = (u64)priv_info->mdp_transfer_time_us * old_fps;
+
+			do_div(new_transfer, refresh_rate_cus);
+			priv_info->mdp_transfer_time_us = (u32)new_transfer;
+			mode->mdp_transfer_time_us = priv_info->mdp_transfer_time_us;
+			DSI_INFO("custom_rr: mdp_transfer_time_us scaled to %uus\n",
+				 priv_info->mdp_transfer_time_us);
+		} else {
+			DSI_INFO("custom_rr: no mdp_transfer_time_us in DT, "
+				 "letting dsi_panel_calc_dsi_transfer_time derive it\n");
+		}
+
+		/*
+		 * If devicetree also specified an explicit clk_rate_hz, keep
+		 * it internally consistent by scaling it too. If it was 0
+		 * (typical for a transfer-time-driven panel), leave it 0
+		 * rather than inventing an uncalibrated value - a non-zero
+		 * clk_rate_hz is exactly what triggers the forced-override
+		 * path described above.
+		 */
+		if (mode->clk_rate_hz) {
+			u64 new_clk = (u64)mode->clk_rate_hz * refresh_rate_cus;
+
+			do_div(new_clk, old_fps);
+			mode->clk_rate_hz = (u32)new_clk;
+			priv_info->clk_rate_hz = mode->clk_rate_hz;
+		}
+
+		mode->refresh_rate = refresh_rate_cus;
+		return;
+	}
+
+	/*
+	 * qcom,mdss-dsi-panel-phy-timings, if present, is a static array of
+	 * raw D-PHY register bytes calibrated by the panel vendor for the
+	 * NATIVE clock only. dsi_display.c commits it to hardware verbatim
+	 * with no awareness that we've just changed the clock underneath
+	 * it - out-of-spec D-PHY signalling from this mismatch is very
+	 * likely the real cause of the longer boot time and post-boot
+	 * stutter, more so than the clock formula below.
+	 *
+	 * dsi_phy.c has a fallback: if priv_info->phy_timing_len is left at
+	 * 0, phy->cfg.is_phy_timing_present stays false, and
+	 * dsi_phy_enable() calls phy->hw.ops.calculate_timing_params()
+	 * instead of replaying the stale array.
+	 *
+	 * Verified safe: dsi_catalog_phy_4_0_init() in dsi_catalog.c wires
+	 * calculate_timing_params up to dsi_phy_hw_calculate_timing_params
+	 * (the same shared function used for v2_0/v3_0 too), so it's never
+	 * NULL for your PHY version. Discarding the array is now confirmed
+	 * to hit real auto-calculated timing instead of a crash.
+	 */
+	if (priv_info->phy_timing_len && priv_info->phy_timing_val) {
+		DSI_INFO("custom_rr: discarding phy_timing_val (calibrated for "
+			 "%uHz, unsafe to reuse at %uHz)\n", old_fps, refresh_rate_cus);
+		kfree(priv_info->phy_timing_val);
+		priv_info->phy_timing_val = NULL;
+		priv_info->phy_timing_len = 0;
+	}
+
+	if (mode->clk_rate_hz) {
+		u64 new_clk = (u64)mode->clk_rate_hz * refresh_rate_cus;
+
+		do_div(new_clk, old_fps);
+		mode->clk_rate_hz = ((u32)new_clk / 1000000) * 1000000;
+		DSI_INFO("custom_rr: scaled clock to %uHz\n", mode->clk_rate_hz);
+	} else if (rr_global_panel) {
+		/*
+		 * No clockrate in DT: derive the minimum required bit clock
+		 * from bpp/lanes (bit_clk = pixel_clk * bpp / lanes), the
+		 * same relationship dsi_panel_calc_dsi_transfer_time() uses,
+		 * instead of an arbitrary multiplier. A flat "* 3" only
+		 * happens to be correct for one specific bpp/lane combo and
+		 * silently produces a wrong, uncalibrated clock for anything
+		 * else - out-of-spec D-PHY timing is a very plausible source
+		 * of your longer boot time too, since panel init commands
+		 * can fail/retry against a marginal link.
+		 */
+		u32 bpp = rr_global_panel->host_config.bpp ? : 24;
+		u32 lanes = rr_global_panel->host_config.num_data_lanes ? : 4;
+		u64 total_pixels = (u64)mode->h_active * mode->v_active;
+		u64 min_bitclk = total_pixels * refresh_rate_cus * bpp;
+
+		do_div(min_bitclk, lanes);
+		/* 10% headroom over the theoretical minimum, similar to the
+		 * margin devicetree-provided clockrate values typically carry.
+		 */
+		min_bitclk += min_bitclk / 10;
+		do_div(min_bitclk, 1000000);
+		mode->clk_rate_hz = (u32)min_bitclk * 1000000;
+
+		DSI_INFO("custom_rr: derived clk_rate_hz=%uHz (bpp=%u lanes=%u)\n",
+			 mode->clk_rate_hz, bpp, lanes);
+	}
+
+	mode->refresh_rate = refresh_rate_cus;
+	priv_info->clk_rate_hz = mode->clk_rate_hz;
+}
+#endif /* CONFIG_DSI_PANEL_CUSTOM_RR */
+#endif /* CONFIG_TARGET_PROJECT_C3Q */
 
 enum dsi_dsc_ratio_type {
 	DSC_8BPC_8BPP,
@@ -1141,10 +1329,6 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		DSI_ERR("qcom,mdss-dsi-h-sync-skew is not defined, rc=%d\n",
 				rc);
 
-	DSI_DEBUG("panel horz active:%d front_portch:%d back_porch:%d sync_skew:%d\n",
-		mode->h_active, mode->h_front_porch, mode->h_back_porch,
-		mode->h_sync_width);
-
 	rc = utils->read_u32(utils->data, "qcom,mdss-dsi-panel-height",
 				  &mode->v_active);
 	if (rc) {
@@ -1176,6 +1360,11 @@ static int dsi_panel_parse_timing(struct dsi_mode_info *mode,
 		       rc);
 		goto error;
 	}
+
+	DSI_DEBUG("panel horz active:%d front_portch:%d back_porch:%d sync_skew:%d\n",
+		mode->h_active, mode->h_front_porch, mode->h_back_porch,
+		mode->h_sync_width);
+	
 	DSI_DEBUG("panel vert active:%d front_portch:%d back_porch:%d pulse_width:%d\n",
 		mode->v_active, mode->v_front_porch, mode->v_back_porch,
 		mode->v_sync_width);
@@ -3771,6 +3960,12 @@ error:
 
 void dsi_panel_put(struct dsi_panel *panel)
 {
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+    if (rr_global_panel == panel) {
+        rr_global_panel = NULL;
+        pr_info("custom_rr: Global panel pointer detached\n");
+    }
+#endif
 	drm_panel_remove(&panel->drm_panel);
 
 	/* free resources allocated for ESD check */
@@ -4188,6 +4383,10 @@ int dsi_panel_get_mode(struct dsi_panel *panel,
 		return -EINVAL;
 	}
 
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+	rr_global_panel = panel;
+#endif
+
 	mutex_lock(&panel->panel_lock);
 	utils = &panel->utils;
 
@@ -4258,6 +4457,15 @@ int dsi_panel_get_mode(struct dsi_panel *panel,
 			"failed to parse panel phy timings, rc=%d\n", rc);
 			goto parse_fail;
 		}
+
+#ifdef CONFIG_DSI_PANEL_CUSTOM_RR
+		/*
+		 * Must run after dsi_panel_parse_phy_timing() above, since it
+		 * needs to see (and potentially invalidate) the static
+		 * phy_timing_val array that call just populated.
+		 */
+		dsi_panel_apply_custom_rr(mode);
+#endif
 
 		rc = dsi_panel_parse_partial_update_caps(mode, utils);
 		if (rc)
