@@ -62,6 +62,7 @@
 #include <linux/zsmalloc.h>
 #include <linux/zpool.h>
 #include <linux/mount.h>
+#include <linux/pseudo_fs.h>
 #include <linux/migrate.h>
 #include <linux/wait.h>
 #include <linux/pagemap.h>
@@ -319,7 +320,7 @@ static void zspage_read_unlock(struct zspage *zspage)
 {
 	struct zspage_lock *zsl = &zspage->zsl;
 
-	rwsem_release(&zsl->dep_map, 1, _RET_IP_);
+	rwsem_release(&zsl->dep_map, _RET_IP_);
 
 	spin_lock(&zsl->lock);
 	zsl->cnt--;
@@ -346,7 +347,7 @@ static void zspage_write_unlock(struct zspage *zspage)
 {
 	struct zspage_lock *zsl = &zspage->zsl;
 
-	rwsem_release(&zsl->dep_map, 1, _RET_IP_);
+	rwsem_release(&zsl->dep_map, _RET_IP_);
 
 	zsl->cnt = ZS_PAGE_UNLOCKED;
 	spin_unlock(&zsl->lock);
@@ -1678,15 +1679,14 @@ static void lock_zspage(struct zspage *zspage)
 }
 #endif /* CONFIG_COMPACTION */
 
-static struct dentry *zs_mount(struct file_system_type *fs_type,
-				int flags, const char *dev_name, void *data)
+static int zs_init_fs_context(struct fs_context *fc)
 {
-	return mount_pseudo(fs_type, "zsmalloc:", NULL, NULL, ZSMALLOC_MAGIC);
+	return init_pseudo(fc, ZSMALLOC_MAGIC) ? 0 : -ENOMEM;
 }
 
 static struct file_system_type zsmalloc_fs = {
 	.name		= "zsmalloc",
-	.mount		= zs_mount,
+	.init_fs_context = zs_init_fs_context,
 	.kill_sb	= kill_anon_super,
 };
 
