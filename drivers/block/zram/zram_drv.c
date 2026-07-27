@@ -106,7 +106,7 @@ static void zram_slot_unlock(struct zram *zram, u32 index)
 {
 	unsigned long *lock = &zram->table[index].flags;
 
-	mutex_release(slot_dep_map(zram, index), 1, _RET_IP_);
+	mutex_release(slot_dep_map(zram, index), _RET_IP_);
 	clear_and_wake_up_bit(ZRAM_ENTRY_LOCK, lock);
 }
 
@@ -2676,7 +2676,7 @@ static int zram_add(void)
 		blk_queue_max_write_zeroes_sectors(zram->disk->queue, UINT_MAX);
 
 	zram->disk->queue->backing_dev_info->capabilities |= BDI_CAP_STABLE_WRITES;
-	device_add_disk(NULL, zram->disk, zram_disk_groups);
+	device_add_disk(NULL, zram->disk);
 
 	zram_debugfs_register(zram);
 	pr_info("Added device: %s\n", zram->disk->disk_name);
