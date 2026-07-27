@@ -17,10 +17,8 @@
 
 #include <linux/rwsem.h>
 #include <linux/zsmalloc.h>
-#include <linux/spinlock.h>
 
 #include "zcomp.h"
-#include "zram_dedup.h"
 
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
@@ -76,8 +74,6 @@ struct zram_table_entry {
 
 struct zram_stats {
 	atomic64_t compr_data_size;	/* compressed size of pages stored */
-	atomic64_t num_reads;	/* failed + successful */
-	atomic64_t num_writes;	/* --do-- */
 	atomic64_t failed_reads;	/* can happen when memory is too low */
 	atomic64_t failed_writes;	/* can happen when memory is too low */
 	atomic64_t notify_free;	/* no. of swap slot free notifications */
@@ -92,16 +88,6 @@ struct zram_stats {
 	atomic64_t bd_reads;		/* no. of reads from backing device */
 	atomic64_t bd_writes;		/* no. of writes from backing device */
 #endif
-	atomic64_t dup_data_size;	/*
-					 * compressed size of pages
-					 * duplicated
-					 */
-	atomic64_t meta_data_size;	/* size of zram_entries */
-};
-
-struct zram_hash {
-	spinlock_t lock;
-	struct rb_root rb_root;
 };
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
@@ -120,8 +106,6 @@ struct zram {
 	struct zcomp *comps[ZRAM_MAX_COMPS];
 	struct zcomp_params params[ZRAM_MAX_COMPS];
 	struct gendisk *disk;
-	struct zram_hash *hash;
-	size_t hash_size;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
 	/*
@@ -155,15 +139,4 @@ struct zram {
 #endif
 	atomic_t pp_in_progress;
 };
-
-static inline bool zram_dedup_enabled(struct zram *zram)
-{
-#ifdef CONFIG_ZRAM_DEDUP
-	return zram->use_dedup;
-#else
-	return false;
-#endif
-}
-
-void zram_entry_free(struct zram *zram, struct zram_entry *entry);
 #endif
