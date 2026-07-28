@@ -26,6 +26,18 @@ config ZRAM_BACKEND_LZ4HC
 	select LZ4HC_COMPRESS
 	select LZ4_DECOMPRESS
 
+config ZRAM_BACKEND_LZ4KDR
+	bool "lz4kdr compression support"
+	depends on ZRAM
+	default y
+	select LZ4KDR_COMPRESS
+	select LZ4KDR_DECOMPRESS
+	help
+	  LZ4KDR is a speed-tuned derivative of Huawei's LZ4KD (a
+	  zram-oriented LZ4 variant), wire-compatible with the original
+	  LZ4KD encoding but with a reworked encoder search loop. See
+	  include/linux/lz4kdr.h for the attribution and what changed.
+
 config ZRAM_BACKEND_ZSTD
 	bool "zstd compression support"
 	depends on ZRAM
@@ -47,6 +59,7 @@ config ZRAM_BACKEND_842
 config ZRAM_BACKEND_FORCE_LZO
 	depends on ZRAM
 	def_bool !ZRAM_BACKEND_LZ4 && !ZRAM_BACKEND_LZ4HC && \
+		!ZRAM_BACKEND_LZ4KDR && \
 		!ZRAM_BACKEND_ZSTD && !ZRAM_BACKEND_DEFLATE && \
 		!ZRAM_BACKEND_842
 
@@ -78,6 +91,10 @@ config ZRAM_DEF_COMP_LZ4HC
 	bool "lz4hc"
 	depends on ZRAM_BACKEND_LZ4HC
 
+config ZRAM_DEF_COMP_LZ4KDR
+	bool "lz4kdr"
+	depends on ZRAM_BACKEND_LZ4KDR
+
 config ZRAM_DEF_COMP_ZSTD
 	bool "zstd"
 	depends on ZRAM_BACKEND_ZSTD
@@ -99,6 +116,7 @@ config ZRAM_DEF_COMP
 	default "lzo" if ZRAM_DEF_COMP_LZO
 	default "lz4" if ZRAM_DEF_COMP_LZ4
 	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
+	default "lz4kdr" if ZRAM_DEF_COMP_LZ4KDR
 	default "zstd" if ZRAM_DEF_COMP_ZSTD
 	default "deflate" if ZRAM_DEF_COMP_DEFLATE
 	default "842" if ZRAM_DEF_COMP_842
