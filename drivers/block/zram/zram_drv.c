@@ -1816,7 +1816,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 			continue;
 
 		zstrm = zcomp_stream_get(zram->comps[prio]);
-		mem = kmap_local_page(page);
+		mem = kmap_atomic(page);
 		ret = zcomp_compress(zram->comps[prio], zstrm,
 				     mem, &comp_len);
 		kunmap_atomic(mem);
