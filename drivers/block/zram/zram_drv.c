@@ -2676,7 +2676,7 @@ static int zram_add(void)
 		blk_queue_max_write_zeroes_sectors(zram->disk->queue, UINT_MAX);
 
 	zram->disk->queue->backing_dev_info->capabilities |= BDI_CAP_STABLE_WRITES;
-	device_add_disk(NULL, zram->disk);
+	device_add_disk(NULL, zram->disk, zram_disk_groups);
 
 	zram_debugfs_register(zram);
 	pr_info("Added device: %s\n", zram->disk->disk_name);
