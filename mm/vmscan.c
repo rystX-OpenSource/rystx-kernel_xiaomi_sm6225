@@ -1183,7 +1183,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			goto keep_locked;
 
 		/* page_update_gen() tried to promote this page? */
-		if (lru_gen_enabled() && !force_reclaim &&
+		if (lru_gen_enabled() && !ignore_references &&
 		    page_mapped(page) && PageReferenced(page))
 			goto keep_locked;
 
