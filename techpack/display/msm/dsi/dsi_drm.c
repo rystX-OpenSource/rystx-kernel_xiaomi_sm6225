@@ -318,6 +318,11 @@ int dsi_bridge_interface_enable(int timeout)
 {
 	int ret = 0;
 
+	if (!gbridge) {
+		DSI_ERR("primary dsi bridge not initialized\n");
+		return -ENODEV;
+	}
+
 	ret = wait_event_timeout(resume_wait_q,
 		!atomic_read(&resume_pending),
 		msecs_to_jiffies(WAIT_RESUME_TIMEOUT));
