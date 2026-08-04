@@ -50,6 +50,7 @@
 #include <linux/printk.h>
 #include <linux/dax.h>
 #include <linux/psi.h>
+#include <linux/psr_lmk.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -2775,6 +2776,17 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	bool reclaimable = false;
 
 	do {
+		/*
+		 * PSR-LMK already dispatched a bypass kill this cycle --
+		 * stop grinding through further reclaim priorities that
+		 * a kill likely already made unnecessary. This is the
+		 * "LRU passthrough" behavior: an immediate kill response
+		 * takes priority over exhaustive scanning once one has
+		 * already been decided on for this pressure event.
+		 */
+		if (psr_lmk_should_abort_reclaim())
+			break;
+
 		struct mem_cgroup *root = sc->target_mem_cgroup;
 		struct mem_cgroup_reclaim_cookie reclaim = {
 			.pgdat = pgdat,
@@ -2936,6 +2948,14 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		if (!sc->hibernation_mode && !current_is_kswapd() &&
 		   current_may_throttle() && pgdat_memcg_congested(pgdat, root))
 			wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+		
+		/*
+		 * Kernel-native scan/reclaim efficiency for this priority
+		 * pass, fed straight into PSR-LMK's regression engine as
+		 * a secondary signal alongside vmpressure.
+		 */
+		psr_lmk_note_scan_progress(pgdat, sc->nr_scanned - nr_scanned,
+					    sc->nr_reclaimed - nr_reclaimed);
 
 	} while (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
 					 sc->nr_scanned - nr_scanned, sc));

@@ -15,6 +15,7 @@
 #include <linux/dax.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/psr_lmk.h>
 
 /*
  *		Double CLOCK lists
@@ -304,6 +305,17 @@ void workingset_refault(struct page *page, void *shadow)
 	refault_distance = (refault - eviction) & EVICTION_MASK;
 
 	inc_lruvec_state(lruvec, WORKINGSET_REFAULT);
+
+	/*
+	 * Raw refault signal for PSR-LMK, reported before the kernel's
+	 * own "was this actionable" distance filter below -- PSR-LMK
+	 * wants every refault, not just the ones the existing
+	 * workingset heuristic decides to act on. PageSwapCache(page)
+	 * splits real anon/swap thrash (what "protected-swap
+	 * regression" means) from ordinary file-cache churn.
+	 */
+	psr_lmk_note_refault(page, PageSwapCache(page), refault_distance,
+			      active_file);
 
 	/*
 	 * Compare the distance to the existing workingset size. We

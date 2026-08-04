@@ -69,6 +69,7 @@
 #include <linux/nmi.h>
 #include <linux/khugepaged.h>
 #include <linux/psi.h>
+#include <linux/psr_lmk.h>
 
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
@@ -4257,6 +4258,16 @@ retry:
 		drained = true;
 		goto retry;
 	}
+
+	/*
+	 * Direct reclaim ran (and the per-cpu/highatomic drain retry
+	 * already happened if it was going to help) and the allocation
+	 * is still failing -- the same "failed allocation stuck in the
+	 * slow path" signal simple_lmk uses to trigger killing, reused
+	 * here as a confirmation input for PSR-LMK.
+	 */
+	if (!page)
+		psr_lmk_note_alloc_failure(order, gfp_mask);
 
 	return page;
 }
