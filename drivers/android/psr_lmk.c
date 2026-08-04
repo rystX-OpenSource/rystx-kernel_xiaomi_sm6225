@@ -6,120 +6,160 @@
  * ------------------------------------------------------------------
  * A self-contained Android LMK driver. Inspired by le9uo's working-set
  * protection concept (anon_min_ratio/clean_min_ratio, enforced in
- * mm/vmscan.c via a core reclaim scan-balance rewrite), PSR-LMK
- * reuses the same class of signals -- swap-in trend, protected anon
- * ratio, protected clean-file ratio -- but keeps them out of the
- * reclaim path entirely: they're read-only inputs to an independent
- * kill decision here, and PSR-LMK acts by SIGKILLing a victim task
- * instead of rewriting LRU scan balance.
+ * mm/vmscan.c via a core reclaim scan-balance rewrite), PSR-LMK reuses
+ * the same class of signals -- swap-in trend, protected anon ratio,
+ * protected clean-file ratio -- but keeps them out of the reclaim path
+ * entirely: they're read-only inputs to an independent kill decision
+ * here, and PSR-LMK acts by SIGKILLing a victim task instead of
+ * rewriting LRU scan balance.
  *
- * Design rationale for keeping this separate from vmscan.c:
- *   - Stays out-of-tree friendly: builds against any kernel exposing
- *     node_page_state()/si_meminfo(), no core mm patch to carry
- *     across kernel version bumps.
- *   - Keeps blast radius contained to "pick a victim, kill it" --
- *     the same operational model as the existing Android LMKD, just
- *     with an earlier, regression-aware trigger.
- *   - The ratio knobs are reused as *confirmation signals*, not
- *     enforcement levers: they change whether we treat a swap-in
- *     trend as "real pressure worth killing over" vs "noise",
- *     rather than changing what the reclaimer scans.
+ * Threading model
+ * ---------------
+ * Everything expensive runs on a dedicated RT kthread (psr_lmkd), woken
+ * by the *global* vmpressure notifier chain -- the same trigger
+ * simple_lmk used, and the one that works regardless of CONFIG_MEMCG.
+ * Nothing in a reclaim path ever walks the task list, takes a mutex,
+ * reads a clock, or sends a signal.
  *
- * Hook points (see the companion mm/*.c patch and include/linux/psr_lmk.h):
- *   - mm/vmpressure.c's vmpressure_work_fn() -- primary trigger and
- *     the only call site that runs the actual kill decision, since
- *     it's the one guaranteed-sleepable context among all the hooks.
- *   - mm/swap.c, mm/vmscan.c, mm/workingset.c, mm/page_alloc.c --
- *     lightweight atomic-counter corroboration signals only; see
- *     psr_lmk_note_*() below for why they can't safely do more than
- *     that from their (often atomic) call sites.
+ * The mm hooks (mm/swap.c, mm/workingset.c, mm/page_alloc.c) are
+ * per-CPU counter bumps behind a static key: patched-out NOPs until the
+ * driver is up, and a single non-atomic per-CPU increment afterwards.
+ * They contribute no shared cachelines to the reclaim path.
+ *
+ * kernel/fork.c's __mmput() reports when a victim's address space is
+ * actually gone, which is what releases the pending-kill gate. That is
+ * the only reliable "the memory came back" signal available; a timeout
+ * alone either fires too early (overkill) or too late (under-kill).
  */
 
-#include <linux/module.h>
-#include <linux/moduleparam.h>
+#define pr_fmt(fmt) "psr_lmk: " fmt
+
+#include <linux/atomic.h>
+#include <linux/cpumask.h>
+#include <linux/freezer.h>
+#include <linux/jump_label.h>
 #include <linux/kernel.h>
-#include <linux/sched.h>
-#include <linux/sched/signal.h>
-#include <linux/sched/task.h>
-#include <linux/sched/cputime.h>
+#include <linux/kthread.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
-#include <linux/swap.h>
-#include <linux/vmpressure.h>
-#include <linux/shrinker.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/notifier.h>
 #include <linux/oom.h>
+#include <linux/percpu.h>
 #include <linux/proc_fs.h>
+#include <linux/psr_lmk.h>
+#include <linux/sched.h>
+#include <linux/sched/coredump.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 #include <linux/seq_file.h>
-#include <linux/uaccess.h>
-#include <linux/ktime.h>
-#include <linux/rculist.h>
-#include <linux/mutex.h>
+#include <linux/signal.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/psr_lmk.h>
-#include <linux/atomic.h>
+#include <linux/swap.h>
+#include <linux/vmpressure.h>
+#include <linux/wait.h>
+#include <uapi/linux/sched/types.h>
 
-/*
- * Counters bumped by the five hooks that can fire from atomic /
- * spinlock-held contexts deep in reclaim (mm/swap.c's
- * __activate_page, mm/vmscan.c's shrink_node, mm/workingset.c's
- * workingset_refault, mm/page_alloc.c's direct-reclaim slow path).
- * They only ever do an atomic_inc/add -- no locking, no sleeping, no
- * task-list walk -- because those call sites cannot safely do more
- * than that. psr_lmk_note_pressure() (fired from vmpressure's
- * workqueue, which is real process context) drains and interprets
- * them each cycle; see the big comment on that function below.
- */
-static atomic_t      psr_stat_anon_reactivations = ATOMIC_INIT(0);
-static atomic_t      psr_stat_alloc_failures     = ATOMIC_INIT(0);
-static atomic_t      psr_stat_swap_refaults      = ATOMIC_INIT(0);
-static atomic_t      psr_stat_file_refaults      = ATOMIC_INIT(0);
-static atomic_long_t psr_stat_scan_sum           = ATOMIC_LONG_INIT(0);
-static atomic_long_t psr_stat_reclaimed_sum      = ATOMIC_LONG_INIT(0);
-
-#define PSR_LMK_NAME "psr_lmk"
 #define PSR_LMK_WINDOW 8
 
+DEFINE_STATIC_KEY_FALSE(psr_lmk_key);
+EXPORT_SYMBOL_GPL(psr_lmk_key);
+
 /* ------------------------------------------------------------------
- * Tunables (exposed under /proc/psr_lmk/*)
+ * Hook counters.
  *
- * reserved_swap_floor_kb  - hard floor on free swap (KB); breach is
- *                            an automatic bypass trigger regardless
- *                            of trend.
- * anon_min_ratio          - percent of node memory below which anon
- *                            pages are considered already-starved.
- *                            Mirrors le9uo's vm.anon_min_ratio
- *                            semantics, but consulted as a signal
- *                            here, not enforced against the LRU.
- * clean_min_ratio         - percent of node memory below which clean
- *                            file pages are considered starved.
- *                            Mirrors le9uo's vm.clean_min_ratio.
- * regression_slope_thresh - swap-in rate trend (pages/sec per
- *                            sample) above which we call it a
- *                            regression.
- * thrash_hard_limit       - absolute swap-in rate (pages/sec) that
- *                            triggers bypass regardless of slope.
+ * Per-CPU and non-atomic on purpose. The previous revision used shared
+ * atomic_t counters bumped from __activate_page() and
+ * workingset_refault(); on an 8-core phone under any UI scroll that is a
+ * globally-contended cacheline taking a LOCK-prefixed RMW from every CPU
+ * on every reactivation and every refault, inside the LRU lock. That
+ * alone is enough to produce the frame drops this driver was reported to
+ * cause, and it produced them whether or not memory was actually tight.
+ *
+ * These are statistics feeding a threshold comparison, so a lost
+ * increment from a preemption race is irrelevant -- accuracy here is
+ * worth nothing and contention costs everything.
+ * ------------------------------------------------------------------ */
+struct psr_counters {
+	unsigned long anon_reactivations;
+	unsigned long alloc_failures;
+	unsigned long swap_refaults;
+	unsigned long file_refaults;
+};
+
+static DEFINE_PER_CPU(struct psr_counters, psr_counters);
+
+void __psr_lmk_note_anon_reactivation(void)
+{
+	raw_cpu_inc(psr_counters.anon_reactivations);
+}
+EXPORT_SYMBOL_GPL(__psr_lmk_note_anon_reactivation);
+
+void __psr_lmk_note_refault(bool is_swap)
+{
+	if (is_swap)
+		raw_cpu_inc(psr_counters.swap_refaults);
+	else
+		raw_cpu_inc(psr_counters.file_refaults);
+}
+EXPORT_SYMBOL_GPL(__psr_lmk_note_refault);
+
+void __psr_lmk_note_alloc_failure(void)
+{
+	raw_cpu_inc(psr_counters.alloc_failures);
+}
+EXPORT_SYMBOL_GPL(__psr_lmk_note_alloc_failure);
+
+/* Drain every CPU's counters into @out and reset them. Called only from
+ * the psr_lmkd kthread, once per pressure event. */
+static void psr_drain_counters(struct psr_counters *out)
+{
+	int cpu;
+
+	memset(out, 0, sizeof(*out));
+
+	for_each_possible_cpu(cpu) {
+		struct psr_counters *c = per_cpu_ptr(&psr_counters, cpu);
+
+		out->anon_reactivations += xchg(&c->anon_reactivations, 0);
+		out->alloc_failures     += xchg(&c->alloc_failures, 0);
+		out->swap_refaults      += xchg(&c->swap_refaults, 0);
+		out->file_refaults      += xchg(&c->file_refaults, 0);
+	}
+}
+
+/* ------------------------------------------------------------------
+ * Tunables (module params; live view in /proc/psr_lmk/status)
+ *
+ * reserved_swap_floor_kb  - hard floor on free swap (KB); breach is an
+ *                            automatic trigger regardless of trend.
+ * anon_min_ratio          - percent of memory below which anon pages are
+ *                            considered already-starved. Mirrors le9uo's
+ *                            vm.anon_min_ratio semantics, consulted as a
+ *                            signal here, not enforced against the LRU.
+ * clean_min_ratio         - percent of memory below which clean file
+ *                            pages are considered starved. Mirrors
+ *                            le9uo's vm.clean_min_ratio.
+ * regression_slope_thresh - pressure trend (per sample) above which we
+ *                            call it a regression.
+ * thrash_hard_limit       - absolute vmpressure level (0-100) that
+ *                            triggers regardless of slope.
  * min_oom_score_adj       - only consider victims at/above this
  *                            oom_score_adj (background-ish tasks).
- * dry_run                 - if 1, log the decision but do not send
- *                            SIGKILL. Default 1; flip explicitly.
+ * dry_run                 - if 1, log the decision but do not SIGKILL.
  * ------------------------------------------------------------------ */
-static unsigned long reserved_swap_floor_kb = 64UL * 1024;
-static unsigned int  anon_min_ratio         = 15;   /* percent */
-static unsigned int  clean_min_ratio        = 15;   /* percent */
-static unsigned int  regression_slope_thresh = 50;  /* pages/s trend */
-static unsigned int  thrash_hard_limit      = 500;  /* pages/s */
-static int           min_oom_score_adj      = 200;
-static int           escalated_min_oom_score_adj = 100; /* wider victim
-				pool once clean_below_min escalates, concept
-				from prlmk's aggressive-mode file threshold */
-static unsigned int  usage_time_weight_pct  = 30;   /* how much accumulated
-				CPU time (stime+utime) discounts a victim's
-				kill score, 0-100; concept from prlmk's
-				stime+utime victim sort -- protects apps
-				you're actively using over idle ones with
-				similar oom_score_adj/RSS */
-static int           dry_run                = 1;
+static unsigned long reserved_swap_floor_kb  = 64UL * 1024;
+static unsigned int  anon_min_ratio          = 15;  /* percent */
+static unsigned int  clean_min_ratio         = 15;  /* percent */
+static unsigned int  regression_slope_thresh = 50;
+static unsigned int  thrash_hard_limit       = 90;  /* vmpressure 0-100 */
+static int           min_oom_score_adj       = 200;
+static int           escalated_min_oom_score_adj = 100;
+static unsigned int  usage_time_weight_pct   = 30;
+static int           dry_run                 = 1;
 
 module_param(reserved_swap_floor_kb, ulong, 0644);
 module_param(anon_min_ratio, uint, 0644);
@@ -131,107 +171,34 @@ module_param(escalated_min_oom_score_adj, int, 0644);
 module_param(usage_time_weight_pct, uint, 0644);
 module_param(dry_run, int, 0644);
 
-/* ------------------------------------------------------------------
- * Optional PSI corroboration.
- *
- * PSR-LMK's primary signal is mm/vmpressure.c's scanned/reclaimed
- * ratio (CONFIG_MEMCG only -- always available, what everything
- * above this block already uses). PSI, when the kernel has it, is a
- * genuinely better pressure signal: it measures actual task stall
- * time instead of inferring pressure from reclaim efficiency, which
- * is known to under-report thrashing that's still "succeeding" often
- * enough to look efficient. This block adds PSI as one more
- * corroborating input alongside the existing ones (reactivations,
- * refaults, ratio floors) -- it never replaces the vmpressure trigger
- * and has zero effect (dead code, compiled out) when CONFIG_PSI=n.
- *
- * VERIFIED against the psi.c/psi_types.h you provided (previously
- * this read PSI via a hand-built seq_file into psi_show(), which
- * worked but was needlessly roundabout -- replaced with a direct
- * read now that the actual struct layout and fixed-point macros are
- * confirmed):
- *
- *   - group->avg[state][window] is indexed as `res * 2 + full`,
- *     confirmed directly from psi_show()'s own indexing
- *     (psi.c:1035, "avg[w] = group->avg[res * 2 + full][w]").
- *     PSI_MEM "some" is therefore index PSI_MEM * 2 + 0.
- *     window index 0 = avg10, 1 = avg60, 2 = avg300 (psi.c:307-309).
- *   - The fixed-point encoding is calc_load()'s (psi.c #includes
- *     <linux/sched/loadavg.h> and reuses LOAD_INT/LOAD_FRAC/FIXED_1,
- *     the same macros CPU loadavg has used for decades) -- this is
- *     about as stable a kernel ABI as exists, not PSI-specific.
- *   - No locking taken on the read: avg[] is refreshed by
- *     psi_avgs_work every PSI_FREQ (2s, psi.c:176/456) independent
- *     of any reader, kicked off by real task-state transitions
- *     (psi.c:859-860) -- so this isn't dependent on something else
- *     polling psi_show()/psi_system elsewhere first. avgs_lock in
- *     psi_show() only protects the recompute-if-stale step; a bare
- *     unlocked read of the current value is fine for a threshold
- *     comparison that tolerates a couple seconds of staleness.
- *   - psi_disabled is checked first (mirrors psi_show()'s own guard)
- *     since PSI can be compiled in but turned off at boot via the
- *     `psi=0` cmdline param.
- * ------------------------------------------------------------------ */
-#if IS_ENABLED(CONFIG_PSI)
-#include <linux/psi.h>
-#include <linux/sched/loadavg.h>
+/*
+ * Pressure level at which the global vmpressure notifier wakes us. The
+ * notifier fires on every vmpressure window, which under normal UI use
+ * is often -- so the callback itself must stay trivial and the wakeup
+ * must be rare. simple_lmk used 98; 95 is slightly earlier while still
+ * meaning "reclaim is barely returning anything".
+ */
+static unsigned int wakeup_pressure = 95;
+module_param(wakeup_pressure, uint, 0644);
 
-static unsigned int psi_avg10_thresh = 20; /* percent; corroboration only */
-module_param(psi_avg10_thresh, uint, 0644);
-
-static inline unsigned int psi_avg10_thresh_or_zero(void)
-{
-	return psi_avg10_thresh;
-}
-
-static unsigned long psr_lmk_read_psi_mem_avg10(void)
-{
-	unsigned long avg10_raw;
-
-	if (static_branch_likely(&psi_disabled))
-		return 0;
-
-	avg10_raw = psi_system.avg[PSI_MEM * 2 + 0][0];
-
-	return LOAD_INT(avg10_raw);
-}
-#else
-static inline unsigned long psr_lmk_read_psi_mem_avg10(void)
-{
-	return 0;
-}
-
-static inline unsigned int psi_avg10_thresh_or_zero(void)
-{
-	return 0;
-}
-#endif /* CONFIG_PSI */
+/*
+ * Floor on how often the kthread will do real work, in ms. The notifier
+ * can fire far faster than a kill can possibly help; without this, a
+ * sustained pressure event would have us re-walking the task list
+ * continuously, which is exactly the kind of background CPU burn that
+ * shows up as UI jank.
+ */
+static unsigned int min_eval_interval_ms = 100;
+module_param(min_eval_interval_ms, uint, 0644);
 
 /* ------------------------------------------------------------------
- * Auto-tuning profiles, applied once at driver init based on total
- * device RAM. Expression style for reading total RAM is borrowed
- * from prlmk's own RAM-based minfree/timeout auto-detection
- * (see darkhz/prlmk), extended here across PSR-LMK's full tunable
- * set instead of just two values, and split into three tiers.
+ * Auto-tuning profiles, applied once at init based on total device RAM.
+ * Concept borrowed from prlmk's RAM-based auto-detection, extended
+ * across PSR-LMK's full tunable set and split into three tiers.
  *
- * Boundaries (tune via the module params below, read-only after
- * driver load since they only take effect during init):
- *   total_mb <= psr_lmk_ram_tier_low_mb  -> LOW  ("3-4GB" budget)
- *   total_mb <= psr_lmk_ram_tier_mid_mb  -> MID  ("6-8GB" mainstream)
- *   total_mb  > psr_lmk_ram_tier_mid_mb  -> HIGH ("12GB+" flagship)
- *
- * The 4-6GB gap rounds down into MID; the 8-12GB gap rounds up into
- * HIGH. If you want a true 4th tier instead of that rounding, add
- * another boundary + profile struct rather than fighting these two.
- *
- * Direction of the tuning, mirroring the "less RAM = protect harder,
- * kill sooner" logic in the reference snippet: LOW has the smallest
- * absolute swap floor but the *tightest* (most sensitive) regression
- * thresholds and the widest victim pool (lowest min_oom_score_adj),
- * since a low-RAM device has the least headroom to lose. HIGH is the
- * opposite: loosest thresholds, narrowest victim pool, because a
- * flagship device with tons of RAM shouldn't be killing background
- * apps on thresholds tuned for a budget phone.
+ * Direction: less RAM = protect harder, kill sooner. LOW has the
+ * smallest absolute swap floor but the tightest thresholds and the
+ * widest victim pool; HIGH is the opposite.
  * ------------------------------------------------------------------ */
 static unsigned int psr_lmk_ram_tier_low_mb = 4096;
 static unsigned int psr_lmk_ram_tier_mid_mb = 8192;
@@ -254,58 +221,56 @@ struct psr_lmk_profile {
 };
 
 static const struct psr_lmk_profile psr_lmk_profile_low = {
-	.name                         = "3-4GB",
-	.reserved_swap_floor_kb       = 32UL * 1024,
-	.anon_min_ratio               = 10,
-	.clean_min_ratio              = 10,
-	.regression_slope_thresh      = 30,
-	.thrash_hard_limit            = 300,
-	.min_oom_score_adj            = 150,
-	.escalated_min_oom_score_adj  = 50,
-	.usage_time_weight_pct        = 20,
+	.name                        = "3-4GB",
+	.reserved_swap_floor_kb      = 32UL * 1024,
+	.anon_min_ratio              = 10,
+	.clean_min_ratio             = 10,
+	.regression_slope_thresh     = 30,
+	.thrash_hard_limit           = 85,
+	.min_oom_score_adj           = 150,
+	.escalated_min_oom_score_adj = 50,
+	.usage_time_weight_pct       = 20,
 };
 
 static const struct psr_lmk_profile psr_lmk_profile_mid = {
-	.name                         = "6-8GB",
-	.reserved_swap_floor_kb       = 64UL * 1024,
-	.anon_min_ratio               = 15,
-	.clean_min_ratio              = 15,
-	.regression_slope_thresh      = 50,
-	.thrash_hard_limit            = 500,
-	.min_oom_score_adj            = 200,
-	.escalated_min_oom_score_adj  = 100,
-	.usage_time_weight_pct        = 30,
+	.name                        = "6-8GB",
+	.reserved_swap_floor_kb      = 64UL * 1024,
+	.anon_min_ratio              = 15,
+	.clean_min_ratio             = 15,
+	.regression_slope_thresh     = 50,
+	.thrash_hard_limit           = 90,
+	.min_oom_score_adj           = 200,
+	.escalated_min_oom_score_adj = 100,
+	.usage_time_weight_pct       = 30,
 };
 
 static const struct psr_lmk_profile psr_lmk_profile_high = {
-	.name                         = "12GB+",
-	.reserved_swap_floor_kb       = 128UL * 1024,
-	.anon_min_ratio               = 20,
-	.clean_min_ratio              = 20,
-	.regression_slope_thresh      = 80,
-	.thrash_hard_limit            = 800,
-	.min_oom_score_adj            = 300,
-	.escalated_min_oom_score_adj  = 150,
-	.usage_time_weight_pct        = 40,
+	.name                        = "12GB+",
+	.reserved_swap_floor_kb      = 128UL * 1024,
+	.anon_min_ratio              = 20,
+	.clean_min_ratio             = 20,
+	.regression_slope_thresh     = 80,
+	.thrash_hard_limit           = 95,
+	.min_oom_score_adj           = 300,
+	.escalated_min_oom_score_adj = 150,
+	.usage_time_weight_pct       = 40,
 };
 
 static const char *psr_lmk_active_profile = "unset";
 
-static void __init psr_lmk_auto_tune(void)
+static void psr_lmk_auto_tune(void)
 {
 	const struct psr_lmk_profile *profile;
 	unsigned long total_mb;
 
 	if (!auto_tune) {
-		pr_info(PSR_LMK_NAME ": auto_tune=0, using compiled-in/cmdline module param defaults\n");
+		pr_info("auto_tune=0, using module param defaults\n");
 		return;
 	}
 
-	/*
-	 * NOTE: totalram_pages is a plain global on kernels before the
-	 * atomic-counter conversion; if your tree already converted it,
-	 * change this to totalram_pages() (function call) instead.
-	 */
+	/* totalram_pages is a plain global in this tree (include/linux/mm.h);
+	 * on trees that converted it to an atomic counter this becomes
+	 * totalram_pages(). */
 	total_mb = totalram_pages >> (20 - PAGE_SHIFT);
 
 	if (total_mb <= psr_lmk_ram_tier_low_mb)
@@ -325,147 +290,103 @@ static void __init psr_lmk_auto_tune(void)
 	usage_time_weight_pct       = profile->usage_time_weight_pct;
 	psr_lmk_active_profile      = profile->name;
 
-	pr_info_once(PSR_LMK_NAME ": detected %lu MB RAM, applying \"%s\" profile "
-		     "(swap_floor=%luKB anon_min=%u%% clean_min=%u%% "
-		     "slope_thresh=%u thrash_hard=%u min_adj=%d "
-		     "escalated_adj=%d usage_weight=%u%%)\n",
-		     total_mb, profile->name,
-		     reserved_swap_floor_kb, anon_min_ratio, clean_min_ratio,
-		     regression_slope_thresh, thrash_hard_limit,
-		     min_oom_score_adj, escalated_min_oom_score_adj,
-		     usage_time_weight_pct);
+	pr_info("detected %lu MB RAM, applying \"%s\" profile (swap_floor=%luKB anon_min=%u%% clean_min=%u%% slope=%u hard=%u min_adj=%d esc_adj=%d usage_weight=%u%%)\n",
+		total_mb, profile->name, reserved_swap_floor_kb,
+		anon_min_ratio, clean_min_ratio, regression_slope_thresh,
+		thrash_hard_limit, min_oom_score_adj,
+		escalated_min_oom_score_adj, usage_time_weight_pct);
 }
 
 /* ------------------------------------------------------------------
- * Regression engine state
+ * Regression engine state.
+ *
+ * Only ever touched by the psr_lmkd kthread, so it needs no lock at all.
+ * The previous revision took a mutex here from what it believed was
+ * process context; it is now single-threaded by construction.
  * ------------------------------------------------------------------ */
-struct psr_sample {
-	u64 pswpin;
-	ktime_t t;
-};
-
 static struct {
-	unsigned long rate_window[PSR_LMK_WINDOW];
+	unsigned long window[PSR_LMK_WINDOW];
 	int head;
 	int count;
-	struct psr_sample last;
-	struct mutex lock;
 } psr_engine;
 
-static void psr_engine_init(void)
-{
-	memset(&psr_engine, 0, sizeof(psr_engine));
-	mutex_init(&psr_engine.lock);
-}
-
-/* Push a new swap-in rate sample (pages/sec), return current slope
- * via simple least-squares fit over the sliding window. */
+/*
+ * Push a pressure sample and return the least-squares slope over the
+ * sliding window.
+ *
+ * Two bugs are fixed relative to the previous revision:
+ *
+ *  - It read the window in array order rather than chronological order,
+ *    so once the ring wrapped, the x-axis no longer corresponded to
+ *    time. The slope past the first 8 samples was fitted against
+ *    shuffled data, i.e. noise.
+ *
+ *  - It computed mean_x/mean_y with integer division and then used them
+ *    in the centred-sums formula, which is only valid for exact means.
+ *    With n=8 and rounded means, the truncation error is applied n
+ *    times over and lands directly in the numerator.
+ *
+ * Both are avoided by scaling the centred sums by n instead of dividing:
+ * for x = 0..n-1 this is exact integer arithmetic. Sizes are tiny
+ * (n <= 8, y <= 100), so nothing here can overflow a long.
+ */
 static long psr_push_sample_and_slope(unsigned long rate)
 {
-	int n, i;
 	long sum_x = 0, sum_y = 0, sum_xy = 0, sum_xx = 0;
-	long mean_x, mean_y, num, den, slope;
+	long num, den;
+	int n, i, idx;
 
-	mutex_lock(&psr_engine.lock);
-	psr_engine.rate_window[psr_engine.head] = rate;
+	psr_engine.window[psr_engine.head] = rate;
 	psr_engine.head = (psr_engine.head + 1) % PSR_LMK_WINDOW;
 	if (psr_engine.count < PSR_LMK_WINDOW)
 		psr_engine.count++;
 
 	n = psr_engine.count;
-	if (n < 2) {
-		mutex_unlock(&psr_engine.lock);
+	if (n < 2)
 		return 0;
-	}
 
+	/* Walk oldest -> newest. head points one past the newest sample,
+	 * so the oldest is head - count (mod window). */
+	idx = (psr_engine.head - n + PSR_LMK_WINDOW) % PSR_LMK_WINDOW;
 	for (i = 0; i < n; i++) {
-		long y = psr_engine.rate_window[i];
+		long y = psr_engine.window[idx];
 
-		sum_x += i;
-		sum_y += y;
+		sum_x  += i;
+		sum_y  += y;
 		sum_xy += (long)i * y;
 		sum_xx += (long)i * i;
-	}
-	mutex_unlock(&psr_engine.lock);
 
-	mean_x = sum_x / n;
-	mean_y = sum_y / n;
-	num = sum_xy - n * mean_x * mean_y;
-	den = sum_xx - n * mean_x * mean_x;
-	slope = den ? (num / den) : 0;
-	return slope;
+		idx = (idx + 1) % PSR_LMK_WINDOW;
+	}
+
+	/* n * (Sxy - n*mean_x*mean_y) and n * (Sxx - n*mean_x^2), which
+	 * share the factor n and so cancel in the ratio. */
+	num = (long)n * sum_xy - sum_x * sum_y;
+	den = (long)n * sum_xx - sum_x * sum_x;
+
+	return den ? num / den : 0;
 }
 
 /* ------------------------------------------------------------------
- * Ratio-based confirmation signals (concept borrowed from le9uo's
- * anon_min_ratio / clean_min_ratio; enforcement differs -- read-only
- * here, used to qualify whether a swap-in trend is worth acting on)
+ * Ratio-based confirmation signals (concept from le9uo's
+ * anon_min_ratio / clean_min_ratio; read-only here, used to qualify
+ * whether a pressure trend is worth acting on)
  * ------------------------------------------------------------------ */
 struct psr_node_state {
 	bool anon_below_min;
 	bool clean_below_min;
 	bool swap_floor_breached;
-	bool escalated;        /* clean_below_min crossed -> aggressive mode,
-				 * concept borrowed from prlmk's free_file_limit
-				 * two-tier severity */
-	unsigned long swap_in_rate;
+	bool escalated;
+	unsigned long pressure;
 };
-
-/* Tracks whether the last dispatched kill has actually been reaped yet,
- * so we don't fire a second SIGKILL before the first one relieved any
- * pressure -- borrowed from simple_lmk's "wait for victim's memory to
- * be freed before killing more" behavior. */
-static struct {
-	pid_t pending_victim_pid;
-	ktime_t dispatched_at;
-} psr_kill_state;
-
-#define PSR_KILL_GRACE_MS 200  /* max time to wait for a pending kill
-				 * to be reaped before considering the
-				 * slot free again */
-
-static bool psr_kill_in_flight(void)
-{
-	struct task_struct *t;
-	bool alive = false;
-
-	if (!psr_kill_state.pending_victim_pid)
-		return false;
-
-	if (ktime_ms_delta(ktime_get(), psr_kill_state.dispatched_at) >
-	    PSR_KILL_GRACE_MS) {
-		/* Timed out waiting -- stop blocking further kills, but
-		 * log it since a stuck reap usually means something else
-		 * is wrong (e.g. victim stuck in D-state). */
-		pr_warn(PSR_LMK_NAME ": pid=%d not reaped within %dms, unblocking\n",
-			psr_kill_state.pending_victim_pid, PSR_KILL_GRACE_MS);
-		psr_kill_state.pending_victim_pid = 0;
-		return false;
-	}
-
-	rcu_read_lock();
-	t = find_task_by_vpid(psr_kill_state.pending_victim_pid);
-	if (t)
-		alive = true;
-	rcu_read_unlock();
-
-	if (!alive)
-		psr_kill_state.pending_victim_pid = 0;
-
-	return alive;
-}
 
 static void psr_compute_node_state(struct psr_node_state *st)
 {
-	struct sysinfo si;
-	unsigned long node_total_kb;
-	unsigned long anon_kb, file_kb, dirty_kb, clean_kb;
-	unsigned long anon_floor_kb, clean_floor_kb;
+	pg_data_t *pgdat = NODE_DATA(first_online_node);
+	unsigned long total_kb, anon_kb, file_kb, dirty_kb, clean_kb;
 	unsigned long free_swap_kb;
-	pg_data_t *pgdat = NODE_DATA(numa_node_id());
 
-	si_meminfo(&si);
-	node_total_kb = si.totalram << (PAGE_SHIFT - 10);
+	total_kb = totalram_pages << (PAGE_SHIFT - 10);
 
 	anon_kb = (node_page_state(pgdat, NR_ACTIVE_ANON) +
 		   node_page_state(pgdat, NR_INACTIVE_ANON)) << (PAGE_SHIFT - 10);
@@ -475,273 +396,379 @@ static void psr_compute_node_state(struct psr_node_state *st)
 	dirty_kb = node_page_state(pgdat, NR_FILE_DIRTY) << (PAGE_SHIFT - 10);
 	clean_kb = (file_kb > dirty_kb) ? (file_kb - dirty_kb) : 0;
 
-	anon_floor_kb  = node_total_kb * anon_min_ratio  / 100;
-	clean_floor_kb = node_total_kb * clean_min_ratio / 100;
+	st->anon_below_min  = anon_kb  < total_kb * anon_min_ratio  / 100;
+	st->clean_below_min = clean_kb < total_kb * clean_min_ratio / 100;
 
-	st->anon_below_min  = anon_kb  < anon_floor_kb;
-	st->clean_below_min = clean_kb < clean_floor_kb;
+	/*
+	 * get_nr_swap_pages() instead of si_meminfo()'s freeswap: same
+	 * number, without walking every swap device under swap_lock. It
+	 * returns 0 with CONFIG_SWAP=n, in which case a swap floor is
+	 * meaningless -- don't let that read as permanently breached.
+	 */
+	free_swap_kb = (unsigned long)get_nr_swap_pages() << (PAGE_SHIFT - 10);
+	st->swap_floor_breached = total_swap_pages &&
+				  free_swap_kb < reserved_swap_floor_kb;
 
-	free_swap_kb = si.freeswap << (PAGE_SHIFT - 10);
-	st->swap_floor_breached = free_swap_kb < reserved_swap_floor_kb;
-
-	/* Escalation tier, concept borrowed from prlmk: crossing the
-	 * clean-file floor is treated as a harder signal than swap-in
-	 * trend alone -- widen the victim pool in psr_select_victim(). */
+	/* Escalation tier, concept from prlmk: crossing the clean-file
+	 * floor is a harder signal than trend alone -- widen the victim
+	 * pool in psr_select_victim(). */
 	st->escalated = st->clean_below_min;
 }
 
 /* ------------------------------------------------------------------
+ * Pending-kill gate.
+ *
+ * Don't dispatch a second kill until the previous victim's memory has
+ * actually come back -- concept from simple_lmk. The mm is reported
+ * released by psr_lmk_mm_freed() from __mmput(); the timeout is only a
+ * backstop for a victim wedged in D-state.
+ *
+ * The previous revision polled find_task_by_vpid() on a raw pid and gave
+ * up after a fixed 200ms. Two problems: a pid can be recycled onto an
+ * unrelated new task within that window (so the gate would keep blocking
+ * on a stranger), and task exit is not the same event as memory being
+ * freed -- the mm can outlive the task struct. Holding an mm reference
+ * and waiting for __mmput() removes both.
+ * ------------------------------------------------------------------ */
+static struct mm_struct *psr_victim_mm;	/* kthread-owned, holds mmgrab ref */
+static unsigned long psr_victim_deadline;
+static atomic_t psr_victim_freed = ATOMIC_INIT(0);
+
+#define PSR_KILL_TIMEOUT_MS 2000
+
+void __psr_lmk_mm_freed(struct mm_struct *mm)
+{
+	/*
+	 * Called from __mmput() for every dying address space. Reading
+	 * psr_victim_mm unlocked is fine: it is only ever written by the
+	 * kthread, and a stale read can only make us miss a match, which
+	 * degrades to the timeout path. Comparing pointers -- not pids --
+	 * so a recycled pid can never produce a false match.
+	 */
+	if (READ_ONCE(psr_victim_mm) == mm)
+		atomic_set(&psr_victim_freed, 1);
+}
+EXPORT_SYMBOL_GPL(__psr_lmk_mm_freed);
+
+static bool psr_kill_in_flight(void)
+{
+	if (!psr_victim_mm)
+		return false;
+
+	if (atomic_read(&psr_victim_freed))
+		goto release;
+
+	if (time_after(jiffies, psr_victim_deadline)) {
+		pr_warn("victim mm not released within %dms, unblocking\n",
+			PSR_KILL_TIMEOUT_MS);
+		goto release;
+	}
+
+	return true;
+
+release:
+	mmdrop(psr_victim_mm);
+	WRITE_ONCE(psr_victim_mm, NULL);
+	atomic_set(&psr_victim_freed, 0);
+	return false;
+}
+
+/* ------------------------------------------------------------------
  * Victim selection: highest oom_score_adj, tie-broken by largest RSS,
- * discounted by accumulated CPU time (stime+utime) -- an app you've
- * actively used gets a lower kill score than an idle one at the same
- * oom_score_adj/RSS, concept borrowed from prlmk's stime+utime sort.
+ * discounted by accumulated CPU time -- an app you've actively used
+ * scores lower than an idle one at the same oom_score_adj/RSS (concept
+ * from prlmk's stime+utime sort).
  *
- * Also skips tasks whose anon footprint is what's already protected
- * by anon_below_min -- killing an anon-heavy task when anon is
- * already starved doesn't relieve the actual pressure source
- * (file/swap).
+ * Fixes relative to the previous revision, which had three bugs that
+ * would each have produced a wrong or fatal outcome:
  *
- * When st->escalated is set (clean-file floor breached), the victim
- * pool widens to escalated_min_oom_score_adj instead of
- * min_oom_score_adj -- concept borrowed from prlmk's aggressive mode
- * once free_file_limit is crossed.
+ *  1. It returned the winning task_struct but had called task_unlock()
+ *     on it inside the loop and only did get_task_struct() at the very
+ *     end -- the winner was unreferenced for the rest of the walk, so it
+ *     could be freed underneath us. Now the reference is taken at the
+ *     moment the task becomes the leader, and the previous leader's is
+ *     dropped.
+ *
+ *  2. thread_group_cputime() walks every thread in the group and takes
+ *     siglock. Running that for *every* process on every evaluation is
+ *     both slow and a lock-ordering hazard under task_lock. Replaced
+ *     with the group's already-summed signal->stime/utime plus the
+ *     leader's own, which needs no walk and no extra lock.
+ *
+ *  3. It never skipped kthreads, dying tasks, or the global init
+ *     process. find_lock_task_mm() filters kthreads, but a task already
+ *     in the middle of exiting is a wasted kill, and current->mm-less
+ *     checks alone don't cover SIGNAL_GROUP_EXIT.
  * ------------------------------------------------------------------ */
 static struct task_struct *psr_select_victim(const struct psr_node_state *st)
 {
 	struct task_struct *p, *victim = NULL;
 	long best_score = LONG_MIN;
 	int score_floor = st->escalated ? escalated_min_oom_score_adj
-					 : min_oom_score_adj;
+					: min_oom_score_adj;
 
 	rcu_read_lock();
 	for_each_process(p) {
-		struct task_struct *t = find_lock_task_mm(p);
-		long score;
-		unsigned long rss_kb;
-		u64 cputime_ns;
-		unsigned long cputime_s;
+		struct signal_struct *sig = p->signal;
+		struct task_struct *t;
+		unsigned long rss_kb, cputime_s;
+		long score, adj;
 
+		/* Cheap filters first, before find_lock_task_mm() has to
+		 * take task_lock on anything. */
+		adj = READ_ONCE(sig->oom_score_adj);
+		if (adj < score_floor)
+			continue;
+
+		/* Already dying: killing it again frees nothing sooner. */
+		if (sig->flags & (SIGNAL_GROUP_EXIT | SIGNAL_GROUP_COREDUMP))
+			continue;
+		if (thread_group_empty(p) && (p->flags & PF_EXITING))
+			continue;
+
+		t = find_lock_task_mm(p);
 		if (!t)
 			continue;
 
-		if (t->signal->oom_score_adj < score_floor) {
+		if (unlikely(is_global_init(t))) {
 			task_unlock(t);
 			continue;
 		}
 
 		rss_kb = get_mm_rss(t->mm) << (PAGE_SHIFT - 10);
 
-		/* Accumulated CPU time as a proxy for "how much this app
-		 * has actually been used" -- thread_group_cputime() sums
-		 * stime+utime across the whole process, matching the
-		 * spirit of prlmk's per-task stime+utime accounting
-		 * without depending on CONFIG_TASK_XACCT/acct_timexpd,
-		 * which isn't enabled on every kernel config. */
-		{
-			struct task_cputime ct;
-
-			thread_group_cputime(t, &ct);
-			cputime_ns = ct.stime + ct.utime;
-		}
-		cputime_s = (unsigned long)(cputime_ns / NSEC_PER_SEC);
-
-		score = (long)t->signal->oom_score_adj * 1000 + (long)rss_kb;
-
-		if (st->anon_below_min)
-			score -= (long)rss_kb / 2; /* derate anon-heavy tasks */
-
-		/* Discount by usage time: heavily-used tasks are less
-		 * attractive victims even at equal oom_score_adj/RSS.
-		 * usage_time_weight_pct=0 disables this entirely. */
-		if (usage_time_weight_pct)
-			score -= (long)(cputime_s * usage_time_weight_pct) / 100;
+		/*
+		 * Accumulated CPU time as a proxy for "how much this app has
+		 * actually been used". signal->{s,u}time is the sum already
+		 * accrued by exited threads; adding the leader's own covers
+		 * the common single-heavy-thread case without walking the
+		 * group.
+		 */
+		cputime_s = (unsigned long)((sig->stime + sig->utime +
+					     t->stime + t->utime) / NSEC_PER_SEC);
 
 		task_unlock(t);
 
+		score = adj * 1000 + (long)rss_kb;
+
+		/* Killing an anon-heavy task when anon is already starved
+		 * doesn't relieve the actual pressure source. */
+		if (st->anon_below_min)
+			score -= (long)rss_kb / 2;
+
+		if (usage_time_weight_pct)
+			score -= (long)(cputime_s * usage_time_weight_pct) / 100;
+
 		if (score > best_score) {
-			best_score = score;
+			struct task_struct *old = victim;
+
+			/*
+			 * Pin the new leader before dropping the old one, so
+			 * the returned task is referenced continuously from
+			 * the moment it wins.
+			 */
+			get_task_struct(t);
 			victim = t;
+			best_score = score;
+			if (old)
+				put_task_struct(old);
 		}
 	}
-	if (victim)
-		get_task_struct(victim);
 	rcu_read_unlock();
 
 	return victim;
+}
+
+/*
+ * Dispatch the kill.
+ *
+ * Beyond plain send_sig(), this mirrors simple_lmk's acceleration: mark
+ * the mm as an OOM victim so exit_mmap() reaps anonymous memory first,
+ * force the signal past any blocking, thaw the task if it's frozen (a
+ * frozen task cannot act on a signal at all -- a real hang source in the
+ * previous revision, which would then have blocked every subsequent kill
+ * until its gate timed out), and briefly elevate the group to RT so the
+ * memory actually comes back promptly instead of whenever a background
+ * cgroup next gets scheduled.
+ */
+static void psr_kill_victim(struct task_struct *victim)
+{
+	static const struct sched_param rt_prio = { .sched_priority = 1 };
+	struct task_struct *t;
+	struct mm_struct *mm;
+
+	task_lock(victim);
+	mm = victim->mm;
+	if (!mm) {
+		task_unlock(victim);
+		return;
+	}
+	/* Keep the mm alive so the pending-kill gate can watch it, and so
+	 * __mmput()'s pointer comparison stays valid. */
+	mmgrab(mm);
+	set_bit(MMF_OOM_VICTIM, &mm->flags);
+	task_unlock(victim);
+
+	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, PIDTYPE_TGID);
+
+	rcu_read_lock();
+	for_each_thread(victim, t) {
+		set_tsk_thread_flag(t, TIF_MEMDIE);
+		sched_setscheduler_nocheck(t, SCHED_RR, &rt_prio);
+		/* Signals can't wake frozen tasks; only a thaw can. */
+		__thaw_task(t);
+	}
+	rcu_read_unlock();
+
+	/* Let it run anywhere so exit_mmap() isn't stuck behind a busy
+	 * little core. This doesn't schedule. */
+	set_cpus_allowed_ptr(victim, cpu_all_mask);
+
+	WRITE_ONCE(psr_victim_mm, mm);
+	atomic_set(&psr_victim_freed, 0);
+	psr_victim_deadline = jiffies + msecs_to_jiffies(PSR_KILL_TIMEOUT_MS);
 }
 
 static void psr_bypass_and_kill(const struct psr_node_state *st)
 {
 	struct task_struct *victim;
 
-	/* Don't dispatch a second kill while the last one hasn't been
-	 * reaped yet -- concept borrowed from simple_lmk, which waits
-	 * for a victim's memory to actually be freed before killing
-	 * more. Prevents overkill on a single sustained pressure event
-	 * where one kill would have been enough. */
-	if (psr_kill_in_flight()) {
-		pr_debug(PSR_LMK_NAME ": kill already in flight (pid=%d), skipping\n",
-			 psr_kill_state.pending_victim_pid);
-		return;
-	}
-
 	victim = psr_select_victim(st);
 	if (!victim) {
-		pr_info(PSR_LMK_NAME ": regression signaled, no eligible victim\n");
+		pr_info("regression signaled, no eligible victim\n");
 		return;
 	}
 
-	pr_warn(PSR_LMK_NAME ": BYPASS pid=%d comm=%s escalated=%d anon_below_min=%d clean_below_min=%d swap_floor_breached=%d swap_in_rate=%lu%s\n",
-		victim->pid, victim->comm, st->escalated,
-		st->anon_below_min, st->clean_below_min, st->swap_floor_breached,
-		st->swap_in_rate, dry_run ? " (dry-run)" : "");
+	pr_warn("BYPASS pid=%d comm=%s adj=%d escalated=%d anon_below_min=%d clean_below_min=%d swap_floor_breached=%d pressure=%lu%s\n",
+		victim->pid, victim->comm, victim->signal->oom_score_adj,
+		st->escalated, st->anon_below_min, st->clean_below_min,
+		st->swap_floor_breached, st->pressure,
+		dry_run ? " (dry-run)" : "");
 
-	if (!dry_run) {
-		send_sig(SIGKILL, victim, 1);
-		psr_kill_state.pending_victim_pid = victim->pid;
-		psr_kill_state.dispatched_at = ktime_get();
-	}
+	if (!dry_run)
+		psr_kill_victim(victim);
 
 	put_task_struct(victim);
 }
 
 /* ------------------------------------------------------------------
- * Hook implementations (declared in include/linux/psr_lmk.h, called
- * from the mm/*.c patch). Five of them are deliberately trivial --
- * see the counter block above for why. Only psr_lmk_note_pressure()
- * runs the actual regression check + victim selection + kill
- * dispatch, because it's the one call site (vmpressure_work_fn(),
- * invoked off a workqueue) that's guaranteed to be sleepable and
- * safe to walk the task list / send a signal from.
+ * The decision engine, running on the psr_lmkd kthread.
  * ------------------------------------------------------------------ */
-
-void psr_lmk_note_anon_reactivation(struct page *page)
+static void psr_evaluate(unsigned long pressure)
 {
-	atomic_inc(&psr_stat_anon_reactivations);
-}
-EXPORT_SYMBOL_GPL(psr_lmk_note_anon_reactivation);
-
-void psr_lmk_note_scan_progress(struct pglist_data *pgdat,
-				 unsigned long nr_scanned,
-				 unsigned long nr_reclaimed)
-{
-	atomic_long_add(nr_scanned, &psr_stat_scan_sum);
-	atomic_long_add(nr_reclaimed, &psr_stat_reclaimed_sum);
-}
-EXPORT_SYMBOL_GPL(psr_lmk_note_scan_progress);
-
-bool psr_lmk_should_abort_reclaim(void)
-{
-	return psr_kill_in_flight();
-}
-EXPORT_SYMBOL_GPL(psr_lmk_should_abort_reclaim);
-
-void psr_lmk_note_alloc_failure(unsigned int order, gfp_t gfp_mask)
-{
-	atomic_inc(&psr_stat_alloc_failures);
-}
-EXPORT_SYMBOL_GPL(psr_lmk_note_alloc_failure);
-
-void psr_lmk_note_refault(struct page *page, bool is_swap,
-			   unsigned long refault_distance,
-			   unsigned long active_size)
-{
-	if (is_swap)
-		atomic_inc(&psr_stat_swap_refaults);
-	else
-		atomic_inc(&psr_stat_file_refaults);
-}
-EXPORT_SYMBOL_GPL(psr_lmk_note_refault);
-
-/*
- * The real decision engine. Runs once per vmpressure work cycle
- * (typically driven by actual reclaim activity, so this is
- * naturally rate-limited -- it doesn't free-run on a timer). Uses
- * vmpressure's own scanned/reclaimed-derived pressure percentage as
- * the primary trend sample instead of the old userspace pswpin
- * polling, and drains the counters the other five hooks have been
- * accumulating since the last cycle as corroborating evidence.
- *
- * "Don't kill too aggressively, but don't keep an unused task around
- * as long as there's real free-memory pressure": the aggressiveness
- * side is handled by psr_kill_in_flight() inside psr_bypass_and_kill()
- * (won't fire a second kill until the last one's been reaped or the
- * grace period lapses); the other side is handled by treating
- * VMPRESSURE_CRITICAL and a real allocation failure as hard triggers
- * regardless of how mild the trend sample looks.
- */
-void psr_lmk_note_pressure(enum vmpressure_levels level,
-			    unsigned long pressure,
-			    unsigned long scanned,
-			    unsigned long reclaimed)
-{
+	struct psr_counters c;
 	struct psr_node_state st;
-	long slope;
 	bool regression;
-	int reactivations, alloc_failures, swap_refaults, file_refaults;
-	long scan_sum, reclaimed_sum;
+	long slope;
 
+	/* Cheapest gate first: if a kill is still outstanding, there is
+	 * nothing useful to do and no reason to touch anything else. */
+	if (psr_kill_in_flight())
+		return;
+
+	psr_drain_counters(&c);
 	psr_compute_node_state(&st);
+	st.pressure = pressure;
 
 	slope = psr_push_sample_and_slope(pressure);
 
-	reactivations  = atomic_xchg(&psr_stat_anon_reactivations, 0);
-	alloc_failures = atomic_xchg(&psr_stat_alloc_failures, 0);
-	swap_refaults  = atomic_xchg(&psr_stat_swap_refaults, 0);
-	file_refaults  = atomic_xchg(&psr_stat_file_refaults, 0);
-	scan_sum       = atomic_long_xchg(&psr_stat_scan_sum, 0);
-	reclaimed_sum  = atomic_long_xchg(&psr_stat_reclaimed_sum, 0);
-
-	/* Reused field; unit here is vmpressure's 0-100 pressure scale,
-	 * not pages/sec -- kept as swap_in_rate for status-output/log
-	 * continuity rather than renaming the struct field everywhere. */
-	st.swap_in_rate = pressure;
-
-	regression = (pressure >= thrash_hard_limit) ||
-		     (slope >= (long)regression_slope_thresh) ||
-		     (alloc_failures > 0) ||
-		     (level >= VMPRESSURE_CRITICAL);
+	regression = pressure >= thrash_hard_limit ||
+		     slope >= (long)regression_slope_thresh ||
+		     c.alloc_failures > 0;
 
 	/*
-	 * Corroboration, borrowed from le9uo's ratio concept: real
-	 * anon/swap refaults strengthen a borderline pressure reading
-	 * when the clean-file floor is also under pressure. A pure
-	 * file-cache refault burst with no swap activity doesn't count
-	 * -- that's ordinary page-cache churn, not swap thrash.
+	 * Corroboration (le9uo's ratio concept): real anon/swap refaults
+	 * strengthen a borderline reading when the clean-file floor is
+	 * also under pressure. A pure file-cache refault burst with no
+	 * swap activity doesn't count -- that's ordinary page-cache churn,
+	 * not swap thrash.
 	 */
-	if (!regression && st.clean_below_min && swap_refaults > 0)
+	if (!regression && st.clean_below_min && c.swap_refaults > 0)
 		regression = true;
 
-	/* Reactivation churn + poor reclaim efficiency this cycle is
-	 * the same "thrashing but hasn't hit a hard limit yet" case
-	 * the slope/hard-limit checks above are meant to catch --
-	 * this catches it earlier when scan volume is low. */
-	if (!regression && reactivations > 4 && scan_sum > 0 &&
-	    (reclaimed_sum * 100 / scan_sum) < 10)
+	/* Reactivation churn: memory being pulled straight back off the
+	 * inactive list is thrash even when the pressure number itself
+	 * hasn't peaked. */
+	if (!regression && st.clean_below_min && c.anon_reactivations > 64)
 		regression = true;
 
-	/*
-	 * PSI corroboration -- real task stall time catches cases the
-	 * scanned/reclaimed ratio misses (reclaim looks "efficient"
-	 * but tasks are still stalling). No-op (dead code, compiled
-	 * out) when CONFIG_PSI=n; psr_lmk_read_psi_mem_avg10() returns
-	 * 0 unconditionally in that case, so this can never fire on
-	 * your current test kernel.
-	 */
-	if (!regression && IS_ENABLED(CONFIG_PSI) &&
-	    psr_lmk_read_psi_mem_avg10() >= psi_avg10_thresh_or_zero())
-		regression = true;
-
-	pr_debug(PSR_LMK_NAME
-		 ": pressure=%lu level=%d slope=%ld reactivations=%d alloc_failures=%d "
-		 "swap_refaults=%d file_refaults=%d scan=%ld reclaimed=%ld regression=%d\n",
-		 pressure, level, slope, reactivations, alloc_failures,
-		 swap_refaults, file_refaults, scan_sum, reclaimed_sum, regression);
+	pr_debug("pressure=%lu slope=%ld react=%lu allocfail=%lu swap_rf=%lu file_rf=%lu regression=%d\n",
+		 pressure, slope, c.anon_reactivations, c.alloc_failures,
+		 c.swap_refaults, c.file_refaults, regression);
 
 	if (regression || st.swap_floor_breached)
 		psr_bypass_and_kill(&st);
 }
-EXPORT_SYMBOL_GPL(psr_lmk_note_pressure);
+
+/* ------------------------------------------------------------------
+ * Trigger: the global vmpressure notifier chain.
+ *
+ * The previous revision hooked vmpressure_work_fn() directly and ran the
+ * whole decision -- task-list walk included -- inline on the system
+ * workqueue. That call site is also MEMCG-only, and this defconfig had
+ * to turn MEMCG on to reach it, which costs page-counter accounting on
+ * every charge/uncharge kernel-wide. That combination is the main reason
+ * the UI stuttered regardless of what was running.
+ *
+ * The notifier chain is the same trigger simple_lmk used, it exists
+ * independently of CONFIG_MEMCG, and the callback here does nothing but
+ * a comparison and a wakeup.
+ * ------------------------------------------------------------------ */
+static DECLARE_WAIT_QUEUE_HEAD(psr_waitq);
+static atomic_t psr_needs_eval = ATOMIC_INIT(0);
+static unsigned long psr_last_pressure;
+
+static int psr_vmpressure_cb(struct notifier_block *nb, unsigned long pressure,
+			     void *data)
+{
+	if (pressure >= wakeup_pressure) {
+		WRITE_ONCE(psr_last_pressure, pressure);
+		atomic_set(&psr_needs_eval, 1);
+		smp_mb__after_atomic();
+		if (waitqueue_active(&psr_waitq))
+			wake_up(&psr_waitq);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block psr_vmpressure_nb = {
+	.notifier_call = psr_vmpressure_cb,
+	.priority = INT_MAX,
+};
+
+static int psr_lmkd_thread(void *data)
+{
+	static const struct sched_param rt_prio = {
+		.sched_priority = MAX_RT_PRIO - 1
+	};
+
+	sched_setscheduler_nocheck(current, SCHED_RR, &rt_prio);
+	set_freezable();
+
+	while (!kthread_should_stop()) {
+		wait_event_freezable(psr_waitq,
+				     atomic_read(&psr_needs_eval) ||
+				     kthread_should_stop());
+		if (kthread_should_stop())
+			break;
+
+		atomic_set(&psr_needs_eval, 0);
+		psr_evaluate(READ_ONCE(psr_last_pressure));
+
+		/*
+		 * Rate limit. A kill takes real time to pay off, and the
+		 * notifier can fire far faster than that -- re-walking the
+		 * task list in a tight loop would burn CPU that the UI
+		 * needs, which is precisely the failure being fixed here.
+		 */
+		if (min_eval_interval_ms)
+			schedule_timeout_interruptible(
+				msecs_to_jiffies(min_eval_interval_ms));
+	}
+
+	return 0;
+}
 
 /* ------------------------------------------------------------------
  * proc interface: /proc/psr_lmk/status
@@ -753,33 +780,33 @@ static int psr_status_show(struct seq_file *m, void *v)
 	psr_compute_node_state(&st);
 
 	seq_printf(m,
-		"active_profile: %s\n"
-		"dry_run: %d\n"
-		"reserved_swap_floor_kb: %lu\n"
-		"anon_min_ratio: %u\n"
-		"clean_min_ratio: %u\n"
-		"regression_slope_thresh: %u\n"
-		"thrash_hard_limit: %u\n"
-		"min_oom_score_adj: %d\n"
-		"escalated_min_oom_score_adj: %d\n"
-		"usage_time_weight_pct: %u\n"
-		"---\n"
-		"anon_below_min: %d\n"
-		"clean_below_min: %d\n"
-		"swap_floor_breached: %d\n"
-		"escalated: %d\n"
-		"kill_in_flight_pid: %d\n"
-		"psi_available: %d\n"
-		"psi_mem_avg10: %lu\n"
-		"psi_avg10_thresh: %u\n",
-		psr_lmk_active_profile,
-		dry_run, reserved_swap_floor_kb, anon_min_ratio, clean_min_ratio,
-		regression_slope_thresh, thrash_hard_limit, min_oom_score_adj,
-		escalated_min_oom_score_adj, usage_time_weight_pct,
-		st.anon_below_min, st.clean_below_min, st.swap_floor_breached,
-		st.escalated, psr_kill_state.pending_victim_pid,
-		IS_ENABLED(CONFIG_PSI), psr_lmk_read_psi_mem_avg10(),
-		psi_avg10_thresh_or_zero());
+		   "active_profile: %s\n"
+		   "dry_run: %d\n"
+		   "reserved_swap_floor_kb: %lu\n"
+		   "anon_min_ratio: %u\n"
+		   "clean_min_ratio: %u\n"
+		   "regression_slope_thresh: %u\n"
+		   "thrash_hard_limit: %u\n"
+		   "wakeup_pressure: %u\n"
+		   "min_eval_interval_ms: %u\n"
+		   "min_oom_score_adj: %d\n"
+		   "escalated_min_oom_score_adj: %d\n"
+		   "usage_time_weight_pct: %u\n"
+		   "---\n"
+		   "anon_below_min: %d\n"
+		   "clean_below_min: %d\n"
+		   "swap_floor_breached: %d\n"
+		   "escalated: %d\n"
+		   "kill_in_flight: %d\n"
+		   "last_pressure: %lu\n",
+		   psr_lmk_active_profile, dry_run, reserved_swap_floor_kb,
+		   anon_min_ratio, clean_min_ratio, regression_slope_thresh,
+		   thrash_hard_limit, wakeup_pressure, min_eval_interval_ms,
+		   min_oom_score_adj, escalated_min_oom_score_adj,
+		   usage_time_weight_pct, st.anon_below_min, st.clean_below_min,
+		   st.swap_floor_breached, st.escalated,
+		   READ_ONCE(psr_victim_mm) != NULL,
+		   READ_ONCE(psr_last_pressure));
 
 	return 0;
 }
@@ -792,98 +819,84 @@ static int psr_status_open(struct inode *inode, struct file *file)
 static const struct file_operations psr_status_fops = {
 	.open    = psr_status_open,
 	.read    = seq_read,
-	.llseek   = seq_lseek,
+	.llseek  = seq_lseek,
 	.release = single_release,
 };
 
-static struct proc_dir_entry *psr_proc_dir;
-
 /* ------------------------------------------------------------------
- * Module init/exit
+ * Bring-up.
+ *
+ * Deferred to the first write to the legacy lowmemorykiller.minfree
+ * node, the same way simple_lmk did it. That write comes from
+ * init/lmkd once userspace is far enough along to want an LMK, which
+ * means the kthread doesn't exist and -- more importantly -- the static
+ * key stays off, so the mm hooks are patched-out NOPs, for the whole of
+ * boot.
+ *
+ * That node has to exist for a second reason: some Android init/vendor
+ * scripts and some lmkd branches treat its absence as "no LMK present"
+ * and reboot. Note this requires CONFIG_ANDROID_PSR_LMK=y, not =m -- the
+ * dot in "lowmemorykiller.minfree" is only split into a synthesized
+ * /sys/module/lowmemorykiller/ directory for built-in params.
+ *
+ * MODULE_PARAM_PREFIX is a plain preprocessor macro affecting every
+ * module_param() that follows it in this file, so this block stays at
+ * the very end, after every real tunable is registered, and the prefix
+ * is restored immediately. Do not add module_param() calls between the
+ * #define and #undef below.
  * ------------------------------------------------------------------ */
-static int __init psr_lmk_init(void)
+static struct proc_dir_entry *psr_proc_dir;
+static struct task_struct *psr_lmkd_task;
+
+static int psr_lmk_start(void)
 {
-	psr_engine_init();
-	memset(&psr_kill_state, 0, sizeof(psr_kill_state));
+	struct task_struct *thread;
+	int ret;
 
 	psr_lmk_auto_tune();
 
-	psr_proc_dir = proc_mkdir(PSR_LMK_NAME, NULL);
-	if (!psr_proc_dir)
-		return -ENOMEM;
+	thread = kthread_run(psr_lmkd_thread, NULL, "psr_lmkd");
+	if (IS_ERR(thread)) {
+		pr_err("failed to start kthread: %ld\n", PTR_ERR(thread));
+		return PTR_ERR(thread);
+	}
+	psr_lmkd_task = thread;
 
-	proc_create("status", 0444, psr_proc_dir, &psr_status_fops);
+	ret = vmpressure_notifier_register(&psr_vmpressure_nb);
+	if (ret) {
+		pr_err("failed to register vmpressure notifier: %d\n", ret);
+		kthread_stop(psr_lmkd_task);
+		psr_lmkd_task = NULL;
+		return ret;
+	}
 
-	/*
-	 * No notifier registration needed here: mm/vmpressure.c calls
-	 * psr_lmk_note_pressure() directly (see the mm hooks patch),
-	 * so PSR-LMK gets the same pressure event the kernel's own
-	 * vmpressure machinery already computes, with no separate
-	 * registration/cgroup-target step required.
-	 */
+	psr_proc_dir = proc_mkdir("psr_lmk", NULL);
+	if (psr_proc_dir)
+		proc_create("status", 0444, psr_proc_dir, &psr_status_fops);
 
-	pr_info(PSR_LMK_NAME ": loaded (dry_run=%d)\n", dry_run);
+	/* Last: only now do the mm hooks start costing anything. */
+	static_branch_enable(&psr_lmk_key);
+
+	pr_info("started (dry_run=%d wakeup_pressure=%u)\n", dry_run,
+		wakeup_pressure);
 	return 0;
 }
 
-static void __exit psr_lmk_exit(void)
-{
-	proc_remove(psr_proc_dir);
-	pr_info(PSR_LMK_NAME ": unloaded\n");
-}
-
-/* ------------------------------------------------------------------
- * Compatibility shim: some Android init/vendor init scripts, and
- * lmkd on certain branches, probe for the presence of the classic
- * kernel LMK's sysfs parameter node at boot and treat its absence as
- * "no LMK present," which can trigger a reboot loop. PSR-LMK replaces
- * the kernel LMK, so it needs to present the same compatibility node
- * -- even though PSR-LMK's real tunables live under its own
- * psr_lmk-prefixed params above and /proc/psr_lmk/status.
- *
- * REQUIRES CONFIG_ANDROID_PSR_LMK=y (built-in), not =m (loadable
- * module). The dot in "lowmemorykiller.minfree" only gets split into
- * a synthesized /sys/module/lowmemorykiller/ directory by the
- * kernel's builtin-param sysfs path, which requires THIS_MODULE to be
- * NULL (i.e. compiled directly into vmlinux). As a loadable module,
- * this would instead show up as a literal file named
- * "lowmemorykiller.minfree" inside /sys/module/psr_lmk/parameters/,
- * which does NOT satisfy the boot-time presence check. Update the
- * Kconfig entry to `bool` before relying on this.
- *
- * MODULE_PARAM_PREFIX is a plain preprocessor macro: it affects every
- * module_param()/module_param_cb() call that follows it in this
- * translation unit, not just the next one. This block is therefore
- * placed at the very end of the file, after every PSR-LMK tunable has
- * already been registered above with the default (empty) prefix, and
- * the prefix is undef'd back immediately after this single call. Do
- * not add new module_param() calls between the #define and #undef
- * below, and do not move this block earlier in the file.
- * ------------------------------------------------------------------ */
 static int psr_lmk_compat_minfree_set(const char *val,
-				       const struct kernel_param *kp)
+				      const struct kernel_param *kp)
 {
-	/* Accept and log writes from init/lmkd probing or configuring
-	 * this legacy node so boot doesn't stall, but don't let it
-	 * drive PSR-LMK's actual thresholds -- those are configured
-	 * exclusively through the psr_lmk.* module params above. */
-	pr_info(PSR_LMK_NAME ": compat lowmemorykiller.minfree write ignored: %s\n",
-		val ? val : "(null)");
-	return 0;
-}
+	static atomic_t init_done = ATOMIC_INIT(0);
 
-static int psr_lmk_compat_minfree_get(char *buffer,
-				       const struct kernel_param *kp)
-{
-	/* perm is write-only (0200) below, so sysfs never actually
-	 * calls this -- defined anyway so kernel_param_ops is complete
-	 * if perm is ever loosened. */
-	return scnprintf(buffer, PAGE_SIZE, "0\n");
+	if (!atomic_cmpxchg(&init_done, 0, 1))
+		psr_lmk_start();
+
+	/* The legacy minfree values themselves are ignored -- PSR-LMK's
+	 * thresholds come from its own params and RAM profile. */
+	return 0;
 }
 
 static const struct kernel_param_ops psr_lmk_compat_minfree_ops = {
 	.set = psr_lmk_compat_minfree_set,
-	.get = psr_lmk_compat_minfree_get,
 };
 
 #undef MODULE_PARAM_PREFIX
@@ -892,9 +905,5 @@ module_param_cb(minfree, &psr_lmk_compat_minfree_ops, NULL, 0200);
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX ""
 
-module_init(psr_lmk_init);
-module_exit(psr_lmk_exit);
-
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("PSR-LMK: Protected-Swap Regression Low Memory Killer");
-MODULE_AUTHOR("prototype");

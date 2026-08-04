@@ -4267,7 +4267,7 @@ retry:
 	 * here as a confirmation input for PSR-LMK.
 	 */
 	if (!page)
-		psr_lmk_note_alloc_failure(order, gfp_mask);
+		psr_lmk_note_alloc_failure();
 
 	return page;
 }

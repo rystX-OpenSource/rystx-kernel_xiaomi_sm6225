@@ -79,26 +79,6 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 }
 #undef SEQ_PUT_DEC
 
-/*
- * task_swap_kb - per-task swap footprint in KB
- * @mm: the task's mm_struct
- *
- * NOTE: this is a convenience wrapper, not a required hook. The
- * underlying counter (get_mm_counter(mm, MM_SWAPENTS)) is already a
- * public inline in <linux/mm.h> that PSR-LMK (or anything else) can
- * call directly without this function existing at all. It's added
- * here purely so PSR-LMK's victim selection doesn't hand-roll the
- * page-to-KB shift inline and to keep this hook's shape consistent
- * with the others in include/linux/psr_lmk.h -- deliberately NOT the
- * process_reclaim-style per-task reclaim trigger/ioctl some other
- * LMK drivers add here.
- */
-unsigned long task_swap_kb(struct mm_struct *mm)
-{
-	return get_mm_counter(mm, MM_SWAPENTS) << (PAGE_SHIFT - 10);
-}
-EXPORT_SYMBOL_GPL(task_swap_kb);
-
 unsigned long task_vsize(struct mm_struct *mm)
 {
 	return PAGE_SIZE * mm->total_vm;

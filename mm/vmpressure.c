@@ -26,7 +26,6 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/vmpressure.h>
-#include <linux/psr_lmk.h>
 
 /*
  * These thresholds are used when we account memory pressure through
@@ -103,6 +102,13 @@ static struct vmpressure *vmpressure_parent(struct vmpressure *vmpr)
 	return NULL;
 }
 #endif
+
+enum vmpressure_levels {
+	VMPRESSURE_LOW = 0,
+	VMPRESSURE_MEDIUM,
+	VMPRESSURE_CRITICAL,
+	VMPRESSURE_NUM_LEVELS,
+};
 
 enum vmpressure_modes {
 	VMPRESSURE_NO_PASSTHROUGH = 0,
@@ -238,15 +244,6 @@ static void vmpressure_work_fn(struct work_struct *work)
 
 	pressure = vmpressure_calc_pressure(scanned, reclaimed);
 	level = vmpressure_level(pressure);
-
-	/*
-	 * Kernel-native scan/reclaim efficiency, already computed by
-	 * the existing vmpressure machinery -- feed it straight into
-	 * PSR-LMK's regression engine instead of having a userspace
-	 * daemon re-derive the same signal by polling
-	 * /proc/pressure/memory or vmstat deltas.
-	 */
-	psr_lmk_note_pressure(level, pressure, scanned, reclaimed);
 
 	do {
 		if (vmpressure_event(vmpr, level, ancestor, signalled))

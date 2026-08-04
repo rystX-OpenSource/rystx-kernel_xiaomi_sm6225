@@ -314,8 +314,7 @@ void workingset_refault(struct page *page, void *shadow)
 	 * splits real anon/swap thrash (what "protected-swap
 	 * regression" means) from ordinary file-cache churn.
 	 */
-	psr_lmk_note_refault(page, PageSwapCache(page), refault_distance,
-			      active_file);
+	psr_lmk_note_refault(PageSwapCache(page));
 
 	/*
 	 * Compare the distance to the existing workingset size. We

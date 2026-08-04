@@ -3,89 +3,92 @@
 #define _LINUX_PSR_LMK_H
 
 #include <linux/types.h>
-#include <linux/gfp.h>
-#include <linux/vmpressure.h>
 
-struct page;
-struct pglist_data;
+struct mm_struct;
 
 /*
  * PSR-LMK core hook API.
  *
- * These are the mm/fs call sites that feed PSR-LMK's regression
- * engine and let it short-circuit further reclaim once it has
- * already dispatched a bypass kill. All of them are cheap (counter
- * bumps / conditional checks) except the actual kill dispatch, which
- * PSR-LMK itself defers to a workqueue rather than doing inline from
- * these (often atomic / lock-held) call sites -- see
- * drivers/android/psr_lmk.c.
+ * Everything here is a corroboration signal only: a per-CPU counter bump
+ * behind a static key. None of these hooks take a lock, read a timer,
+ * walk the task list, or influence what the reclaimer does -- they are
+ * pure statistics. The actual regression evaluation, victim selection
+ * and kill dispatch all happen on the psr_lmkd kthread, woken by the
+ * existing global vmpressure notifier chain (see drivers/android/psr_lmk.c).
+ *
+ * Because these sit in genuinely hot mm paths (__activate_page() runs
+ * under the LRU lock, workingset_refault() runs on every refault), the
+ * cost of the disabled case has to be *zero*, not "small". Hence the
+ * static key: until the driver is up, each hook is a patched-out NOP
+ * rather than a load-and-test. Once up, it is a single non-atomic
+ * per-CPU increment -- no shared cacheline, so no cross-CPU bouncing.
  */
 
 #ifdef CONFIG_ANDROID_PSR_LMK
 
-/* mm/swap.c: an anon (swap-backed) page was just reactivated from the
- * inactive to the active LRU -- memory that was a swap-out candidate
- * is being pulled back into active use. Core "protected-swap
- * regression" signal, hence the driver's name. */
-void psr_lmk_note_anon_reactivation(struct page *page);
+#include <linux/jump_label.h>
 
-/* mm/vmpressure.c: kernel-native scan/reclaim efficiency pressure,
- * computed once per vmpressure work cycle. Replaces userspace polling
- * of /proc/pressure/memory with the same signal the kernel itself
- * already computes. */
-void psr_lmk_note_pressure(enum vmpressure_levels level,
-			    unsigned long pressure,
-			    unsigned long scanned,
-			    unsigned long reclaimed);
+DECLARE_STATIC_KEY_FALSE(psr_lmk_key);
 
-/* mm/vmscan.c: per-priority-pass scan/reclaim progress for a node. */
-void psr_lmk_note_scan_progress(struct pglist_data *pgdat,
-				 unsigned long nr_scanned,
-				 unsigned long nr_reclaimed);
+void __psr_lmk_note_anon_reactivation(void);
+void __psr_lmk_note_refault(bool is_swap);
+void __psr_lmk_note_alloc_failure(void);
+void __psr_lmk_mm_freed(struct mm_struct *mm);
 
-/* mm/vmscan.c: checked at the top of each reclaim priority pass in
- * shrink_node(). Returns true if PSR-LMK already dispatched a bypass
- * kill this cycle, so the caller can stop scanning early instead of
- * grinding through priorities a kill likely already made unnecessary. */
-bool psr_lmk_should_abort_reclaim(void);
+/*
+ * mm/swap.c: an anon (swap-backed) page was just reactivated from the
+ * inactive to the active LRU -- memory that was a swap-out candidate is
+ * being pulled back into active use. Core "protected-swap regression"
+ * signal, hence the driver's name.
+ */
+static inline void psr_lmk_note_anon_reactivation(void)
+{
+	if (static_branch_unlikely(&psr_lmk_key))
+		__psr_lmk_note_anon_reactivation();
+}
 
-/* mm/page_alloc.c: direct reclaim finished but the allocation still
- * failed -- the same "failed allocation stuck in the slow path"
- * signal simple_lmk uses to trigger killing. */
-void psr_lmk_note_alloc_failure(unsigned int order, gfp_t gfp_mask);
+/*
+ * mm/workingset.c: a page just refaulted after being evicted. @is_swap
+ * distinguishes an anon/swap-backed refault (real swap thrash -- what
+ * PSR-LMK cares about) from a file-cache refault (page-cache churn,
+ * tracked but weighted differently).
+ */
+static inline void psr_lmk_note_refault(bool is_swap)
+{
+	if (static_branch_unlikely(&psr_lmk_key))
+		__psr_lmk_note_refault(is_swap);
+}
 
-/* mm/workingset.c: a page just refaulted after being evicted.
- * is_swap distinguishes an anon/swap-backed refault (real swap
- * thrash -- what PSR-LMK cares about) from a file-cache refault
- * (page-cache churn, tracked but weighted differently). */
-void psr_lmk_note_refault(struct page *page, bool is_swap,
-			   unsigned long refault_distance,
-			   unsigned long active_size);
+/*
+ * mm/page_alloc.c: direct reclaim finished but the allocation still
+ * failed. Slow path only, so this one is never hot.
+ */
+static inline void psr_lmk_note_alloc_failure(void)
+{
+	if (static_branch_unlikely(&psr_lmk_key))
+		__psr_lmk_note_alloc_failure();
+}
+
+/*
+ * kernel/fork.c (__mmput): a victim's address space has finished
+ * exit_mmap(), i.e. its memory is actually back. This is what closes
+ * PSR-LMK's pending-kill gate; without it the gate can only be closed by
+ * a timeout, which either releases it too early (overkill) or holds it
+ * too long (under-kill). Cheap: an unlocked bit test on the dying mm,
+ * which is false for every non-victim process exit.
+ */
+static inline void psr_lmk_mm_freed(struct mm_struct *mm)
+{
+	if (static_branch_unlikely(&psr_lmk_key))
+		__psr_lmk_mm_freed(mm);
+}
 
 #else /* !CONFIG_ANDROID_PSR_LMK */
 
-static inline void psr_lmk_note_anon_reactivation(struct page *page) {}
-
-static inline void psr_lmk_note_pressure(enum vmpressure_levels level,
-					  unsigned long pressure,
-					  unsigned long scanned,
-					  unsigned long reclaimed) {}
-
-static inline void psr_lmk_note_scan_progress(struct pglist_data *pgdat,
-					       unsigned long nr_scanned,
-					       unsigned long nr_reclaimed) {}
-
-static inline bool psr_lmk_should_abort_reclaim(void)
-{
-	return false;
-}
-
-static inline void psr_lmk_note_alloc_failure(unsigned int order,
-					       gfp_t gfp_mask) {}
-
-static inline void psr_lmk_note_refault(struct page *page, bool is_swap,
-					 unsigned long refault_distance,
-					 unsigned long active_size) {}
+static inline void psr_lmk_note_anon_reactivation(void) {}
+static inline void psr_lmk_note_refault(bool is_swap) {}
+static inline void psr_lmk_note_alloc_failure(void) {}
+static inline void psr_lmk_mm_freed(struct mm_struct *mm) {}
 
 #endif /* CONFIG_ANDROID_PSR_LMK */
 

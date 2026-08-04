@@ -296,7 +296,7 @@ static void __activate_page(struct page *page, struct lruvec *lruvec,
 		 * core protected-swap-regression signal PSR-LMK watches.
 		 */
 		if (!file)
-			psr_lmk_note_anon_reactivation(page);
+			psr_lmk_note_anon_reactivation();
 	}
 }
 
