@@ -73,6 +73,62 @@ config ANDROID_BINDER_LOGS
 
           Say N on production builds.
 
+# Add this block into drivers/android/Kconfig
+
+config ANDROID_PSR_LMK
+	bool "Android Protected-Swap Regression Low Memory Killer (PSR-LMK)"
+	depends on MMU
+	depends on VM_EVENT_COUNTERS
+	depends on !ANDROID_SIMPLE_LMK
+	select MEMCG if !MEMCG
+	help
+	  PSR-LMK is a regression-aware low memory killer. It watches the
+	  swap-in rate trend, a reserved swap floor, and (as read-only
+	  confirmation signals, inspired by le9uo's working-set-protection
+	  patch) the anon/clean-file protected ratios, then bypasses
+	  standard reclaim to SIGKILL a background victim early when a
+	  swap thrashing regression is detected.
+
+	  Unlike le9uo, which enforces those ratios by rewriting LRU scan
+	  balance directly in mm/vmscan.c, PSR-LMK only reads node
+	  page-state counters and acts by killing a task -- it never
+	  touches the reclaim path itself, so it builds and iterates as a
+	  self-contained driver with no core mm patch to carry across
+	  kernel version bumps.
+
+	  Tunables (swap floor, protected ratios, regression thresholds,
+	  victim-pool width) auto-select from one of three RAM-based
+	  profiles (3-4GB / 6-8GB / 12GB+) at driver init; see
+	  auto_tune/psr_lmk_ram_tier_* module params to override.
+
+	  When the kernel also has CONFIG_PSI, PSR-LMK additionally uses
+	  PSI's memory avg10 as a corroborating signal alongside its
+	  primary vmpressure-based trigger -- this is optional and
+	  auto-detected at compile time, never a hard requirement.
+	  Building without CONFIG_PSI is fully supported and unaffected.
+
+	  PSR-LMK is meant to REPLACE a kernel LMK like simple_lmk, not
+	  run alongside one -- both register the same compatibility
+	  sysfs node (lowmemorykiller.minfree) to satisfy Android's
+	  boot-time "is an LMK present" check, and having two independent
+	  kernel-level killers racing on the same pressure event produces
+	  non-deterministic double-kills. This entry therefore depends on
+	  !ANDROID_SIMPLE_LMK; disable that driver in your defconfig
+	  before enabling this one. (Verify ANDROID_SIMPLE_LMK is the
+	  actual Kconfig symbol name in your tree -- adjust if it differs.)
+
+	  NOTE: this must be built in (Y), not as a module (M). PSR-LMK
+	  exposes a legacy /sys/module/lowmemorykiller/parameters/minfree
+	  compatibility node so Android init/lmkd don't treat the device
+	  as having no LMK present and reboot -- that synthesized sysfs
+	  path only gets created for code compiled directly into the
+	  kernel image, not for loadable modules.
+
+	  Say Y here if you want early, regression-aware OOM handling on
+	  top of (not instead of) the standard Android LMKD/kernel LMK
+	  path. If unsure, say N.
+
+
 endif # if ANDROID
 
 endmenu
