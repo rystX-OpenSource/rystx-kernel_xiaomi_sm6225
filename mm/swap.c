@@ -35,6 +35,7 @@
 #include <linux/uio.h>
 #include <linux/hugetlb.h>
 #include <linux/page_idle.h>
+#include <linux/psr_lmk.h>
 
 #include "internal.h"
 
@@ -287,6 +288,15 @@ static void __activate_page(struct page *page, struct lruvec *lruvec,
 
 		__count_vm_event(PGACTIVATE);
 		update_page_reclaim_stat(lruvec, file, 1);
+
+		/*
+		 * An anon (swap-backed) page just got pulled back onto
+		 * the active LRU -- memory that was a swap-out candidate
+		 * is being reclaimed back into active use. This is the
+		 * core protected-swap-regression signal PSR-LMK watches.
+		 */
+		if (!file)
+			psr_lmk_note_anon_reactivation(page);
 	}
 }
 
