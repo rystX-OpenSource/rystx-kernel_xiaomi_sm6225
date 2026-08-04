@@ -31,6 +31,13 @@ struct vmpressure {
 	rwlock_t users_lock;
 };
 
+enum vmpressure_levels {
+	VMPRESSURE_LOW = 0,
+	VMPRESSURE_MEDIUM,
+	VMPRESSURE_CRITICAL,
+	VMPRESSURE_NUM_LEVELS,
+};
+
 struct mem_cgroup;
 
 extern int vmpressure_notifier_register(struct notifier_block *nb);

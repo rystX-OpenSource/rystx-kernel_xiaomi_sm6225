@@ -103,13 +103,6 @@ static struct vmpressure *vmpressure_parent(struct vmpressure *vmpr)
 }
 #endif
 
-enum vmpressure_levels {
-	VMPRESSURE_LOW = 0,
-	VMPRESSURE_MEDIUM,
-	VMPRESSURE_CRITICAL,
-	VMPRESSURE_NUM_LEVELS,
-};
-
 enum vmpressure_modes {
 	VMPRESSURE_NO_PASSTHROUGH = 0,
 	VMPRESSURE_HIERARCHY,
