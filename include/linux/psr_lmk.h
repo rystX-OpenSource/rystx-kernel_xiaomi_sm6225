@@ -32,7 +32,7 @@ DECLARE_STATIC_KEY_FALSE(psr_lmk_key);
 
 void __psr_lmk_note_anon_reactivation(void);
 void __psr_lmk_note_refault(bool is_swap);
-void __psr_lmk_note_alloc_failure(void);
+void __psr_lmk_note_alloc_failure(unsigned int order, gfp_t gfp_mask);
 void __psr_lmk_mm_freed(struct mm_struct *mm);
 
 /*
@@ -62,11 +62,20 @@ static inline void psr_lmk_note_refault(bool is_swap)
 /*
  * mm/page_alloc.c: direct reclaim finished but the allocation still
  * failed. Slow path only, so this one is never hot.
+ *
+ * @order and @gfp_mask are passed through rather than filtered here so
+ * this header needn't pull in <linux/gfp.h> for __GFP_NORETRY; the
+ * filtering happens in the out-of-line callee. Most failures reaching
+ * this point are benign -- order>0 and __GFP_NORETRY callers (THP, SLUB
+ * high-order, zsmalloc) fail routinely and fall back to order-0 -- and
+ * counting those as a memory regression is a false positive, so the
+ * callee discards them.
  */
-static inline void psr_lmk_note_alloc_failure(void)
+static inline void psr_lmk_note_alloc_failure(unsigned int order,
+					      gfp_t gfp_mask)
 {
 	if (static_branch_unlikely(&psr_lmk_key))
-		__psr_lmk_note_alloc_failure();
+		__psr_lmk_note_alloc_failure(order, gfp_mask);
 }
 
 /*
@@ -87,7 +96,8 @@ static inline void psr_lmk_mm_freed(struct mm_struct *mm)
 
 static inline void psr_lmk_note_anon_reactivation(void) {}
 static inline void psr_lmk_note_refault(bool is_swap) {}
-static inline void psr_lmk_note_alloc_failure(void) {}
+static inline void psr_lmk_note_alloc_failure(unsigned int order,
+					      gfp_t gfp_mask) {}
 static inline void psr_lmk_mm_freed(struct mm_struct *mm) {}
 
 #endif /* CONFIG_ANDROID_PSR_LMK */

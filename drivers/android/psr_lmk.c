@@ -37,6 +37,8 @@
 #include <linux/atomic.h>
 #include <linux/cpumask.h>
 #include <linux/freezer.h>
+#include <linux/gfp.h>
+#include <linux/jiffies.h>
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
@@ -59,6 +61,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/swap.h>
+#include <linux/time.h>
+#include <linux/timekeeping.h>
 #include <linux/vmpressure.h>
 #include <linux/wait.h>
 #include <uapi/linux/sched/types.h>
@@ -107,8 +111,25 @@ void __psr_lmk_note_refault(bool is_swap)
 }
 EXPORT_SYMBOL_GPL(__psr_lmk_note_refault);
 
-void __psr_lmk_note_alloc_failure(void)
+/*
+ * Only order-0, non-__GFP_NORETRY failures count as a memory regression.
+ *
+ * This hook sits in __alloc_pages_direct_reclaim(), which is reached by
+ * plenty of allocations that are *designed* to fail and fall back: THP
+ * faults, SLUB's high-order attempts, zsmalloc. Those callers pass
+ * __GFP_NORETRY (and/or order > 0) precisely because failure is an
+ * acceptable outcome they handle by dropping to order-0. Counting them
+ * made a single benign fallback sufficient to declare a regression,
+ * since psr_evaluate() tests alloc_failures > 0.
+ *
+ * An order-0 failure that survived direct reclaim is the real signal --
+ * the same one simple_lmk triggers on.
+ */
+void __psr_lmk_note_alloc_failure(unsigned int order, gfp_t gfp_mask)
 {
+	if (order > 0 || (gfp_mask & (__GFP_NORETRY | __GFP_NOWAIT)))
+		return;
+
 	raw_cpu_inc(psr_counters.alloc_failures);
 }
 EXPORT_SYMBOL_GPL(__psr_lmk_note_alloc_failure);
@@ -172,14 +193,55 @@ module_param(usage_time_weight_pct, uint, 0644);
 module_param(dry_run, int, 0644);
 
 /*
- * Pressure level at which the global vmpressure notifier wakes us. The
- * notifier fires on every vmpressure window, which under normal UI use
- * is often -- so the callback itself must stay trivial and the wakeup
- * must be rare. simple_lmk used 98; 95 is slightly earlier while still
- * meaning "reclaim is barely returning anything".
+ * Pressure level at which the global vmpressure notifier wakes us.
+ *
+ * This MUST stay below thrash_hard_limit. The kthread only ever runs
+ * because the notifier saw pressure >= wakeup_pressure, so if that value
+ * is >= thrash_hard_limit then "pressure >= thrash_hard_limit" is
+ * tautologically true on every evaluation and every wakeup produces a
+ * kill decision before any corroborating signal is consulted. The
+ * previous revision had wakeup_pressure=95 against a 4GB-profile hard
+ * limit of 85 and did exactly that.
+ *
+ * It also has to leave the sliding window some dynamic range: if every
+ * sample that reaches psr_push_sample_and_slope() is >= 95, the fit runs
+ * over the top 5 points of a 100-point scale and no slope can ever
+ * approach regression_slope_thresh. Waking lower is what makes the trend
+ * signal -- the actual premise of this driver -- computable at all.
+ *
+ * Profile-tuned; overridable at runtime, clamped in psr_sanity_check().
  */
-static unsigned int wakeup_pressure = 95;
+static unsigned int wakeup_pressure = 75;
 module_param(wakeup_pressure, uint, 0644);
+
+/*
+ * Number of consecutive evaluations that must agree before pressure
+ * alone is allowed to trip the hard limit.
+ *
+ * vmpressure_prio() synthesizes pressure=100 (critical, scanned=0,
+ * reclaimed=0) whenever vmscan's scan priority dips past
+ * vmpressure_level_critical_prio. That is a scan-*depth* signal, not a
+ * reclaim-*efficiency* one, and it fires routinely during ordinary app
+ * launches on a healthy system -- observed firing on facebook/instagram
+ * cold starts with every starvation flag clear. Requiring the condition
+ * to persist across several evaluations distinguishes a launch blip from
+ * sustained thrash.
+ */
+static unsigned int sustain_evals = 3;
+module_param(sustain_evals, uint, 0644);
+
+/*
+ * Grace period after a task starts during which it will not be selected
+ * as a victim, in ms.
+ *
+ * An app being launched is simultaneously the most likely *cause* of a
+ * pressure spike and the worst possible victim: killing it makes the
+ * launch the user just requested fail visibly. Without this, PSR-LMK
+ * will happily pick a process belonging to the app currently starting --
+ * which is precisely what the first dry-run trace showed it doing.
+ */
+static unsigned int launch_grace_ms = 8000;
+module_param(launch_grace_ms, uint, 0644);
 
 /*
  * Floor on how often the kthread will do real work, in ms. The notifier
@@ -215,6 +277,7 @@ struct psr_lmk_profile {
 	unsigned int   clean_min_ratio;
 	unsigned int   regression_slope_thresh;
 	unsigned int   thrash_hard_limit;
+	unsigned int   wakeup_pressure;
 	int            min_oom_score_adj;
 	int            escalated_min_oom_score_adj;
 	unsigned int   usage_time_weight_pct;
@@ -227,6 +290,7 @@ static const struct psr_lmk_profile psr_lmk_profile_low = {
 	.clean_min_ratio             = 10,
 	.regression_slope_thresh     = 30,
 	.thrash_hard_limit           = 85,
+	.wakeup_pressure             = 70,
 	.min_oom_score_adj           = 150,
 	.escalated_min_oom_score_adj = 50,
 	.usage_time_weight_pct       = 20,
@@ -239,6 +303,7 @@ static const struct psr_lmk_profile psr_lmk_profile_mid = {
 	.clean_min_ratio             = 15,
 	.regression_slope_thresh     = 50,
 	.thrash_hard_limit           = 90,
+	.wakeup_pressure             = 75,
 	.min_oom_score_adj           = 200,
 	.escalated_min_oom_score_adj = 100,
 	.usage_time_weight_pct       = 30,
@@ -251,6 +316,7 @@ static const struct psr_lmk_profile psr_lmk_profile_high = {
 	.clean_min_ratio             = 20,
 	.regression_slope_thresh     = 80,
 	.thrash_hard_limit           = 95,
+	.wakeup_pressure             = 80,
 	.min_oom_score_adj           = 300,
 	.escalated_min_oom_score_adj = 150,
 	.usage_time_weight_pct       = 40,
@@ -285,16 +351,38 @@ static void psr_lmk_auto_tune(void)
 	clean_min_ratio             = profile->clean_min_ratio;
 	regression_slope_thresh     = profile->regression_slope_thresh;
 	thrash_hard_limit           = profile->thrash_hard_limit;
+	wakeup_pressure             = profile->wakeup_pressure;
 	min_oom_score_adj           = profile->min_oom_score_adj;
 	escalated_min_oom_score_adj = profile->escalated_min_oom_score_adj;
 	usage_time_weight_pct       = profile->usage_time_weight_pct;
 	psr_lmk_active_profile      = profile->name;
 
-	pr_info("detected %lu MB RAM, applying \"%s\" profile (swap_floor=%luKB anon_min=%u%% clean_min=%u%% slope=%u hard=%u min_adj=%d esc_adj=%d usage_weight=%u%%)\n",
+	pr_info("detected %lu MB RAM, applying \"%s\" profile (swap_floor=%luKB anon_min=%u%% clean_min=%u%% slope=%u hard=%u wakeup=%u min_adj=%d esc_adj=%d usage_weight=%u%%)\n",
 		total_mb, profile->name, reserved_swap_floor_kb,
 		anon_min_ratio, clean_min_ratio, regression_slope_thresh,
-		thrash_hard_limit, min_oom_score_adj,
+		thrash_hard_limit, wakeup_pressure, min_oom_score_adj,
 		escalated_min_oom_score_adj, usage_time_weight_pct);
+}
+
+/*
+ * Enforce wakeup_pressure < thrash_hard_limit.
+ *
+ * Both are writable at runtime, and getting the ordering wrong silently
+ * turns every wakeup into a guaranteed regression verdict -- a failure
+ * mode with no symptom other than a flood of kills, so it is worth
+ * refusing rather than trusting. Called at start and after either value
+ * could have been written.
+ */
+static void psr_sanity_check(void)
+{
+	if (wakeup_pressure >= thrash_hard_limit) {
+		unsigned int fixed = thrash_hard_limit > 15
+					? thrash_hard_limit - 15 : 1;
+
+		pr_warn("wakeup_pressure=%u >= thrash_hard_limit=%u would make the hard limit unconditional; clamping wakeup to %u\n",
+			wakeup_pressure, thrash_hard_limit, fixed);
+		wakeup_pressure = fixed;
+	}
 }
 
 /* ------------------------------------------------------------------
@@ -309,6 +397,13 @@ static struct {
 	int head;
 	int count;
 } psr_engine;
+
+/*
+ * Consecutive evaluations with pressure >= thrash_hard_limit. Reset on
+ * any sample below the limit and after a kill is dispatched. kthread-only,
+ * like the rest of the engine state, so it needs no synchronisation.
+ */
+static unsigned int psr_high_streak;
 
 /*
  * Push a pressure sample and return the least-squares slope over the
@@ -378,6 +473,16 @@ struct psr_node_state {
 	bool swap_floor_breached;
 	bool escalated;
 	unsigned long pressure;
+
+	/* Filled in by psr_evaluate() purely so the BYPASS log line can
+	 * report which signals justified the decision. The first dry-run
+	 * trace showed only the node flags, all of them zero, which said
+	 * that nothing agreed but not what had fired instead. */
+	long          slope;
+	unsigned int  streak;
+	unsigned long swap_refaults;
+	unsigned long alloc_failures;
+	unsigned long anon_reactivations;
 };
 
 static void psr_compute_node_state(struct psr_node_state *st)
@@ -506,6 +611,8 @@ static struct task_struct *psr_select_victim(const struct psr_node_state *st)
 	long best_score = LONG_MIN;
 	int score_floor = st->escalated ? escalated_min_oom_score_adj
 					: min_oom_score_adj;
+	u64 now_ns = ktime_get_ns();
+	u64 grace_ns = (u64)launch_grace_ms * NSEC_PER_MSEC;
 
 	rcu_read_lock();
 	for_each_process(p) {
@@ -524,6 +631,16 @@ static struct task_struct *psr_select_victim(const struct psr_node_state *st)
 		if (sig->flags & (SIGNAL_GROUP_EXIT | SIGNAL_GROUP_COREDUMP))
 			continue;
 		if (thread_group_empty(p) && (p->flags & PF_EXITING))
+			continue;
+
+		/*
+		 * Launch grace. An app that started moments ago is the most
+		 * likely cause of the pressure spike we are responding to and
+		 * the worst possible victim -- killing it fails the launch the
+		 * user just asked for, visibly. p->start_time is monotonic ns
+		 * (kernel/fork.c), so this is a plain subtraction.
+		 */
+		if (grace_ns && now_ns - p->start_time < grace_ns)
 			continue;
 
 		t = find_lock_task_mm(p);
@@ -639,10 +756,11 @@ static void psr_bypass_and_kill(const struct psr_node_state *st)
 		return;
 	}
 
-	pr_warn("BYPASS pid=%d comm=%s adj=%d escalated=%d anon_below_min=%d clean_below_min=%d swap_floor_breached=%d pressure=%lu%s\n",
+	pr_warn("BYPASS pid=%d comm=%s adj=%d escalated=%d anon_below_min=%d clean_below_min=%d swap_floor_breached=%d pressure=%lu streak=%u slope=%ld swap_rf=%lu allocfail=%lu react=%lu%s\n",
 		victim->pid, victim->comm, victim->signal->oom_score_adj,
 		st->escalated, st->anon_below_min, st->clean_below_min,
-		st->swap_floor_breached, st->pressure,
+		st->swap_floor_breached, st->pressure, st->streak, st->slope,
+		st->swap_refaults, st->alloc_failures, st->anon_reactivations,
 		dry_run ? " (dry-run)" : "");
 
 	if (!dry_run)
@@ -658,7 +776,8 @@ static void psr_evaluate(unsigned long pressure)
 {
 	struct psr_counters c;
 	struct psr_node_state st;
-	bool regression;
+	bool corroborated, sustained;
+	bool regression = false;
 	long slope;
 
 	/* Cheapest gate first: if a kill is still outstanding, there is
@@ -672,9 +791,52 @@ static void psr_evaluate(unsigned long pressure)
 
 	slope = psr_push_sample_and_slope(pressure);
 
-	regression = pressure >= thrash_hard_limit ||
-		     slope >= (long)regression_slope_thresh ||
-		     c.alloc_failures > 0;
+	st.slope              = slope;
+	st.swap_refaults      = c.swap_refaults;
+	st.alloc_failures     = c.alloc_failures;
+	st.anon_reactivations = c.anon_reactivations;
+
+	/*
+	 * Sustain tracking. pressure >= thrash_hard_limit on a single
+	 * sample means very little: vmpressure_prio() manufactures
+	 * pressure=100 from a scan-depth threshold crossing, with no
+	 * reference to whether reclaim is actually failing. Only a run of
+	 * consecutive high samples indicates the condition persists.
+	 */
+	if (pressure >= thrash_hard_limit)
+		psr_high_streak++;
+	else
+		psr_high_streak = 0;
+
+	sustained = psr_high_streak >= sustain_evals;
+	st.streak = psr_high_streak;
+
+	/*
+	 * Corroboration. Every input below is independent of vmpressure,
+	 * so requiring one of them prevents a pure pressure artifact from
+	 * being sufficient on its own.
+	 *
+	 * The first dry-run trace on a 4GB device showed ten consecutive
+	 * BYPASS decisions with anon_below_min=0 clean_below_min=0
+	 * swap_floor_breached=0 -- i.e. no independent signal agreed that
+	 * memory was tight, and all ten were false positives driven by the
+	 * hard limit alone. Hence the AND rather than an OR.
+	 */
+	corroborated = st.anon_below_min || st.clean_below_min ||
+		       st.swap_floor_breached || c.alloc_failures > 0 ||
+		       c.swap_refaults > 0;
+
+	/* Sustained high pressure, agreed with by something that is not
+	 * vmpressure. */
+	if (sustained && corroborated)
+		regression = true;
+
+	/* A real upward trend in pressure. Independent of the hard limit,
+	 * and only computable now that wakeup_pressure sits low enough to
+	 * give the window some range. */
+	if (!regression && slope >= (long)regression_slope_thresh &&
+	    corroborated)
+		regression = true;
 
 	/*
 	 * Corroboration (le9uo's ratio concept): real anon/swap refaults
@@ -692,12 +854,15 @@ static void psr_evaluate(unsigned long pressure)
 	if (!regression && st.clean_below_min && c.anon_reactivations > 64)
 		regression = true;
 
-	pr_debug("pressure=%lu slope=%ld react=%lu allocfail=%lu swap_rf=%lu file_rf=%lu regression=%d\n",
-		 pressure, slope, c.anon_reactivations, c.alloc_failures,
-		 c.swap_refaults, c.file_refaults, regression);
+	pr_debug("pressure=%lu streak=%u slope=%ld react=%lu allocfail=%lu swap_rf=%lu file_rf=%lu corrob=%d regression=%d\n",
+		 pressure, psr_high_streak, slope, c.anon_reactivations,
+		 c.alloc_failures, c.swap_refaults, c.file_refaults,
+		 corroborated, regression);
 
-	if (regression || st.swap_floor_breached)
+	if (regression || st.swap_floor_breached) {
+		psr_high_streak = 0;
 		psr_bypass_and_kill(&st);
+	}
 }
 
 /* ------------------------------------------------------------------
@@ -753,7 +918,6 @@ static int psr_lmkd_thread(void *data)
 		if (kthread_should_stop())
 			break;
 
-		atomic_set(&psr_needs_eval, 0);
 		psr_evaluate(READ_ONCE(psr_last_pressure));
 
 		/*
@@ -765,6 +929,18 @@ static int psr_lmkd_thread(void *data)
 		if (min_eval_interval_ms)
 			schedule_timeout_interruptible(
 				msecs_to_jiffies(min_eval_interval_ms));
+
+		/*
+		 * Clear the flag *after* sleeping, not before evaluating.
+		 * The notifier re-arms it on every vmpressure window, so
+		 * clearing first meant any notification landing during the
+		 * sleep guaranteed an immediate second evaluation of the
+		 * same event -- visible in the first dry-run trace as every
+		 * BYPASS line appearing twice, ~100ms apart. Coalescing here
+		 * makes min_eval_interval_ms drop redundant work instead of
+		 * merely delaying it.
+		 */
+		atomic_set(&psr_needs_eval, 0);
 	}
 
 	return 0;
@@ -788,6 +964,8 @@ static int psr_status_show(struct seq_file *m, void *v)
 		   "regression_slope_thresh: %u\n"
 		   "thrash_hard_limit: %u\n"
 		   "wakeup_pressure: %u\n"
+		   "sustain_evals: %u\n"
+		   "launch_grace_ms: %u\n"
 		   "min_eval_interval_ms: %u\n"
 		   "min_oom_score_adj: %d\n"
 		   "escalated_min_oom_score_adj: %d\n"
@@ -798,14 +976,17 @@ static int psr_status_show(struct seq_file *m, void *v)
 		   "swap_floor_breached: %d\n"
 		   "escalated: %d\n"
 		   "kill_in_flight: %d\n"
+		   "high_streak: %u\n"
 		   "last_pressure: %lu\n",
 		   psr_lmk_active_profile, dry_run, reserved_swap_floor_kb,
 		   anon_min_ratio, clean_min_ratio, regression_slope_thresh,
-		   thrash_hard_limit, wakeup_pressure, min_eval_interval_ms,
+		   thrash_hard_limit, wakeup_pressure, sustain_evals,
+		   launch_grace_ms, min_eval_interval_ms,
 		   min_oom_score_adj, escalated_min_oom_score_adj,
 		   usage_time_weight_pct, st.anon_below_min, st.clean_below_min,
 		   st.swap_floor_breached, st.escalated,
 		   READ_ONCE(psr_victim_mm) != NULL,
+		   READ_ONCE(psr_high_streak),
 		   READ_ONCE(psr_last_pressure));
 
 	return 0;
@@ -854,6 +1035,7 @@ static int psr_lmk_start(void)
 	int ret;
 
 	psr_lmk_auto_tune();
+	psr_sanity_check();
 
 	thread = kthread_run(psr_lmkd_thread, NULL, "psr_lmkd");
 	if (IS_ERR(thread)) {
@@ -877,8 +1059,9 @@ static int psr_lmk_start(void)
 	/* Last: only now do the mm hooks start costing anything. */
 	static_branch_enable(&psr_lmk_key);
 
-	pr_info("started (dry_run=%d wakeup_pressure=%u)\n", dry_run,
-		wakeup_pressure);
+	pr_info("started (dry_run=%d wakeup_pressure=%u thrash_hard_limit=%u sustain_evals=%u launch_grace_ms=%u)\n",
+		dry_run, wakeup_pressure, thrash_hard_limit, sustain_evals,
+		launch_grace_ms);
 	return 0;
 }
 
