@@ -6,8 +6,9 @@
  * Single-queue scheduler combining Kyber's domain-based latency control
  * with Anxiety's lightweight dispatch and ADIOS-style adaptive prediction.
  *
- * Phase 2: RINKA-Adaptive - ADIOS-style per-CPU-bucketed, RCU-published
- *          linear latency model (base + slope·size) driving depth control
+ * Phase 3: RINKA-MLP - quantized MLP predictor refining the Phase-2 linear
+ *          model. Inference runs in a kthread (NEON needs process context
+ *          with IRQs on) and publishes an RCU lookup table the hot path reads.
  */
 
 #include <linux/kernel.h>
@@ -19,8 +20,20 @@
 #include <linux/init.h>
 #include <linux/rculist.h>
 #include <linux/percpu.h>
+#include <linux/kthread.h>
+#include <linux/log2.h>
 
-#define RINKA_VERSION "0.3.0-phase2"
+#ifdef CONFIG_IOSCHED_RINKA_MLP_NEON
+#include <asm/neon.h>
+#include <asm/simd.h>
+#endif
+
+#include "rinka-mlp.h"
+
+#define RINKA_VERSION "0.4.0-phase3"
+
+/* How often the inference kthread refreshes the published table. */
+#define RINKA_MLP_REFRESH_MS	1000
 
 /* Scheduling domains (Kyber-inspired) */
 enum {
@@ -90,6 +103,13 @@ struct rinka_domain {
 	/* Latency model for this domain */
 	struct rinka_latency_model model;
 
+	/*
+	 * MLP-refined prediction table, published by the inference kthread.
+	 * NULL until the first successful refresh, in which case callers fall
+	 * back to the unmodified linear model.
+	 */
+	struct rinka_pred_lut __rcu *lut;
+
 	/* Statistics */
 	unsigned long dispatched;
 	unsigned long queued;
@@ -101,6 +121,14 @@ struct rinka_data {
 
 	/* Anxiety-style batch dispatch control */
 	u8 batch_count;
+
+	/* MLP inference */
+	struct task_struct *mlp_thread;
+	struct rinka_mlp_weights mlp_weights;
+	bool mlp_enabled;
+	unsigned long mlp_refreshes;
+	unsigned long mlp_neon_used;
+	unsigned long mlp_fallback_used;
 
 	/* Statistics */
 	unsigned long total_dispatched;
@@ -197,6 +225,152 @@ static void rinka_sample_latency(struct rinka_data *rd,
 	dom->sampled++;
 }
 
+/*
+ * Latency prediction refined by the MLP.
+ *
+ * Starts from the Phase-2 linear model, then applies the Q8.8 correction
+ * ratio the inference kthread published for this (size, congestion) bucket.
+ * Safe to call from the hot path: this is an RCU-protected table read, never
+ * an inference.
+ */
+static u64 rinka_predict_latency_mlp(struct rinka_domain *dom, u32 block_size)
+{
+	struct rinka_pred_lut *lut;
+	u64 base = rinka_predict_latency(&dom->model, block_size);
+	u64 result = base;
+	s16 ratio;
+
+	rcu_read_lock();
+	lut = rcu_dereference(dom->lut);
+	if (lut) {
+		unsigned int idx = rinka_lut_index(
+			rinka_size_bucket(block_size),
+			rinka_depth_bucket(dom->in_flight, dom->target_depth));
+
+		ratio = lut->ratio[idx];
+		if (ratio > 0)
+			result = (base * (u64)ratio) >> RINKA_Q_SHIFT;
+	}
+	rcu_read_unlock();
+
+	return result;
+}
+
+/*
+ * Build the feature vector for one (size, congestion) bucket, in Q8.8.
+ *
+ *   in[0] - log2 of request size relative to 4K, normalized
+ *   in[1] - congestion, in_flight/target_depth
+ *   in[2] - current base latency, normalized against 1ms
+ *   in[3] - current slope, normalized against 1us/KB
+ */
+static void rinka_mlp_features(struct rinka_domain *dom,
+			       unsigned int size_bucket,
+			       unsigned int depth_bucket,
+			       s16 in[RINKA_MLP_IN])
+{
+	struct rinka_latency_params *params;
+	u64 base, slope;
+
+	rcu_read_lock();
+	params = rcu_dereference(dom->model.params);
+	base = params->base;
+	slope = params->slope;
+	rcu_read_unlock();
+
+	in[0] = (s16)((size_bucket * RINKA_Q_ONE) / RINKA_LUT_SIZE_BUCKETS);
+	in[1] = (s16)((depth_bucket * RINKA_Q_ONE) / RINKA_LUT_DEPTH_BUCKETS);
+
+	base = min_t(u64, base, NSEC_PER_MSEC);
+	in[2] = (s16)((base * RINKA_Q_ONE) / NSEC_PER_MSEC);
+
+	slope = min_t(u64, slope, NSEC_PER_USEC);
+	in[3] = (s16)((slope * RINKA_Q_ONE) / NSEC_PER_USEC);
+}
+
+/*
+ * Evaluate the network over the whole input grid and publish a new table.
+ *
+ * Runs only from the inference kthread, so process context with IRQs on:
+ * this is the one place NEON is legal.
+ */
+static void rinka_mlp_refresh_domain(struct rinka_data *rd,
+				     struct rinka_domain *dom)
+{
+	struct rinka_pred_lut *new_lut, *old_lut;
+	unsigned int s, d;
+	bool used_neon = false;
+
+	new_lut = kzalloc(sizeof(*new_lut), GFP_KERNEL);
+	if (!new_lut)
+		return;
+
+#ifdef CONFIG_IOSCHED_RINKA_MLP_NEON
+	if (may_use_simd()) {
+		kernel_neon_begin();
+		for (s = 0; s < RINKA_LUT_SIZE_BUCKETS; s++) {
+			for (d = 0; d < RINKA_LUT_DEPTH_BUCKETS; d++) {
+				s16 in[RINKA_MLP_IN];
+
+				rinka_mlp_features(dom, s, d, in);
+				new_lut->ratio[rinka_lut_index(s, d)] =
+					(s16)rinka_mlp_infer_neon(
+						&rd->mlp_weights, in);
+			}
+		}
+		kernel_neon_end();
+		used_neon = true;
+	}
+#endif
+
+	if (!used_neon) {
+		for (s = 0; s < RINKA_LUT_SIZE_BUCKETS; s++) {
+			for (d = 0; d < RINKA_LUT_DEPTH_BUCKETS; d++) {
+				s16 in[RINKA_MLP_IN];
+
+				rinka_mlp_features(dom, s, d, in);
+				new_lut->ratio[rinka_lut_index(s, d)] =
+					(s16)rinka_mlp_infer_int(
+						&rd->mlp_weights, in);
+			}
+		}
+	}
+
+	if (used_neon)
+		rd->mlp_neon_used++;
+	else
+		rd->mlp_fallback_used++;
+
+	old_lut = rcu_dereference_protected(dom->lut, 1);
+	rcu_assign_pointer(dom->lut, new_lut);
+	if (old_lut)
+		kfree_rcu(old_lut, rcu);
+}
+
+static int rinka_mlp_thread_fn(void *data)
+{
+	struct rinka_data *rd = data;
+
+	while (!kthread_should_stop()) {
+		unsigned int i;
+
+		if (rd->mlp_enabled) {
+			for (i = 0; i < RINKA_NUM_DOMAINS; i++)
+				rinka_mlp_refresh_domain(rd, &rd->domain[i]);
+			rd->mlp_refreshes++;
+		}
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (kthread_should_stop()) {
+			set_current_state(TASK_RUNNING);
+			break;
+		}
+		schedule_timeout(msecs_to_jiffies(RINKA_MLP_REFRESH_MS));
+	}
+
+	return 0;
+}
+
 static void rinka_merged_requests(struct request_queue *q, struct request *rq,
 				   struct request *next)
 {
@@ -208,9 +382,8 @@ static void rinka_merged_requests(struct request_queue *q, struct request *rq,
 
 static inline bool rinka_domain_can_dispatch(struct rinka_domain *dom)
 {
-	/* Allow dispatch if under target depth or if queue is non-empty
-	 * (to avoid starvation even when over limit) */
-	return dom->in_flight < dom->target_depth || !list_empty(&dom->queue);
+	/* Allow dispatch if under target depth */
+	return dom->in_flight < dom->target_depth;
 }
 
 static int __rinka_dispatch_domain(struct request_queue *q,
@@ -337,6 +510,15 @@ static void rinka_completed_request(struct request_queue *q, struct request *rq)
 	unsigned int domain = rinka_req_domain(rq);
 	struct rinka_domain *dom = &rd->domain[domain];
 	u64 now, latency;
+
+	/*
+	 * Release the in-flight token taken in rinka_activate_request().
+	 * Both hooks are gated on RQF_SORTED by the elevator core, and for a
+	 * single trip through the driver exactly one of completed/deactivate
+	 * runs, so the counter stays balanced.
+	 */
+	if (dom->in_flight)
+		dom->in_flight--;
 
 	/* Only sample if we have valid timing data */
 	if (!(rq->rq_flags & RQF_STATS) || !rq->io_start_time_ns)
@@ -469,11 +651,26 @@ static int rinka_init_queue(struct request_queue *q, struct elevator_type *elv)
 
 	rd->batch_count = RINKA_DEFAULT_BATCH_COUNT;
 
+	/* MLP predictor: start with neutral weights so behaviour matches the
+	 * Phase-2 linear model until real weights are loaded via sysfs. */
+	rd->mlp_weights = rinka_mlp_default_weights;
+	rd->mlp_enabled = true;
+
+	rd->mlp_thread = kthread_run(rinka_mlp_thread_fn, rd, "rinka-mlp");
+	if (IS_ERR(rd->mlp_thread)) {
+		/* Not fatal: without the kthread no table is ever published and
+		 * every prediction falls back to the linear model. */
+		pr_warn("rinka: failed to start MLP thread (%ld), using linear model\n",
+			PTR_ERR(rd->mlp_thread));
+		rd->mlp_thread = NULL;
+		rd->mlp_enabled = false;
+	}
+
 	spin_lock_irq(q->queue_lock);
 	q->elevator = eq;
 	spin_unlock_irq(q->queue_lock);
 
-	pr_info("rinka: initialized (version %s, phase 2)\n", RINKA_VERSION);
+	pr_info("rinka: initialized (version %s, phase 3)\n", RINKA_VERSION);
 	return 0;
 }
 
@@ -482,8 +679,20 @@ static void rinka_exit_queue(struct elevator_queue *e)
 	struct rinka_data *rd = e->elevator_data;
 	unsigned int i;
 
+	/* Stop inference before tearing down anything it reads. */
+	if (rd->mlp_thread)
+		kthread_stop(rd->mlp_thread);
+
 	for (i = 0; i < RINKA_NUM_DOMAINS; i++) {
+		struct rinka_pred_lut *lut;
+
 		BUG_ON(!list_empty(&rd->domain[i].queue));
+
+		lut = rcu_dereference_protected(rd->domain[i].lut, 1);
+		RCU_INIT_POINTER(rd->domain[i].lut, NULL);
+		if (lut)
+			kfree_rcu(lut, rcu);
+
 		rinka_cleanup_latency_model(&rd->domain[i].model);
 	}
 
@@ -714,6 +923,45 @@ static ssize_t rinka_other_sampled_show(struct elevator_queue *e, char *page)
 			rd->domain[RINKA_OTHER].sampled);
 }
 
+static ssize_t rinka_mlp_enabled_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%d\n", rd->mlp_enabled);
+}
+
+static ssize_t rinka_mlp_enabled_store(struct elevator_queue *e,
+					const char *page, size_t count)
+{
+	struct rinka_data *rd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret < 0)
+		return ret;
+
+	rd->mlp_enabled = val;
+	return count;
+}
+
+static ssize_t rinka_mlp_refreshes_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n", rd->mlp_refreshes);
+}
+
+static ssize_t rinka_mlp_neon_used_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n", rd->mlp_neon_used);
+}
+
+static ssize_t rinka_mlp_fallback_used_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n", rd->mlp_fallback_used);
+}
+
 static struct elv_fs_entry rinka_attrs[] = {
 	__ATTR(read_depth, 0644, rinka_read_depth_show, rinka_read_depth_store),
 	__ATTR(sync_write_depth, 0644, rinka_sync_write_depth_show,
@@ -733,6 +981,10 @@ static struct elv_fs_entry rinka_attrs[] = {
 	__ATTR(read_sampled, 0444, rinka_read_sampled_show, NULL),
 	__ATTR(sync_write_sampled, 0444, rinka_sync_write_sampled_show, NULL),
 	__ATTR(other_sampled, 0444, rinka_other_sampled_show, NULL),
+	__ATTR(mlp_enabled, 0644, rinka_mlp_enabled_show, rinka_mlp_enabled_store),
+	__ATTR(mlp_refreshes, 0444, rinka_mlp_refreshes_show, NULL),
+	__ATTR(mlp_neon_used, 0444, rinka_mlp_neon_used_show, NULL),
+	__ATTR(mlp_fallback_used, 0444, rinka_mlp_fallback_used_show, NULL),
 	__ATTR_NULL
 };
 

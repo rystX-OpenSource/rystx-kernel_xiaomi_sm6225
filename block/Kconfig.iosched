@@ -51,6 +51,25 @@ config IOSCHED_RINKA
 	  devices whose drivers do not support blk-mq (e.g. UFS/SCSI hosts
 	  that force use_blk_mq = false), where Kyber itself is unavailable.
 
+config IOSCHED_RINKA_MLP_NEON
+	bool "RINKA MLP predictor NEON acceleration"
+	depends on IOSCHED_RINKA && KERNEL_MODE_NEON
+	default y
+	---help---
+	  Use NEON intrinsics for RINKA's MLP latency predictor.
+
+	  Inference runs in a kthread rather than on the I/O hot path, since
+	  kernel-mode NEON requires process context with interrupts enabled
+	  and the block completion path holds the queue lock with IRQs off.
+	  The kthread publishes its results into an RCU-protected table that
+	  the hot path reads with a plain lookup.
+
+	  If NEON is unavailable at runtime, the portable integer
+	  implementation is used instead. Saying N here builds only the
+	  integer path.
+
+	  If unsure, say Y.
+
 config CFQ_GROUP_IOSCHED
 	bool "CFQ Group Scheduling support"
 	depends on IOSCHED_CFQ && BLK_CGROUP
