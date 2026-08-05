@@ -26,6 +26,7 @@
 #define RINKA_MLP_H
 
 #include <linux/types.h>
+#include <linux/log2.h>	/* ilog2() in rinka_size_bucket() */
 
 /* Q8.8 fixed point */
 #define RINKA_Q_SHIFT		8
