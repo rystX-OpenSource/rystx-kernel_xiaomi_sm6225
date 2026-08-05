@@ -22,6 +22,8 @@
 #include <linux/percpu.h>
 #include <linux/kthread.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
+#include <linux/jiffies.h>
 
 #ifdef CONFIG_IOSCHED_RINKA_MLP_NEON
 #include <asm/neon.h>
@@ -29,8 +31,9 @@
 #endif
 
 #include "rinka-mlp.h"
+#include "blk-stat.h"
 
-#define RINKA_VERSION "0.4.0-phase3"
+#define RINKA_VERSION "0.5.0-phase3"
 
 /* How often the inference kthread refreshes the published table. */
 #define RINKA_MLP_REFRESH_MS	1000
@@ -48,6 +51,10 @@ enum {
 #define LM_LAT_BUCKET_COUNT		64
 #define LM_UPDATE_INTERVAL_MS		1500
 #define LM_MIN_SAMPLES_FOR_UPDATE	128
+/* Discard the slowest 1% of samples before fitting; see rinka_lm_cutoff(). */
+#define LM_OUTLIER_PERCENTILE		99
+/* EMA divisor: each update moves the published value 1/8 of the way. */
+#define LM_EMA_WEIGHT			8
 
 /* Default batch sizes - favor reads like Kyber */
 #define RINKA_DEFAULT_READ_BATCH	16
@@ -114,6 +121,7 @@ struct rinka_domain {
 	unsigned long dispatched;
 	unsigned long queued;
 	unsigned long sampled;
+	unsigned long lm_updates;
 };
 
 struct rinka_data {
@@ -209,13 +217,15 @@ static void rinka_sample_latency(struct rinka_data *rd,
 		buckets->small_bucket[bucket_idx].sum_of_weights++;
 		buckets->small_bucket[bucket_idx].weighted_sum_latency += latency;
 	} else {
-		/* Large request - update large bucket */
-		if (!current_base) {
-			local_irq_restore(flags);
-			return;
-		}
-
-		bucket_idx = rinka_bucket_index(latency, current_base);
+		/*
+		 * Large request. Record these even before base is known: an
+		 * all-large workload has no other way to seed the model, and
+		 * rinka_lm_update() bootstraps base from the fastest bucket.
+		 * Bucketing is meaningless at base 0 (everything clamps to the
+		 * top bucket) but the sums stay correct, which is all the fit
+		 * needs.
+		 */
+		bucket_idx = rinka_bucket_index(latency, current_base ?: 1);
 		buckets->large_bucket[bucket_idx].sum_of_weights++;
 		buckets->large_bucket[bucket_idx].weighted_sum_latency += latency;
 		buckets->large_bucket[bucket_idx].weighted_sum_block_size += block_size;
@@ -223,6 +233,230 @@ static void rinka_sample_latency(struct rinka_data *rd,
 
 	local_irq_restore(flags);
 	dom->sampled++;
+}
+
+/*
+ * Per-bucket accumulator used while folding the per-CPU buckets together.
+ * Lives in the update path only, never on the hot path.
+ */
+struct rinka_lm_totals {
+	u64 lat;
+	u64 size;
+	u64 n;
+};
+
+/*
+ * Fold every CPU's buckets into per-bucket totals, consuming what we read.
+ *
+ * Samplers only ever touch their own CPU's buckets with IRQs off, so they
+ * never collide with each other, but they do run concurrently with this walk.
+ * We subtract exactly what we observed rather than zeroing, so a sample that
+ * lands mid-walk is carried into the next window instead of being dropped.
+ * A torn read can still misattribute a single sample; that is acceptable for
+ * a heuristic model and keeps the sampler lock-free.
+ */
+static void rinka_lm_collect(struct rinka_latency_model *model,
+			     struct rinka_lm_totals *small,
+			     struct rinka_lm_totals *large)
+{
+	unsigned int b;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct rinka_lm_buckets *buckets =
+			per_cpu_ptr(model->pcpu_buckets, cpu);
+
+		for (b = 0; b < LM_LAT_BUCKET_COUNT; b++) {
+			struct rinka_latency_bucket_small *sb =
+				&buckets->small_bucket[b];
+			struct rinka_latency_bucket_large *lb =
+				&buckets->large_bucket[b];
+			u64 n, lat, size;
+
+			n = READ_ONCE(sb->sum_of_weights);
+			if (n) {
+				lat = READ_ONCE(sb->weighted_sum_latency);
+				small[b].n += n;
+				small[b].lat += lat;
+				sb->sum_of_weights -= n;
+				sb->weighted_sum_latency -= lat;
+			}
+
+			n = READ_ONCE(lb->sum_of_weights);
+			if (n) {
+				lat = READ_ONCE(lb->weighted_sum_latency);
+				size = READ_ONCE(lb->weighted_sum_block_size);
+				large[b].n += n;
+				large[b].lat += lat;
+				large[b].size += size;
+				lb->sum_of_weights -= n;
+				lb->weighted_sum_latency -= lat;
+				lb->weighted_sum_block_size -= size;
+			}
+		}
+	}
+}
+
+/*
+ * Index of the highest bucket to retain, i.e. the LM_OUTLIER_PERCENTILE cut.
+ * Buckets are ordered by latency, so everything above this is the long tail
+ * (retries, contention, thermal stalls) that would otherwise drag the fit.
+ */
+static unsigned int rinka_lm_cutoff(const struct rinka_lm_totals *t,
+				    u64 total_n)
+{
+	u64 keep = div64_u64(total_n * LM_OUTLIER_PERCENTILE, 100);
+	u64 acc = 0;
+	unsigned int b;
+
+	for (b = 0; b < LM_LAT_BUCKET_COUNT; b++) {
+		acc += t[b].n;
+		if (acc >= keep)
+			return b;
+	}
+
+	return LM_LAT_BUCKET_COUNT - 1;
+}
+
+/* new = (old * (N-1) + measured) / N, or measured outright if unseeded. */
+static u64 rinka_lm_ema(u64 old, u64 measured)
+{
+	if (!old)
+		return measured;
+
+	return div64_u64(old * (LM_EMA_WEIGHT - 1) + measured, LM_EMA_WEIGHT);
+}
+
+/*
+ * Recompute base/slope from the accumulated samples and publish them.
+ *
+ * base  - mean latency of requests at or below LM_BLOCK_SIZE_THRESHOLD, i.e.
+ *         the fixed per-request cost.
+ * slope - nanoseconds per KB above that threshold, fitted from the large
+ *         requests once base is known.
+ *
+ * Runs from the model kthread: process context, GFP_KERNEL is fine, and the
+ * per-CPU walk is far too heavy for the completion path.
+ */
+static void rinka_lm_update(struct rinka_latency_model *model)
+{
+	struct rinka_latency_params *old, *new;
+	struct rinka_lm_totals *small, *large;
+	u64 total_n, lat, n, size, base, slope;
+	unsigned int b, cut;
+
+	/* One allocation, split in half: 64 buckets each, too big for the stack. */
+	small = kcalloc(LM_LAT_BUCKET_COUNT * 2, sizeof(*small), GFP_KERNEL);
+	if (!small)
+		return;
+	large = small + LM_LAT_BUCKET_COUNT;
+
+	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	if (!new) {
+		kfree(small);
+		return;
+	}
+
+	spin_lock(&model->update_lock);
+
+	old = rcu_dereference_protected(model->params,
+					lockdep_is_held(&model->update_lock));
+	base = old->base;
+	slope = old->slope;
+
+	rinka_lm_collect(model, small, large);
+
+	/* Small requests give us the fixed cost. */
+	total_n = 0;
+	for (b = 0; b < LM_LAT_BUCKET_COUNT; b++)
+		total_n += small[b].n;
+
+	if (total_n >= LM_MIN_SAMPLES_FOR_UPDATE) {
+		cut = rinka_lm_cutoff(small, total_n);
+		lat = 0;
+		n = 0;
+		for (b = 0; b <= cut; b++) {
+			lat += small[b].lat;
+			n += small[b].n;
+		}
+		if (n)
+			base = rinka_lm_ema(base, div64_u64(lat, n));
+	}
+
+	total_n = 0;
+	for (b = 0; b < LM_LAT_BUCKET_COUNT; b++)
+		total_n += large[b].n;
+
+	/*
+	 * An all-large workload never populates the small buckets, which would
+	 * leave base at zero and block the slope fit below. Seed it from the
+	 * fastest populated large bucket: those samples sit closest to the
+	 * fixed cost, so it is a usable floor until small requests show up.
+	 */
+	if (!base && total_n >= LM_MIN_SAMPLES_FOR_UPDATE) {
+		for (b = 0; b < LM_LAT_BUCKET_COUNT; b++) {
+			if (large[b].n) {
+				base = div64_u64(large[b].lat, large[b].n);
+				break;
+			}
+		}
+	}
+
+	if (base && total_n >= LM_MIN_SAMPLES_FOR_UPDATE) {
+		cut = rinka_lm_cutoff(large, total_n);
+		lat = 0;
+		n = 0;
+		size = 0;
+		for (b = 0; b <= cut; b++) {
+			lat += large[b].lat;
+			n += large[b].n;
+			size += large[b].size;
+		}
+
+		/*
+		 * Every retained sample is above the threshold, so the excess
+		 * bytes are exactly what the slope has to explain. Latency
+		 * below n*base is noise around the fixed cost rather than a
+		 * negative slope, so skip the fit instead of clamping it.
+		 */
+		if (n && lat > n * base &&
+		    size > n * (u64)LM_BLOCK_SIZE_THRESHOLD) {
+			u64 excess_kb = div64_u64(size - n * LM_BLOCK_SIZE_THRESHOLD,
+						  1024);
+
+			if (excess_kb)
+				slope = rinka_lm_ema(slope,
+						div64_u64(lat - n * base,
+							  excess_kb));
+		}
+	}
+
+	new->base = base;
+	new->slope = slope;
+	new->last_update_jiffies = get_jiffies_64();
+
+	rcu_assign_pointer(model->params, new);
+
+	spin_unlock(&model->update_lock);
+
+	kfree_rcu(old, rcu);
+	kfree(small);
+}
+
+/* Has LM_UPDATE_INTERVAL_MS elapsed since this model last published? */
+static bool rinka_lm_due(struct rinka_latency_model *model)
+{
+	struct rinka_latency_params *params;
+	bool due;
+
+	rcu_read_lock();
+	params = rcu_dereference(model->params);
+	due = time_after64(get_jiffies_64(),
+			   params->last_update_jiffies +
+				msecs_to_jiffies(LM_UPDATE_INTERVAL_MS));
+	rcu_read_unlock();
+
+	return due;
 }
 
 /*
@@ -353,6 +587,19 @@ static int rinka_mlp_thread_fn(void *data)
 
 	while (!kthread_should_stop()) {
 		unsigned int i;
+
+		/*
+		 * Refit the linear model first: the MLP consumes base/slope as
+		 * two of its four features, so refreshing the table against
+		 * stale params would publish ratios for a model that no longer
+		 * exists.
+		 */
+		for (i = 0; i < RINKA_NUM_DOMAINS; i++) {
+			if (rinka_lm_due(&rd->domain[i].model)) {
+				rinka_lm_update(&rd->domain[i].model);
+				rd->domain[i].lm_updates++;
+			}
+		}
 
 		if (rd->mlp_enabled) {
 			for (i = 0; i < RINKA_NUM_DOMAINS; i++)
@@ -579,7 +826,7 @@ static int rinka_init_latency_model(struct rinka_latency_model *model,
 	/* Start with zero base/slope - will be learned from observations */
 	params->base = 0;
 	params->slope = 0;
-	params->last_update_jiffies = jiffies;
+	params->last_update_jiffies = get_jiffies_64();
 
 	rcu_assign_pointer(model->params, params);
 
@@ -669,6 +916,14 @@ static int rinka_init_queue(struct request_queue *q, struct elevator_type *elv)
 	spin_lock_irq(q->queue_lock);
 	q->elevator = eq;
 	spin_unlock_irq(q->queue_lock);
+
+	/*
+	 * Ask the block core to stamp io_start_time_ns and set RQF_STATS on
+	 * every request. Without this the legacy path leaves both unset,
+	 * rinka_completed_request() bails before sampling, and the latency
+	 * model never sees a single observation.
+	 */
+	blk_stat_enable_accounting(q);
 
 	pr_info("rinka: initialized (version %s, phase 3)\n", RINKA_VERSION);
 	return 0;
@@ -923,6 +1178,112 @@ static ssize_t rinka_other_sampled_show(struct elevator_queue *e, char *page)
 			rd->domain[RINKA_OTHER].sampled);
 }
 
+static ssize_t rinka_read_lm_updates_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n",
+			rd->domain[RINKA_READ].lm_updates);
+}
+
+static ssize_t rinka_sync_write_lm_updates_show(struct elevator_queue *e,
+						 char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n",
+			rd->domain[RINKA_SYNC_WRITE].lm_updates);
+}
+
+static ssize_t rinka_other_lm_updates_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n",
+			rd->domain[RINKA_OTHER].lm_updates);
+}
+
+static ssize_t rinka_read_base_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	struct rinka_latency_params *params;
+	u64 base;
+
+	rcu_read_lock();
+	params = rcu_dereference(rd->domain[RINKA_READ].model.params);
+	base = params->base;
+	rcu_read_unlock();
+
+	return snprintf(page, PAGE_SIZE, "%llu\n", base);
+}
+
+static ssize_t rinka_sync_write_base_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	struct rinka_latency_params *params;
+	u64 base;
+
+	rcu_read_lock();
+	params = rcu_dereference(rd->domain[RINKA_SYNC_WRITE].model.params);
+	base = params->base;
+	rcu_read_unlock();
+
+	return snprintf(page, PAGE_SIZE, "%llu\n", base);
+}
+
+static ssize_t rinka_other_base_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	struct rinka_latency_params *params;
+	u64 base;
+
+	rcu_read_lock();
+	params = rcu_dereference(rd->domain[RINKA_OTHER].model.params);
+	base = params->base;
+	rcu_read_unlock();
+
+	return snprintf(page, PAGE_SIZE, "%llu\n", base);
+}
+
+static ssize_t rinka_read_slope_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	struct rinka_latency_params *params;
+	u64 slope;
+
+	rcu_read_lock();
+	params = rcu_dereference(rd->domain[RINKA_READ].model.params);
+	slope = params->slope;
+	rcu_read_unlock();
+
+	return snprintf(page, PAGE_SIZE, "%llu\n", slope);
+}
+
+static ssize_t rinka_sync_write_slope_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	struct rinka_latency_params *params;
+	u64 slope;
+
+	rcu_read_lock();
+	params = rcu_dereference(rd->domain[RINKA_SYNC_WRITE].model.params);
+	slope = params->slope;
+	rcu_read_unlock();
+
+	return snprintf(page, PAGE_SIZE, "%llu\n", slope);
+}
+
+static ssize_t rinka_other_slope_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	struct rinka_latency_params *params;
+	u64 slope;
+
+	rcu_read_lock();
+	params = rcu_dereference(rd->domain[RINKA_OTHER].model.params);
+	slope = params->slope;
+	rcu_read_unlock();
+
+	return snprintf(page, PAGE_SIZE, "%llu\n", slope);
+}
+
 static ssize_t rinka_mlp_enabled_show(struct elevator_queue *e, char *page)
 {
 	struct rinka_data *rd = e->elevator_data;
@@ -981,6 +1342,15 @@ static struct elv_fs_entry rinka_attrs[] = {
 	__ATTR(read_sampled, 0444, rinka_read_sampled_show, NULL),
 	__ATTR(sync_write_sampled, 0444, rinka_sync_write_sampled_show, NULL),
 	__ATTR(other_sampled, 0444, rinka_other_sampled_show, NULL),
+	__ATTR(read_lm_updates, 0444, rinka_read_lm_updates_show, NULL),
+	__ATTR(sync_write_lm_updates, 0444, rinka_sync_write_lm_updates_show, NULL),
+	__ATTR(other_lm_updates, 0444, rinka_other_lm_updates_show, NULL),
+	__ATTR(read_base, 0444, rinka_read_base_show, NULL),
+	__ATTR(sync_write_base, 0444, rinka_sync_write_base_show, NULL),
+	__ATTR(other_base, 0444, rinka_other_base_show, NULL),
+	__ATTR(read_slope, 0444, rinka_read_slope_show, NULL),
+	__ATTR(sync_write_slope, 0444, rinka_sync_write_slope_show, NULL),
+	__ATTR(other_slope, 0444, rinka_other_slope_show, NULL),
 	__ATTR(mlp_enabled, 0644, rinka_mlp_enabled_show, rinka_mlp_enabled_store),
 	__ATTR(mlp_refreshes, 0444, rinka_mlp_refreshes_show, NULL),
 	__ATTR(mlp_neon_used, 0444, rinka_mlp_neon_used_show, NULL),
