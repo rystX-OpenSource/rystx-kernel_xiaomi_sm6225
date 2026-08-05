@@ -127,7 +127,7 @@ EXPORT_SYMBOL_GPL(__psr_lmk_note_refault);
  */
 void __psr_lmk_note_alloc_failure(unsigned int order, gfp_t gfp_mask)
 {
-	if (order > 0 || (gfp_mask & (__GFP_NORETRY | __GFP_NOWAIT)))
+	if (order > 0 || (gfp_mask & (__GFP_NORETRY)))
 		return;
 
 	raw_cpu_inc(psr_counters.alloc_failures);
