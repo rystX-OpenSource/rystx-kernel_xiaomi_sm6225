@@ -41,6 +41,16 @@ config IOSCHED_ANXIETY
 		else. When a request comes in, it will use a lighweight
 		selection algorithm to swiftly process the current pending task.
 
+config IOSCHED_RINKA
+	tristate "RINKA I/O scheduler"
+	default y
+	---help---
+	  RINKA (Robust & Intelligent Kyber + Anxiety) is a single-queue I/O
+	  scheduler that combines Kyber's domain-based latency control with
+	  Anxiety's lightweight ratio-drain dispatch. It is intended for
+	  devices whose drivers do not support blk-mq (e.g. UFS/SCSI hosts
+	  that force use_blk_mq = false), where Kyber itself is unavailable.
+
 config CFQ_GROUP_IOSCHED
 	bool "CFQ Group Scheduling support"
 	depends on IOSCHED_CFQ && BLK_CGROUP
@@ -66,7 +76,10 @@ choice
 		bool "No-op"
 
 	config DEFAULT_ANXIETY
-		bool "Anxiety" if IOSCHED_ANXIETY=y	
+		bool "Anxiety" if IOSCHED_ANXIETY=y
+
+	config DEFAULT_RINKA
+		bool "RINKA" if IOSCHED_RINKA=y
 
 endchoice
 
@@ -74,6 +87,7 @@ config DEFAULT_IOSCHED
 	string
 	default "deadline" if DEFAULT_DEADLINE
 	default "anxiety" if DEFAULT_ANXIETY
+	default "rinka" if DEFAULT_RINKA
 	default "cfq" if DEFAULT_CFQ
 	default "noop" if DEFAULT_NOOP
 
