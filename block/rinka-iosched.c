@@ -67,6 +67,15 @@ enum {
 #define RINKA_DEFAULT_SYNC_WRITE_DEPTH	128
 #define RINKA_DEFAULT_OTHER_DEPTH	64
 
+/*
+ * Default predicted-latency ceilings, in nanoseconds (Kyber's targets).
+ * Async/discard traffic is left ungated: it has no latency consumer waiting
+ * on it, and throttling it only costs throughput.
+ */
+#define RINKA_DEFAULT_READ_LATENCY	(2 * NSEC_PER_MSEC)
+#define RINKA_DEFAULT_SYNC_WRITE_LATENCY (10 * NSEC_PER_MSEC)
+#define RINKA_DEFAULT_OTHER_LATENCY	0
+
 /* Per-CPU latency bucket for small requests (≤4KB) */
 struct rinka_latency_bucket_small {
 	u64 weighted_sum_latency;
@@ -107,6 +116,11 @@ struct rinka_domain {
 	unsigned int target_depth;
 	unsigned int batch_size;
 
+	/*
+	 * Predicted-latency ceiling in ns. 0 disables the adaptive gate and
+	 * leaves only the fixed target_depth ceiling in force.
+	 */
+	u64 target_latency;
 	/* Latency model for this domain */
 	struct rinka_latency_model model;
 
@@ -122,6 +136,7 @@ struct rinka_domain {
 	unsigned long queued;
 	unsigned long sampled;
 	unsigned long lm_updates;
+	unsigned long throttled;
 };
 
 struct rinka_data {
@@ -633,6 +648,49 @@ static inline bool rinka_domain_can_dispatch(struct rinka_domain *dom)
 	return dom->in_flight < dom->target_depth;
 }
 
+/*
+ * Latency-aware admission check for the head request of a domain.
+ *
+ * The depth limit above is a fixed ceiling; this is the adaptive half. We ask
+ * the model what the head request is likely to cost at the current congestion
+ * level and hold it back if that exceeds the domain's target, which lets a
+ * domain shed depth under pressure instead of riding its ceiling all the way
+ * into the tail.
+ *
+ * Two properties keep this from wedging the queue:
+ *
+ *  - A domain with nothing in flight is always allowed through. Throttling
+ *    depends on completions to relieve it, so refusing the last request would
+ *    leave nothing to generate one.
+ *  - An unlearned model (base == 0) predicts 0 and never throttles, so the
+ *    gate stays inert until the fit has real samples behind it.
+ */
+static bool rinka_domain_latency_ok(struct rinka_domain *dom)
+{
+	struct request *rq;
+	u64 predicted;
+
+	if (!dom->target_latency)
+		return true;
+
+	/* Never throttle an idle domain; see above. */
+	if (!dom->in_flight)
+		return true;
+
+	if (list_empty(&dom->queue))
+		return true;
+
+	rq = list_first_entry(&dom->queue, struct request, queuelist);
+	predicted = rinka_predict_latency_mlp(dom, blk_rq_bytes(rq));
+
+	if (predicted > dom->target_latency) {
+		dom->throttled++;
+		return false;
+	}
+
+	return true;
+}
+
 static int __rinka_dispatch_domain(struct request_queue *q,
 				    struct rinka_domain *dom,
 				    unsigned int max_dispatch)
@@ -642,6 +700,9 @@ static int __rinka_dispatch_domain(struct request_queue *q,
 
 	while (dispatched < max_dispatch && !list_empty(&dom->queue)) {
 		if (!rinka_domain_can_dispatch(dom))
+			break;
+
+		if (!rinka_domain_latency_ok(dom))
 			break;
 
 		rq = list_first_entry(&dom->queue, struct request, queuelist);
@@ -897,6 +958,12 @@ static int rinka_init_queue(struct request_queue *q, struct elevator_type *elv)
 	rd->domain[RINKA_OTHER].batch_size = RINKA_DEFAULT_OTHER_BATCH;
 
 	rd->batch_count = RINKA_DEFAULT_BATCH_COUNT;
+
+	/* Adaptive latency ceilings; inert until the model has learned. */
+	rd->domain[RINKA_READ].target_latency = RINKA_DEFAULT_READ_LATENCY;
+	rd->domain[RINKA_SYNC_WRITE].target_latency =
+		RINKA_DEFAULT_SYNC_WRITE_LATENCY;
+	rd->domain[RINKA_OTHER].target_latency = RINKA_DEFAULT_OTHER_LATENCY;
 
 	/* MLP predictor: start with neutral weights so behaviour matches the
 	 * Phase-2 linear model until real weights are loaded via sysfs. */
@@ -1178,6 +1245,98 @@ static ssize_t rinka_other_sampled_show(struct elevator_queue *e, char *page)
 			rd->domain[RINKA_OTHER].sampled);
 }
 
+static ssize_t rinka_read_target_latency_show(struct elevator_queue *e,
+					       char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%llu\n",
+			rd->domain[RINKA_READ].target_latency);
+}
+
+static ssize_t rinka_read_target_latency_store(struct elevator_queue *e,
+						const char *page, size_t count)
+{
+	struct rinka_data *rd = e->elevator_data;
+	u64 val;
+	int ret;
+
+	ret = kstrtou64(page, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	rd->domain[RINKA_READ].target_latency = val;
+	return count;
+}
+
+static ssize_t rinka_sync_write_target_latency_show(struct elevator_queue *e,
+						     char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%llu\n",
+			rd->domain[RINKA_SYNC_WRITE].target_latency);
+}
+
+static ssize_t rinka_sync_write_target_latency_store(struct elevator_queue *e,
+						      const char *page,
+						      size_t count)
+{
+	struct rinka_data *rd = e->elevator_data;
+	u64 val;
+	int ret;
+
+	ret = kstrtou64(page, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	rd->domain[RINKA_SYNC_WRITE].target_latency = val;
+	return count;
+}
+
+static ssize_t rinka_other_target_latency_show(struct elevator_queue *e,
+						char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%llu\n",
+			rd->domain[RINKA_OTHER].target_latency);
+}
+
+static ssize_t rinka_other_target_latency_store(struct elevator_queue *e,
+						 const char *page, size_t count)
+{
+	struct rinka_data *rd = e->elevator_data;
+	u64 val;
+	int ret;
+
+	ret = kstrtou64(page, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	rd->domain[RINKA_OTHER].target_latency = val;
+	return count;
+}
+
+static ssize_t rinka_read_throttled_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n",
+			rd->domain[RINKA_READ].throttled);
+}
+
+static ssize_t rinka_sync_write_throttled_show(struct elevator_queue *e,
+						char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n",
+			rd->domain[RINKA_SYNC_WRITE].throttled);
+}
+
+static ssize_t rinka_other_throttled_show(struct elevator_queue *e, char *page)
+{
+	struct rinka_data *rd = e->elevator_data;
+	return snprintf(page, PAGE_SIZE, "%lu\n",
+			rd->domain[RINKA_OTHER].throttled);
+}
+
 static ssize_t rinka_read_lm_updates_show(struct elevator_queue *e, char *page)
 {
 	struct rinka_data *rd = e->elevator_data;
@@ -1342,6 +1501,16 @@ static struct elv_fs_entry rinka_attrs[] = {
 	__ATTR(read_sampled, 0444, rinka_read_sampled_show, NULL),
 	__ATTR(sync_write_sampled, 0444, rinka_sync_write_sampled_show, NULL),
 	__ATTR(other_sampled, 0444, rinka_other_sampled_show, NULL),
+	__ATTR(read_target_latency, 0644, rinka_read_target_latency_show,
+	       rinka_read_target_latency_store),
+	__ATTR(sync_write_target_latency, 0644,
+	       rinka_sync_write_target_latency_show,
+	       rinka_sync_write_target_latency_store),
+	__ATTR(other_target_latency, 0644, rinka_other_target_latency_show,
+	       rinka_other_target_latency_store),
+	__ATTR(read_throttled, 0444, rinka_read_throttled_show, NULL),
+	__ATTR(sync_write_throttled, 0444, rinka_sync_write_throttled_show, NULL),
+	__ATTR(other_throttled, 0444, rinka_other_throttled_show, NULL),
 	__ATTR(read_lm_updates, 0444, rinka_read_lm_updates_show, NULL),
 	__ATTR(sync_write_lm_updates, 0444, rinka_sync_write_lm_updates_show, NULL),
 	__ATTR(other_lm_updates, 0444, rinka_other_lm_updates_show, NULL),
