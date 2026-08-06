@@ -48,10 +48,6 @@ struct kgsl_device_private;
  *		 be written.
  * @active_node: Linkage for nodes in active_list
  * @active_time: Time when this context last seen
- * @gpu_time_ema: Infinity Scheduler -- EMA of GPU busy time for this context
- * @gpu_time_total: Infinity Scheduler -- lifetime GPU busy time, debug only
- * @gpu_time_last_active: Infinity Scheduler -- ktime of last retirement,
- *			  used to compute idle decay periods
  */
 struct adreno_context {
 	struct kgsl_context base;
@@ -81,11 +77,6 @@ struct adreno_context {
 
 	struct list_head active_node;
 	unsigned long active_time;
-
-	/* Infinity Scheduler: GPU-side EMA tracking */
-	u64 gpu_time_ema;
-	u64 gpu_time_total;
-	ktime_t gpu_time_last_active;
 };
 
 /* Flag definitions for flag field in adreno_context */
