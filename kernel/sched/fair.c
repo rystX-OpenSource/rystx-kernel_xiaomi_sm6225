@@ -1275,8 +1275,72 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		se->slice = sysctl_sched_base_slice;
 		
 		if (entity_is_task(se)) {
-			/* Infinity: remove SCHED_SMT */
 			struct task_struct *p__ = task_of(se);
+
+			/*
+			 * SMT halving: on the secondary SMT thread,
+			 * reduce the slice further.
+			 */
+#ifdef CONFIG_SCHED_SMT
+			{
+				int cpu = cpu_of(rq_of(cfs_rq));
+				const struct cpumask *sibling_mask =
+					topology_sibling_cpumask(cpu);
+				if (sibling_mask && !cpumask_empty(sibling_mask) &&
+				    cpu != cpumask_first(sibling_mask)) {
+					unsigned long div = READ_ONCE(
+						infinity_tune_smt_divisor);
+					if (div > 1)
+						se->slice = div64_u64(
+							se->slice, div);
+				}
+			}
+#else
+			/*
+			 * Infinity: heterogeneous-capacity equivalent of the
+			 * SMT halving above.
+			 *
+			 * ARM big.LITTLE has no SMT siblings, so the block
+			 * above compiles out entirely.  The divisor's purpose
+			 * still applies though: it limits dwell time on the
+			 * weaker execution resource, so the scheduler reaches
+			 * another placement decision sooner and gets a chance
+			 * to move the task back onto a faster core.  A task on
+			 * a below-max-capacity core is on exactly that weaker
+			 * resource.
+			 *
+			 * Only the predicate changes -- the secondary-thread
+			 * test becomes a below-max-capacity test.  The penalty
+			 * itself is identical to the SMT path, so
+			 * infinity_smt_divisor keeps one meaning on both
+			 * topologies (2 == halve the slice on the weaker
+			 * resource) and stays within its documented range.
+			 *
+			 * arch_scale_cpu_capacity() is normalized against
+			 * SCHED_CAPACITY_SCALE for the system's fastest core
+			 * per the EAS capacity model, so the comparison is
+			 * exact rather than frequency-dependent.  It defaults
+			 * to SCHED_CAPACITY_SCALE before topology parsing, and
+			 * sched_asym_cpucap_active() is a static branch that
+			 * is only patched in once asymmetric capacity domains
+			 * exist -- symmetric systems take no penalty at all.
+			 */
+			{
+				int cpu = cpu_of(rq_of(cfs_rq));
+
+				if (sched_asym_cpucap_active() &&
+				    arch_scale_cpu_capacity(cpu) <
+				    SCHED_CAPACITY_SCALE) {
+					unsigned long div = READ_ONCE(
+						infinity_tune_smt_divisor);
+					if (div > 1)
+						se->slice = div64_u64(
+							se->slice, div);
+				}
+			}
+#endif
+
+			/* Update EEVDF weight from EMA */
 			infinity_update_weight(cfs_rq, se, p__);
 		}
 	}
