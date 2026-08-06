@@ -160,6 +160,12 @@ static inline u32 infinity_calc_weight(struct task_struct *p, u64 ema)
 extern unsigned long infinity_tune_smt_divisor;
 
 /* ------------------------------------------------------------------ */
+/* Stats counters                                                      */
+/* ------------------------------------------------------------------ */
+
+extern atomic_t infinity_gpu_passover_boosts;
+
+/* ------------------------------------------------------------------ */
 /* API — called from fair.c and rt.c                                   */
 /* ------------------------------------------------------------------ */
 
@@ -170,6 +176,7 @@ void infinity_rt_consume(struct infinity_ctx *ctx, u64 delta_ns);
 void infinity_rt_wakeup(struct infinity_ctx *ctx, u64 sleep_ns);
 unsigned int infinity_rr_timeslice(struct task_struct *p,
                    unsigned int rr_default);
+bool infinity_is_interactive_candidate(struct task_struct *p);
 
 /* ------------------------------------------------------------------ */
 /* RT safety valve constants                                           */

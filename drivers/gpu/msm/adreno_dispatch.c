@@ -4,6 +4,10 @@
  * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/math64.h>
+#include <linux/pid.h>
+#include <linux/rcupdate.h>
+#include <linux/sched/clock.h>
 #include <linux/slab.h>
 
 #include "adreno.h"
@@ -507,6 +511,280 @@ static inline int adreno_dispatcher_requeue_cmdobj(
 }
 
 /**
+ * adreno_context_calc_vtime() - Compute the Infinity virtual GPU time
+ * @dispatcher: Pointer to the adreno dispatcher struct
+ * @drawctxt: Pointer to the adreno draw context
+ *
+ * Mirror of drm_sched_entity_calc_vtime().  Must be called with
+ * dispatcher->plist_lock held.
+ */
+static u64 adreno_context_calc_vtime(struct adreno_dispatcher *dispatcher,
+		struct adreno_context *drawctxt)
+{
+	u64 effective_total;
+	u64 vtime;
+
+	if (drawctxt->gpu_time_total < dispatcher->min_gpu_vtime) {
+		/*
+		 * Proportionally-scaled idle compensation.
+		 *
+		 * When a context returns from idle, its gpu_time_total is
+		 * far behind min_gpu_vtime.  Rather than a fixed catch-up
+		 * bonus (which doesn't scale when min_gpu_vtime is large),
+		 * compute a weighted blend between the context's actual
+		 * small total and the front's min_gpu_vtime.
+		 *
+		 * The blend factor (idle_ratio) is a function of actual
+		 * wall-clock idle time: 0 = fully active (no boost),
+		 * approaching 1 = idle for many half-lives (full boost).
+		 *
+		 *    idle_ratio = idle_ns / (idle_ns + HALFLIFE_NS)
+		 *    effective_total = min_gpu_vtime * (1 - idle_ratio)
+		 *                    + gpu_total * idle_ratio
+		 *
+		 * Implemented as 16.16 fixed-point to avoid floating point.
+		 * After 64+ half-lives (~2s) the context gets its actual
+		 * gpu_time_total with no catch-up at all.
+		 */
+		u64 idle_ns;
+		u64 idle_ratio;
+
+		if (drawctxt->gpu_time_last_active) {
+			u64 now = local_clock();
+
+			idle_ns = now > drawctxt->gpu_time_last_active ?
+				now - drawctxt->gpu_time_last_active : 0;
+		} else {
+			idle_ns = 0;
+		}
+
+		if (idle_ns >= INFINITY_GPU_EMA_HALFLIFE_NS * 64ULL) {
+			effective_total = drawctxt->gpu_time_total;
+		} else {
+			idle_ratio = div64_u64(idle_ns * (1ULL << 16),
+					       idle_ns +
+					       INFINITY_GPU_EMA_HALFLIFE_NS);
+
+			/* min_gpu_vtime only grows and never resets; the
+			 * plain multiply wraps u64 once min_gpu_vtime >=
+			 * 2^48 ns (~3.26 days of accumulated GPU time).
+			 * mul_u64_u32_div computes the products in 128-bit
+			 * intermediates, so the blend cannot overflow; each
+			 * truncated term keeps the result at most 1 ns below
+			 * the exact convex combination, far below vtime
+			 * ordering precision.
+			 */
+			effective_total =
+				mul_u64_u32_div(dispatcher->min_gpu_vtime,
+						(u32)((1U << 16) - idle_ratio),
+						1U << 16) +
+				mul_u64_u32_div(drawctxt->gpu_time_total,
+						(u32)idle_ratio, 1U << 16);
+		}
+	} else {
+		effective_total = drawctxt->gpu_time_total;
+	}
+
+	/* CPU-to-GPU cross-scheduler coupling.
+	 *
+	 * Read the owning task's CPU-side interactivity signals via the
+	 * context's process pid.  futex_waiting and low CPU EMA indicate
+	 * an interactive task whose GPU submissions should not be treated
+	 * as bulk load.  Reduce effective_total proportionally so the
+	 * context gets a vtime advantage on the pending list.
+	 *
+	 * Coupling boost is capped at effective_total (100% reduction).
+	 * RCU-safe: pid_task() under rcu_read_lock() returns NULL if the
+	 * task has exited, leaving effective_total unchanged.
+	 *
+	 * KGSL already holds a reference to the submitting process's
+	 * group_leader pid in proc_priv->pid, taken in
+	 * kgsl_process_private_new() and released when the last context
+	 * of the process goes away, so there is no separate infinity_pid
+	 * to capture and put -- the lifetime rules match the DRM
+	 * entity-scoped pid exactly.
+	 */
+	if (drawctxt->base.proc_priv && drawctxt->base.proc_priv->pid) {
+		struct task_struct *p;
+		u64 coupling_boost = 0;
+
+		rcu_read_lock();
+		p = pid_task(drawctxt->base.proc_priv->pid, PIDTYPE_PID);
+		if (p) {
+			/* Infinity: proc_priv->pid resolves to the process
+			 * group leader; only fair-class, non-idle-policy
+			 * leaders participate in CPU-to-GPU coupling (see
+			 * infinity_is_interactive_candidate()).  Non-CFS
+			 * leaders keep coupling_boost == 0.
+			 */
+			if (infinity_is_interactive_candidate(p)) {
+				struct infinity_ctx *inf = &p->infinity;
+				u64 cpu_ema = READ_ONCE(inf->ema);
+				bool futex = READ_ONCE(inf->futex_waiting);
+
+				if (futex)
+					coupling_boost += effective_total >> 1;
+
+				if (cpu_ema == 0)
+					coupling_boost += effective_total >> 1;
+
+				if (coupling_boost > effective_total)
+					coupling_boost = effective_total;
+			}
+		}
+		rcu_read_unlock();
+
+		effective_total -= coupling_boost;
+	}
+
+	vtime = effective_total;
+
+	/*
+	 * Priority scaling.  KGSL priorities run 0..15 with 0 the most
+	 * urgent and KGSL_CONTEXT_PRIORITY_MED (8) the default, which is
+	 * the inverse of the DRM ordering; the four DRM bands are mapped
+	 * onto that range so the multipliers keep their upstream meaning.
+	 */
+	if (drawctxt->base.priority < KGSL_CONTEXT_PRIORITY_MED / 2)
+		/* DRM_SCHED_PRIORITY_KERNEL */
+		vtime >>= 2;
+	else if (drawctxt->base.priority < KGSL_CONTEXT_PRIORITY_MED)
+		/* DRM_SCHED_PRIORITY_HIGH */
+		;
+	else if (drawctxt->base.priority == KGSL_CONTEXT_PRIORITY_MED)
+		/* DRM_SCHED_PRIORITY_NORMAL */
+		vtime = vtime * 3 / 2;
+	else
+		/* DRM_SCHED_PRIORITY_LOW */
+		vtime *= 3;
+
+	if (drawctxt->gpu_time_ema > 0) {
+		u64 ema_pct = div64_u64(drawctxt->gpu_time_ema * 100ULL,
+					INFINITY_GPU_EMA_CLIMB_NS);
+		u64 boost = vtime * ema_pct / 100;
+
+		/* GPU job-type awareness: contexts that submit drawobjs
+		 * frequently (every 1-8ms) follow a compositor-like
+		 * pattern -- many small, short-lived jobs.  These
+		 * should not be penalized as heavily as a compute
+		 * context submitting large, infrequent jobs.
+		 *
+		 * Reduce the burst penalty by 25% when the submission
+		 * interval is under 8ms (INFINITY_GPU_FAST_SUBMIT_NS).
+		 * This gives a smoother desktop experience during GPU
+		 * compositing while keeping the full penalty for batch
+		 * workloads.
+		 */
+		if (drawctxt->gpu_last_submit_interval > 0 &&
+		    drawctxt->gpu_last_submit_interval <
+				INFINITY_GPU_FAST_SUBMIT_NS)
+			boost -= boost >> 2;
+
+		vtime += boost >> 1;
+	}
+
+	return vtime;
+}
+
+/**
+ * adreno_context_vtime_prio() - Project a vtime onto the plist key
+ * @dispatcher: Pointer to the adreno dispatcher struct
+ * @vtime: Infinity virtual GPU time to project
+ *
+ * See INFINITY_GPU_VTIME_GRAIN_NS in adreno_dispatch.h for the rationale.
+ * Must be called with dispatcher->plist_lock held.
+ */
+static int adreno_context_vtime_prio(struct adreno_dispatcher *dispatcher,
+		u64 vtime)
+{
+	u64 delta;
+
+	if (vtime <= dispatcher->min_gpu_vtime)
+		return 0;
+
+	delta = div64_u64(vtime - dispatcher->min_gpu_vtime,
+			  INFINITY_GPU_VTIME_GRAIN_NS);
+
+	if (delta > INFINITY_GPU_VTIME_PRIO_MAX)
+		return INFINITY_GPU_VTIME_PRIO_MAX;
+
+	return (int)delta;
+}
+
+/**
+ * adreno_dispatcher_update_vtime_locked() - Refresh a context's vtime
+ * @dispatcher: Pointer to the adreno dispatcher struct
+ * @drawctxt: Pointer to the adreno draw context
+ * @ts: Monotonic ns timestamp of this queueing
+ *
+ * Mirror of drm_sched_rq_update_vtime_locked(): drain the pending GPU
+ * time, decay the EMA over the idle gap, track the submission interval
+ * and recompute the cached vtime.  Must be called with
+ * dispatcher->plist_lock held and the context off the pending list.
+ */
+static void adreno_dispatcher_update_vtime_locked(
+		struct adreno_dispatcher *dispatcher,
+		struct adreno_context *drawctxt, u64 ts)
+{
+	/* Infinity: drain pending GPU time accounting from retired
+	 * drawobjs.  atomic64_xchg with full barrier pairs with the
+	 * atomic64_add in retire_cmdobj().  All gpu_time_total and
+	 * gpu_time_ema updates happen under plist_lock -- no
+	 * two-lock-domain race.
+	 */
+	{
+		u64 pending_ns = atomic64_xchg(&drawctxt->pending_gpu_ns, 0);
+		u64 climb_ns;
+
+		if (pending_ns) {
+			drawctxt->gpu_time_total += pending_ns;
+
+			/* EMA climb -- clamp total to EMA_CLIMB_NS so a
+			 * single large drain doesn't spike the EMA.
+			 */
+			climb_ns = pending_ns;
+			if (climb_ns > INFINITY_GPU_EMA_CLIMB_NS)
+				climb_ns = INFINITY_GPU_EMA_CLIMB_NS;
+
+			drawctxt->gpu_time_ema += div64_u64(
+				(INFINITY_GPU_EMA_CLIMB_NS -
+				 drawctxt->gpu_time_ema) *
+				climb_ns * INFINITY_GPU_EMA_ALPHA,
+				INFINITY_GPU_EMA_CLIMB_NS * (1ULL << 8));
+		}
+	}
+
+	/* Infinity EMA decay on idle */
+	if (drawctxt->gpu_time_last_active) {
+		u64 idle_ns = ts > drawctxt->gpu_time_last_active ?
+			ts - drawctxt->gpu_time_last_active : 0;
+		u64 periods = div64_u64(idle_ns,
+			INFINITY_GPU_EMA_HALFLIFE_NS);
+
+		if (periods > 63)
+			drawctxt->gpu_time_ema = 0;
+		else if (periods)
+			drawctxt->gpu_time_ema >>= periods;
+	}
+	/* Track submission interval for job-type awareness */
+	if (drawctxt->gpu_time_last_active) {
+		u64 interval = ts > drawctxt->gpu_time_last_active ?
+			ts - drawctxt->gpu_time_last_active : 0;
+
+		drawctxt->gpu_last_submit_interval = interval;
+	} else {
+		drawctxt->gpu_last_submit_interval = 0;
+	}
+	drawctxt->gpu_time_last_active = ts;
+
+	drawctxt->cached_gpu_vtime =
+		adreno_context_calc_vtime(dispatcher, drawctxt);
+
+	drawctxt->pending.prio = adreno_context_vtime_prio(dispatcher,
+			drawctxt->cached_gpu_vtime);
+}
+
+/**
  * dispatcher_queue_context() - Queue a context in the dispatcher pending list
  * @dispatcher: Pointer to the adreno dispatcher struct
  * @drawctxt: Pointer to the adreno draw context
@@ -528,6 +806,13 @@ static void  dispatcher_queue_context(struct adreno_device *adreno_dev,
 		/* Get a reference to the context while it sits on the list */
 		if (_kgsl_context_get(&drawctxt->base)) {
 			trace_dispatch_queue_context(drawctxt);
+			/*
+			 * Infinity: refresh the virtual time before the
+			 * insert so the plist key reflects the GPU time
+			 * retired since this context was last queued.
+			 */
+			adreno_dispatcher_update_vtime_locked(dispatcher,
+					drawctxt, local_clock());
 			plist_add(&drawctxt->pending, &dispatcher->pending);
 		}
 	}
@@ -671,6 +956,14 @@ static int sendcmd(struct adreno_device *adreno_dev,
 	mutex_unlock(&device->mutex);
 
 	cmdobj->submit_ticks = time.ticks;
+
+	/*
+	 * Infinity: stash the CPU-domain submit timestamp so retire_cmdobj()
+	 * can derive the job duration.  time.ktime is local_clock() sampled by
+	 * adreno_get_submit_time() with interrupts off, so it is always valid
+	 * here (unlike the alwayson tick pair, which needs debugfs profiling).
+	 */
+	cmdobj->infinity_submit_ns = time.ktime;
 
 	dispatch_q->cmd_q[dispatch_q->tail] = cmdobj;
 	dispatch_q->tail = (dispatch_q->tail + 1) %
@@ -913,6 +1206,55 @@ static void _adreno_dispatcher_issuecmds(struct adreno_device *adreno_dev)
 		/* Get the next entry on the list */
 		drawctxt = plist_first_entry(&dispatcher->pending,
 			struct adreno_context, pending);
+
+		if (drawctxt->cached_gpu_vtime > dispatcher->min_gpu_vtime)
+			dispatcher->min_gpu_vtime = drawctxt->cached_gpu_vtime;
+
+		/* GPU-to-CPU feedback: increment gpu_passovers on the K
+		 * nearest right-neighbors on the pending list (higher
+		 * vtime), so their owning tasks' CPU-side infinity_wakeup()
+		 * can detect GPU-side starvation and accelerate EMA decay.
+		 * The K nearest contexts are the closest to the next pick
+		 * (most relevant for starvation feedback); contexts deeper
+		 * than K are credited on subsequent selections as the
+		 * winner moves.  This bounds the credited work (and the
+		 * locked atomics) to K contexts per selection; the walk may
+		 * still pass over ineligible nodes beyond K, but the
+		 * expensive per-context accounting is bounded.
+		 */
+		if (drawctxt->base.proc_priv && drawctxt->base.proc_priv->pid) {
+			struct adreno_context *ctx2 = drawctxt;
+			int credited = 0;
+
+			rcu_read_lock();
+			plist_for_each_entry_continue(ctx2,
+					&dispatcher->pending, pending) {
+				struct task_struct *p;
+
+				if (!ctx2->base.proc_priv ||
+				    !ctx2->base.proc_priv->pid)
+					continue;
+				if (kgsl_context_detached(&ctx2->base) ||
+				    kgsl_context_invalid(&ctx2->base))
+					continue;
+
+				p = pid_task(ctx2->base.proc_priv->pid,
+					     PIDTYPE_PID);
+				if (p) {
+					/* Infinity: only fair-class leaders
+					 * accumulate GPU passovers (see
+					 * infinity_is_interactive_candidate()).
+					 */
+					if (!infinity_is_interactive_candidate(p))
+						continue;
+					atomic_inc(&p->infinity.gpu_passovers);
+					if (++credited >=
+					    INFINITY_GPU_PASSOVER_MAX_ENTITIES)
+						break;
+				}
+			}
+			rcu_read_unlock();
+		}
 
 		plist_del(&drawctxt->pending, &dispatcher->pending);
 
@@ -2412,6 +2754,44 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 
 	drawctxt->ticks_index = (drawctxt->ticks_index + 1) %
 		SUBMIT_RETIRE_TICKS_SIZE;
+
+	/*
+	 * Infinity: credit the GPU duration of this drawobj to its context.
+	 * Mirrors drm_sched_job_done(): the duration is the CPU-domain delta
+	 * between submit and completion, clamped to the EMA climb ceiling so a
+	 * single stalled job cannot dominate the average.
+	 *
+	 * The value goes into the atomic64 accumulator rather than straight
+	 * into gpu_time_total/gpu_time_ema: those plain fields belong to the
+	 * plist_lock domain and this path does not hold it.
+	 * adreno_dispatcher_update_vtime_locked() drains the accumulator with
+	 * atomic64_xchg on the next enqueue of this context.
+	 *
+	 * Upstream needs two steps here -- drm_sched_job_done() stashes the
+	 * duration on the job from a fence callback, and
+	 * drm_sched_get_finished_job() later moves it to the entity under
+	 * job_list_lock, because the entity pointer can be torn down in
+	 * between.  KGSL retires from the dispatcher worker with the context
+	 * reference still held by the drawobj, so the two steps collapse into
+	 * this one.
+	 */
+	{
+		u64 gpu_ns = 0;
+		u64 now = local_clock();
+
+		/* Zero means the drawobj never reached sendcmd(), so there is
+		 * no submit timestamp to measure against.
+		 */
+		if (cmdobj->infinity_submit_ns &&
+		    now > cmdobj->infinity_submit_ns)
+			gpu_ns = now - cmdobj->infinity_submit_ns;
+
+		if (gpu_ns > INFINITY_GPU_EMA_CLIMB_NS)
+			gpu_ns = INFINITY_GPU_EMA_CLIMB_NS;
+
+		if (gpu_ns)
+			atomic64_add(gpu_ns, &drawctxt->pending_gpu_ns);
+	}
 
 	kgsl_drawobj_destroy(drawobj);
 }

@@ -17,6 +17,15 @@ struct adreno_context_type {
 #define ADRENO_CONTEXT_DRAWQUEUE_SIZE 128
 #define SUBMIT_RETIRE_TICKS_SIZE 7
 
+/*
+ * Default context priority, applied when the user does not request one.
+ * KGSL priorities run 0..15 with 0 the most urgent, so this sits in the
+ * middle of the range.  The dispatcher's Infinity vtime scaling keys its
+ * priority bands off this value, so it lives here rather than in
+ * adreno_drawctxt.c.
+ */
+#define KGSL_CONTEXT_PRIORITY_MED	0x8
+
 struct kgsl_device;
 struct adreno_device;
 struct kgsl_device_private;
@@ -48,6 +57,27 @@ struct kgsl_device_private;
  *		 be written.
  * @active_node: Linkage for nodes in active_list
  * @active_time: Time when this context last seen
+ * @gpu_time_ema: Infinity EMA of GPU time consumed.  Unit: ns, ceiling
+ *		  ~10ms.  Written and read under dispatcher->plist_lock.
+ *		  Accumulated from @pending_gpu_ns in
+ *		  adreno_dispatcher_update_vtime_locked().
+ * @gpu_time_total: Total GPU time consumed (cumulative).  Written and read
+ *		    under dispatcher->plist_lock.
+ * @gpu_time_last_active: Monotonic ns at which this context last had a
+ *			  drawobj queued.  Used for EMA decay on idle.
+ *			  Written and read under dispatcher->plist_lock.
+ * @gpu_last_submit_interval: ns since the previous submission.  Used for
+ *			      submission profile detection in calc_vtime().
+ *			      Values below ~8ms indicate a compositor-like
+ *			      (tight loop) pattern, which reduces the EMA
+ *			      burst penalty proportionally.
+ * @cached_gpu_vtime: Snapshotted vtime, immutable while on the pending
+ *		      plist.  Protected by dispatcher->plist_lock.
+ * @pending_gpu_ns: GPU ns from retired drawobjs, awaiting plist_lock.
+ *		    Added atomically from the retire path and drained under
+ *		    dispatcher->plist_lock via atomic64_xchg, so that every
+ *		    plain field above is touched from exactly one lock
+ *		    domain.
  */
 struct adreno_context {
 	struct kgsl_context base;
@@ -77,6 +107,14 @@ struct adreno_context {
 
 	struct list_head active_node;
 	unsigned long active_time;
+
+	/* Infinity GPU scheduling */
+	u64 gpu_time_ema;
+	u64 gpu_time_total;
+	u64 gpu_time_last_active;
+	u64 gpu_last_submit_interval;
+	u64 cached_gpu_vtime;
+	atomic64_t pending_gpu_ns;
 };
 
 /* Flag definitions for flag field in adreno_context */

@@ -24,12 +24,19 @@
 #include "infinity_sched.h"
 
 /* ------------------------------------------------------------------ */
+/* Stats counters                                                      */
+/* ------------------------------------------------------------------ */
+
+atomic_t infinity_gpu_passover_boosts = ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_passover_boosts);
+
+/* ------------------------------------------------------------------ */
 /* Sysctl tunables                                                     */
 /* ------------------------------------------------------------------ */
 
 unsigned long infinity_tune_smt_divisor = INFINITY_SMT_DIVISOR_DEFAULT;
 static int infinity_running_flag = 1;
-static char infinity_version[] = "v4.6-adreno/kgsl-K4.19";
+static char infinity_version[] = "v4.8-gpu (kgsl)";
 
 static int clamp_smt_divisor(struct ctl_table *table, int write,
                 void *buf, size_t *lenp, loff_t *ppos)
@@ -140,6 +147,22 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
    if (sleep_ns == 0)
        return;
 
+   /* GPU-to-CPU feedback: if this task's GPU context has been
+    * repeatedly passed over in scheduling, accelerate the EMA
+    * decay so the task appears more interactive on the CPU side.
+    * Each passover is worth one extra half-life of decay.
+    */
+   {
+       int passovers = atomic_xchg(&ctx->gpu_passovers, 0);
+
+       if (passovers > 0) {
+           u64 extra_ns = sleep_ns * min(passovers, 8);
+
+           sleep_ns += extra_ns;
+           atomic_inc(&infinity_gpu_passover_boosts);
+       }
+   }
+
    /*
     * Exponential shift decay with 24ms half-life, using a 2nd-order
     * Taylor expansion for the sub-period residual to maintain a
@@ -180,6 +203,8 @@ void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
    ctx->rt_ema = 0;
    ctx->last_sleep_ns = now;
    ctx->rt_last_sleep_ns = 0;
+   atomic_set(&ctx->gpu_passovers, 0);
+   ctx->futex_waiting = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,3 +290,20 @@ unsigned int infinity_rr_timeslice(struct task_struct *p,
    return max(1U, (unsigned int)(rr_default * (100ULL - decay_pct)
                      / 100ULL));
 }
+
+/* ------------------------------------------------------------------ */
+/* infinity_is_interactive_candidate -- sched-class gate for the GPU   */
+/* scheduler's CPU<->GPU coupling.                                     */
+/*                                                                     */
+/* Only fair-class, non-idle-policy tasks carry meaningful Infinity     */
+/* state: RT and deadline tasks never run the EMA paths, and SCHED_IDLE */
+/* tasks are meant to yield to everything by construction.  The KGSL    */
+/* dispatcher calls this before reading a task's infinity_ctx or        */
+/* crediting it a GPU pass-over.                                       */
+/* ------------------------------------------------------------------ */
+bool infinity_is_interactive_candidate(struct task_struct *p)
+{
+   return p->sched_class == &fair_sched_class &&
+          !task_has_idle_policy(p);
+}
+EXPORT_SYMBOL_GPL(infinity_is_interactive_candidate);

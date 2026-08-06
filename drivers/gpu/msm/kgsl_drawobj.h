@@ -73,6 +73,13 @@ struct kgsl_drawobj {
  * buffer
  * @submit_ticks: Variable to hold ticks at the time of
  *     command obj submit.
+ * @infinity_submit_ns: local_clock() nanoseconds at the time of command obj
+ *     submit.  This is the Infinity analogue of the DRM scheduler's
+ *     drm_sched_job.submit_ts: retire_cmdobj() subtracts it from the
+ *     completion time to derive the GPU duration credited to the context.
+ *     KGSL only records the alwayson @submit_ticks, which is unusable here
+ *     because the matching retire ticks are only sampled when the debugfs
+ *     drawobj profiling is enabled.
 
  */
 struct kgsl_drawobj_cmd {
@@ -88,6 +95,7 @@ struct kgsl_drawobj_cmd {
 	uint64_t profiling_buffer_gpuaddr;
 	unsigned int profile_index;
 	uint64_t submit_ticks;
+	u64 infinity_submit_ns;
 };
 
 /**

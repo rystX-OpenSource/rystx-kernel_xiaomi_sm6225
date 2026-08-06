@@ -110,6 +110,7 @@ struct task_struct init_task
 		.rt_ema		= 0,
 		.last_sleep_ns	= 0,
 		.rt_last_sleep_ns = 0,
+		.gpu_passovers	= ATOMIC_INIT(0),
 	},
 	RCU_POINTER_INITIALIZER(real_cred, &init_cred),
 	RCU_POINTER_INITIALIZER(cred, &init_cred),

@@ -818,6 +818,15 @@ struct infinity_ctx {
 	u64		last_sleep_ns;
 	u64		rt_last_sleep_ns;
 	bool		futex_waiting;
+
+	/**
+	 * @gpu_passovers: GPU scheduling pass-over count.
+	 * Incremented atomically by the GPU scheduler when this task's
+	 * GPU context is ready but skipped during selection.
+	 * Read-and-cleared by infinity_wakeup() to accelerate CPU EMA
+	 * decay for GPU-sidelined tasks.
+	 */
+	atomic_t	gpu_passovers;
 };
 
 struct task_struct {

@@ -300,9 +300,10 @@ void adreno_drawctxt_invalidate(struct kgsl_device *device,
  * Set the priority of the context based on the flags passed into context
  * create.  If the priority is not set in the flags, then the kernel can
  * assign any priority it desires for the context.
+ *
+ * KGSL_CONTEXT_PRIORITY_MED lives in adreno_drawctxt.h so the dispatcher
+ * can key its Infinity vtime priority bands off the same value.
  */
-#define KGSL_CONTEXT_PRIORITY_MED	0x8
-
 static inline void _set_context_priority(struct adreno_context *drawctxt)
 {
 	/* If the priority is not set by user, set it for them */
@@ -398,6 +399,13 @@ adreno_drawctxt_create(struct kgsl_device_private *dev_priv,
 	/*
 	 * Set up the plist node for the dispatcher.  Insert the node into the
 	 * drawctxt pending list based on priority.
+	 *
+	 * Infinity recomputes this key from the context's virtual GPU time on
+	 * every enqueue (adreno_dispatcher_update_vtime_locked()), so the
+	 * priority set here only matters until the first submission.  The
+	 * Infinity per-context GPU state is left zeroed by the kzalloc above:
+	 * a zero gpu_time_last_active reads as "never submitted", which both
+	 * the vtime calculation and the EMA decay treat as a fresh context.
 	 */
 	plist_node_init(&drawctxt->pending, drawctxt->base.priority);
 
