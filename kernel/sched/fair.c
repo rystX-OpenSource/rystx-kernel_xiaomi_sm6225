@@ -6945,6 +6945,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
 
 		p->infinity.futex_waiting = false;
+		p->infinity.ipc_waiting = false;
 
 		if (p->in_iowait)
 			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
