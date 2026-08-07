@@ -218,6 +218,7 @@ DECLARE_PER_CPU(atomic64_t, infinity_gpu_lock_drain_rounds);
 DECLARE_PER_CPU(atomic64_t, infinity_cpufreq_interactive_count);
 DECLARE_PER_CPU(atomic64_t, infinity_smt_interactive_count);
 DECLARE_PER_CPU(atomic64_t, infinity_shield_engage_count);
+DECLARE_PER_CPU(atomic64_t, infinity_divergence_count);
 
 /* ------------------------------------------------------------------ */
 /* API — called from fair.c and rt.c                                   */
@@ -251,5 +252,13 @@ bool infinity_is_interactive_candidate(struct task_struct *p);
  *  100%-burner from 95-100% to ~54-57%, below the 85% re-arm point).
  */
 #define INFINITY_RT_REQUEUE_DECAY_NS    100000000ULL
+
+/* ------------------------------------------------------------------ */
+/* PELT divergence diagnostic                                          */
+/* ------------------------------------------------------------------ */
+/** PELT divergence diagnostic: |ema_pct - util_pct| threshold (pp). */
+#define INFINITY_DIVERGENCE_THRESHOLD        50
+#define INFINITY_DIVERGENCE_THRESHOLD_UNITS \
+    (INFINITY_DIVERGENCE_THRESHOLD * SCHED_CAPACITY_SCALE / 100)
 
 #endif /* __INFINITY_SCHED_H */

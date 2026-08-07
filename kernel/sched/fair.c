@@ -7146,6 +7146,21 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
+	/* Infinity: EMA vs PELT divergence diagnostic (observability only).
+	 * One compare per sleep; flags tasks whose EMA classification
+	 * (hog vs interactive) differs from PELT by > 50pp.
+	 */
+	if (flags & DEQUEUE_SLEEP) {
+		u64 ema = READ_ONCE(p->infinity.ema);
+		unsigned long util = task_util_est(p);
+		u64 ema_units = mul_u64_u32_div(ema, SCHED_CAPACITY_SCALE,
+						INFINITY_BUDGET_MAX_NS);
+		u64 diff = ema_units > util ? ema_units - util : util - ema_units;
+
+		if (diff > INFINITY_DIVERGENCE_THRESHOLD_UNITS)
+			atomic64_inc(this_cpu_ptr(&infinity_divergence_count));
+	}
+
 	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
 	if (dequeue_entities(rq, &p->se, flags) < 0)
 		return false;

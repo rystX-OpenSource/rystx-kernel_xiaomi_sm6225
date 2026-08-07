@@ -3055,6 +3055,10 @@ static int proc_infinity_show(struct seq_file *m, struct pid_namespace *ns,
 	seq_printf(m, "futex_waiting:\t%d\n", ctx->futex_waiting);
 	seq_printf(m, "gpu_passovers:\t%d\n",
 		   atomic_read(&ctx->gpu_passovers));
+	seq_printf(m, "util_avg:\t%lu\n", READ_ONCE(task->se.avg.util_avg));
+	seq_printf(m, "runnable_avg:\t%lu\n", READ_ONCE(task->se.avg.runnable_avg));
+	seq_printf(m, "util_est:\t%u\n",
+		   READ_ONCE(task->se.avg.util_est.enqueued) & ~UTIL_AVG_UNCHANGED);
 	return 0;
 }
 
