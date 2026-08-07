@@ -206,14 +206,11 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    /*
     * Table layout (printf-style, auto-aligned):
     *
-    *   | %-22s | %13s | %-26s |
-    *   +------------------------+---------------+----------------------------+
-    *
-    * %-22s accounts for Unicode box-drawing in tree branch labels
-    * (each Unicode char = 3 bytes, 1 visible).  Total row width: 71.
+    *   | %-22s | %13s | %-30s |
+    *   +------------------------+---------------+--------------------------------+
     */
-   const char *SEP = "+------------------------+---------------+----------------------------+";
-   const char *ROW = "| %-22s | %13s | %-26s |\n";
+   const char *SEP = "+------------------------+---------------+---------------------------+";
+   const char *ROW = "| %-22s | %13s | %-30s |\n";
 
    if (write)
        return -EROFS;
@@ -378,16 +375,16 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
            bufsz);
    }
 
-   if (gcb && gapp == gcb)
+   if (!gcb)
+       strlcat(buf, "Verdict: No GPU jobs recorded yet\n",
+           bufsz);
+   else if (gapp >= gcb)
        strlcat(buf,
            "Verdict: All counters healthy -- system operating normally\n",
            bufsz);
-   else if (gcb && gapp < gcb)
+   else
        strlcat(buf,
            "Verdict: Accounting mismatch detected -- see above for details\n",
-           bufsz);
-   else
-       strlcat(buf, "Verdict: No GPU jobs recorded yet\n",
            bufsz);
 
    *lenp = simple_read_from_buffer(buffer, *lenp, ppos, buf,
