@@ -424,8 +424,12 @@ long __sched wait_woken(struct wait_queue_entry *wq_entry, unsigned int mode,
 	 * or woken_wake_function() sees our store to current->state.
 	 */
 	set_current_state(mode); /* A */
-	if (!(wq_entry->flags & WQ_FLAG_WOKEN) && !is_kthread_should_stop())
+	if (!(wq_entry->flags & WQ_FLAG_WOKEN) && !is_kthread_should_stop()) {
+		/* Infinity: flag IPC wait for the vslice boost on wakeup */
+		current->infinity.ipc_waiting = true;
 		timeout = schedule_timeout(timeout);
+		current->infinity.ipc_waiting = false;
+	}
 	__set_current_state(TASK_RUNNING);
 
 	/*

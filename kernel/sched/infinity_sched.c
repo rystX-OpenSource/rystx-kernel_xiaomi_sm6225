@@ -37,6 +37,10 @@
  */
 DEFINE_PER_CPU(atomic64_t, infinity_futex_boost_count);
 EXPORT_PER_CPU_SYMBOL(infinity_futex_boost_count);
+DEFINE_PER_CPU(atomic64_t, infinity_ipc_boost_count);
+EXPORT_PER_CPU_SYMBOL(infinity_ipc_boost_count);
+DEFINE_PER_CPU(atomic64_t, infinity_ipc_wakeup_count);
+EXPORT_PER_CPU_SYMBOL(infinity_ipc_wakeup_count);
 DEFINE_PER_CPU(atomic64_t, infinity_ema_climb_count);
 EXPORT_PER_CPU_SYMBOL(infinity_ema_climb_count);
 DEFINE_PER_CPU(atomic64_t, infinity_wakeup_count);
@@ -269,14 +273,15 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
     * buffer is sized from the same measurements, so the output can
     * never be truncated either.
     */
-   struct infinity_stats_row cpu_rows[5], rt_rows[1], gpu_rows[8];
+   struct infinity_stats_row cpu_rows[7], rt_rows[1], gpu_rows[8];
    struct infinity_stats_section sections[3] = {
-       { "CPU", cpu_rows, 5 },
+       { "CPU", cpu_rows, 7 },
        { "RT",  rt_rows,  1 },
        { "GPU", gpu_rows, 8 },
    };
    u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
    u64 gic, gcca, gpbo, gldr, icf, ismt;
+   u64 ipb, ipw;
    char *buf;
    size_t bufsz, off = 0;
    int lw = 0, vw = 0, nw = 0, s, r;
@@ -297,6 +302,8 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    gldr = infinity_stats_total(&infinity_gpu_lock_drain_rounds);
    icf  = infinity_stats_total(&infinity_cpufreq_interactive_count);
    ismt = infinity_stats_total(&infinity_smt_interactive_count);
+   ipb  = infinity_stats_total(&infinity_ipc_boost_count);
+   ipw  = infinity_stats_total(&infinity_ipc_wakeup_count);
 
    /* ---- CPU rows ---- */
    cpu_rows[0].label = "Futex boosts";
@@ -332,6 +339,20 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    fill_pretty_llu(cpu_rows[4].value, sizeof(cpu_rows[4].value), ismt);
    strscpy(cpu_rows[4].note, "interactive moves to idle core",
        sizeof(cpu_rows[4].note));
+
+   cpu_rows[5].label = "IPC boosts";
+   fill_pretty_llu(cpu_rows[5].value, sizeof(cpu_rows[5].value), ipb);
+   if (emc)
+       scnprintf(cpu_rows[5].note, sizeof(cpu_rows[5].note),
+             "%llu%% of tasks", mul_u64_u32_div(ipb, 100, emc));
+   else
+       strscpy(cpu_rows[5].note, "interactive IPC wakeups boosted",
+           sizeof(cpu_rows[5].note));
+
+   cpu_rows[6].label = "IPC wakeups";
+   fill_pretty_llu(cpu_rows[6].value, sizeof(cpu_rows[6].value), ipw);
+   strscpy(cpu_rows[6].note, "wait_woken candidates",
+       sizeof(cpu_rows[6].note));
 
    /* ---- RT rows ---- */
    rt_rows[0].label = "RT throttles";
@@ -638,6 +659,8 @@ void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
    ctx->rt_last_sleep_ns = 0;
    atomic_set(&ctx->gpu_passovers, 0);
    ctx->futex_waiting = false;
+   ctx->ipc_waiting = false;
+   ctx->ipc_last_boost = 0;
 }
 
 /* ------------------------------------------------------------------ */

@@ -5296,6 +5296,34 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		atomic64_inc(this_cpu_ptr(&infinity_futex_boost_count));
 	}
 
+	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
+	    task_of(se)->infinity.ipc_waiting &&
+	    !(task_of(se)->flags & PF_KTHREAD)) {
+		/* Infinity: IPC candidates -- all wait_woken wakeups. */
+		u64 now = rq_clock(rq_of(cfs_rq));
+		u64 last_boost = READ_ONCE(task_of(se)->infinity.ipc_last_boost);
+
+		atomic64_inc(this_cpu_ptr(&infinity_ipc_wakeup_count));
+		if (!last_boost ||
+		    (now > last_boost &&
+		     now - last_boost >= INFINITY_IPC_RATE_LIMIT_NS)) {
+			/* IPC boost gradient -- full 2x at sleep <= 1ms,
+			 * linear falloff to 1x at >= 8ms.
+			 */
+			u64 last_sleep = READ_ONCE(task_of(se)->infinity.last_sleep_ns);
+			u64 sleep_ns = (last_sleep && now > last_sleep) ?
+				       now - last_sleep : 0;
+			u64 red = infinity_ipc_gradient(sleep_ns);
+
+			if (red) {
+				vslice -= (vslice * red) >> INFINITY_FP_SHIFT;
+				WRITE_ONCE(task_of(se)->infinity.ipc_last_boost,
+					   now);
+				atomic64_inc(this_cpu_ptr(&infinity_ipc_boost_count));
+			}
+		}
+	}
+
 	/*
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
