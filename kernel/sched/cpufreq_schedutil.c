@@ -321,12 +321,17 @@ static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time,
  * sugov_iowait_boost() - Updates the IO boost status of a CPU.
  * @sg_cpu: the sugov data for the CPU to boost
  * @time: the update time from the caller
- * @flags: SCHED_CPUFREQ_IOWAIT if the task is waking up after an IO wait
+ * @flags: SCHED_CPUFREQ_IOWAIT if the task is waking up after an IO wait,
+ *         SCHED_CPUFREQ_INTERACTIVE if Infinity flagged an interactive wakeup
  *
  * Each time a task wakes up after an IO operation, the CPU utilization can be
  * boosted to a certain utilization which doubles at each "frequent and
  * successive" wakeup from IO, ranging from IOWAIT_BOOST_MIN to the utilization
  * of the maximum OPP.
+ *
+ * Infinity's SCHED_CPUFREQ_INTERACTIVE flag is treated identically, allowing
+ * interactive desktop wakeups (futex, timer) to get the same frequency ramp
+ * as IO-wait tasks without conflating the two signals for IO-wait tracking.
  *
  * To keep doubling, an IO boost has to be requested at least once per tick,
  * otherwise we restart from the utilization of the minimum OPP.
@@ -334,14 +339,15 @@ static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time,
 static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 			       unsigned int flags)
 {
-	bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;
+	bool set_iowait_boost = flags & (SCHED_CPUFREQ_IOWAIT |
+					  SCHED_CPUFREQ_INTERACTIVE);
 
 	/* Reset boost if the CPU appears to have been idle enough */
 	if (sg_cpu->iowait_boost &&
 	    sugov_iowait_reset(sg_cpu, time, set_iowait_boost))
 		return;
 
-	/* Boost only tasks waking up after IO */
+	/* Boost only tasks waking up after IO or interactive wakeups */
 	if (!set_iowait_boost)
 		return;
 
