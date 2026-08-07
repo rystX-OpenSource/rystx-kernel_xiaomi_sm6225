@@ -3854,6 +3854,7 @@ static void update_cfs_group(struct sched_entity *se)
 {
 	struct cfs_rq *gcfs_rq = group_cfs_rq(se);
 	long shares;
+	bool shield_reduced = false;
 
 	/*
 	 * When a group becomes empty, preserve its weight. This matters for
@@ -3935,13 +3936,22 @@ static void update_cfs_group(struct sched_entity *se)
 				long reduced = shares * (100ULL - red) / 100ULL;
 
 				shares = max_t(long, reduced, MIN_SHARES);
-				atomic64_inc(this_cpu_ptr(&infinity_shield_engage_count));
+				shield_reduced = true;
 			}
 		}
 	}
 
-	if (unlikely(se->load.weight != shares))
+	if (unlikely(se->load.weight != shares)) {
 		reweight_entity(cfs_rq_of(se), se, shares);
+		/* Infinity: the shield counter counts only shield-induced
+		 * reweights that actually changed the group share.  It
+		 * previously incremented on every update_cfs_group()
+		 * evaluation (per tick via entity_tick), overstating
+		 * applied reductions by ~3 orders of magnitude.
+		 */
+		if (shield_reduced)
+			atomic64_inc(this_cpu_ptr(&infinity_shield_engage_count));
+	}
 }
 
 #else /* CONFIG_FAIR_GROUP_SCHED */
