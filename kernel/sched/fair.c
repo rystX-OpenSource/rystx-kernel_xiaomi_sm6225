@@ -5672,7 +5672,12 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *se = pick_eevdf(cfs_rq);
 	if (unlikely(!se)) {
-		WARN_ON_ONCE(cfs_rq->nr_queued > 0);
+		/* pick_eevdf() legitimately returns NULL when every queued
+		 * entity is ineligible (tight-deadline windows from the
+		 * futex/IPC vslice reductions).  Falling back to the leftmost
+		 * queued entity keeps runnable tasks from being skipped
+		 * rather than idling.
+		 */
 		se = __pick_first_entity(cfs_rq);
 		if (!se)
 			return NULL;
