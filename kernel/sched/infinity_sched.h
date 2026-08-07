@@ -171,6 +171,9 @@ extern atomic_t infinity_gpu_completion_callbacks;
 extern atomic_t infinity_gpu_accounting_applied;
 extern atomic_t infinity_gpu_accounting_skipped;
 extern atomic_t infinity_gpu_passover_boosts;
+extern atomic_t infinity_gpu_idle_compensations;
+extern atomic_t infinity_gpu_cpu_coupling_activations;
+extern atomic_t infinity_gpu_lock_drain_rounds;
 
 /* ------------------------------------------------------------------ */
 /* API — called from fair.c and rt.c                                   */

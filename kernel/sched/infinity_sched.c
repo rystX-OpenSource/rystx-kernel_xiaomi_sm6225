@@ -19,6 +19,7 @@
 
 #include <linux/fs.h>
 #include <linux/math64.h>
+#include <linux/slab.h>
 #include <linux/sysctl.h>
 #include <linux/string.h>
 #include <uapi/linux/sched/types.h>
@@ -45,6 +46,12 @@ atomic_t infinity_gpu_accounting_skipped	= ATOMIC_INIT(0);
 EXPORT_SYMBOL(infinity_gpu_accounting_skipped);
 atomic_t infinity_gpu_passover_boosts = ATOMIC_INIT(0);
 EXPORT_SYMBOL(infinity_gpu_passover_boosts);
+atomic_t infinity_gpu_idle_compensations	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_idle_compensations);
+atomic_t infinity_gpu_cpu_coupling_activations	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_cpu_coupling_activations);
+atomic_t infinity_gpu_lock_drain_rounds		= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_lock_drain_rounds);
 
 /* ------------------------------------------------------------------ */
 /* Sysctl tunables                                                     */
@@ -190,10 +197,11 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
                        void *buffer, size_t *lenp,
                        loff_t *ppos)
 {
-   char buf[1536];
+   char *buf;
    u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
+   u64 gic, gcca, gpbo, gldr;
    char v1[16];
-   const size_t bufsz = sizeof(buf);
+   const size_t bufsz = 4096;
 
    /*
     * Table layout (printf-style, auto-aligned):
@@ -210,6 +218,10 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    if (write)
        return -EROFS;
 
+   buf = kmalloc(bufsz, GFP_KERNEL);
+   if (!buf)
+       return -ENOMEM;
+
    fbc  = (u64)(unsigned int)atomic_read(&infinity_futex_boost_count);
    emc  = (u64)(unsigned int)atomic_read(&infinity_ema_climb_count);
    wkc  = (u64)(unsigned int)atomic_read(&infinity_wakeup_count);
@@ -217,6 +229,10 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    gcb  = (u64)(unsigned int)atomic_read(&infinity_gpu_completion_callbacks);
    gapp = (u64)(unsigned int)atomic_read(&infinity_gpu_accounting_applied);
    gskp = (u64)(unsigned int)atomic_read(&infinity_gpu_accounting_skipped);
+   gic  = (u64)(unsigned int)atomic_read(&infinity_gpu_idle_compensations);
+   gcca = (u64)(unsigned int)atomic_read(&infinity_gpu_cpu_coupling_activations);
+   gpbo = (u64)(unsigned int)atomic_read(&infinity_gpu_passover_boosts);
+   gldr = (u64)(unsigned int)atomic_read(&infinity_gpu_lock_drain_rounds);
 
    buf[0] = '\0';
    scnprintf(buf + strlen(buf), bufsz - strlen(buf),
@@ -315,6 +331,26 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
          fill_pretty_llu(v1, sizeof(v1), gskp),
          "(no submit timestamp)");
 
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "Idle compensation",
+         fill_pretty_llu(v1, sizeof(v1), gic),
+         "proportional idle boost");
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "CPU->GPU coupling",
+         fill_pretty_llu(v1, sizeof(v1), gcca),
+         "interactive vtime reduction");
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "GPU->CPU coupling",
+         fill_pretty_llu(v1, sizeof(v1), gpbo),
+         "passover EMA boost");
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "Lock drain rounds",
+         fill_pretty_llu(v1, sizeof(v1), gldr),
+         "pending_ns drained");
+
    strlcat(buf, SEP, bufsz);
    strlcat(buf, "\n\n", bufsz);
 
@@ -356,6 +392,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
 
    *lenp = simple_read_from_buffer(buffer, *lenp, ppos, buf,
                    strnlen(buf, bufsz));
+   kfree(buf);
    return 0;
 }
 /* ------------------------------------------------------------------ */

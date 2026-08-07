@@ -55,6 +55,9 @@ bool infinity_is_interactive_candidate(struct task_struct *p);
 extern atomic_t infinity_gpu_completion_callbacks;
 extern atomic_t infinity_gpu_accounting_applied;
 extern atomic_t infinity_gpu_accounting_skipped;
+extern atomic_t infinity_gpu_idle_compensations;
+extern atomic_t infinity_gpu_cpu_coupling_activations;
+extern atomic_t infinity_gpu_lock_drain_rounds;
 
 /*
  * Maximum size of the dispatcher ringbuffer - the actual inflight size will be

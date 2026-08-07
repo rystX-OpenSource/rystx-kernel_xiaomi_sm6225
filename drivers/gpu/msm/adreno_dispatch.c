@@ -581,6 +581,8 @@ static u64 adreno_context_calc_vtime(struct adreno_dispatcher *dispatcher,
 				mul_u64_u32_div(drawctxt->gpu_time_total,
 						(u32)idle_ratio, 1U << 16);
 		}
+
+		atomic_inc(&infinity_gpu_idle_compensations);
 	} else {
 		effective_total = drawctxt->gpu_time_total;
 	}
@@ -633,6 +635,9 @@ static u64 adreno_context_calc_vtime(struct adreno_dispatcher *dispatcher,
 			}
 		}
 		rcu_read_unlock();
+
+		if (coupling_boost)
+			atomic_inc(&infinity_gpu_cpu_coupling_activations);
 
 		effective_total -= coupling_boost;
 	}
@@ -751,6 +756,8 @@ static void adreno_dispatcher_update_vtime_locked(
 				 drawctxt->gpu_time_ema) *
 				climb_ns * INFINITY_GPU_EMA_ALPHA,
 				INFINITY_GPU_EMA_CLIMB_NS * (1ULL << 8));
+
+			atomic_inc(&infinity_gpu_lock_drain_rounds);
 		}
 	}
 
