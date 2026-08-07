@@ -286,7 +286,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
          "RT throttles",
          fill_pretty_llu(v1, sizeof(v1), rtc),
-         "0 rogue SCHED_FIFO");
+         "FIFO rogue demotions");
 
    strlcat(buf, SEP, bufsz);
    strlcat(buf, "\n\n", bufsz);
@@ -344,9 +344,9 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
          "passover EMA boost");
 
    scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Lock drain rounds",
+         "Drain count",
          fill_pretty_llu(v1, sizeof(v1), gldr),
-         "pending_ns drained");
+         "batch drain operations");
 
    strlcat(buf, SEP, bufsz);
    strlcat(buf, "\n\n", bufsz);
