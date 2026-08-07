@@ -182,7 +182,11 @@ bool infinity_is_interactive_candidate(struct task_struct *p);
 /* RT safety valve constants                                           */
 /* ------------------------------------------------------------------ */
 
-/** rt_ema threshold: force rogue FIFO to yield. */
-#define INFINITY_RT_DEMOTE_THRESHOLD     9500ULL
+/**
+ * rt_ema threshold: force rogue SCHED_FIFO to yield when rt_ema exceeds
+ * 95% of INFINITY_RT_BUDGET_NS (10ms).  Expressed as a computed percentage
+ * of the budget to prevent unit mismatch errors.
+ */
+#define INFINITY_RT_DEMOTE_THRESHOLD    (INFINITY_RT_BUDGET_NS * 95ULL / 100ULL)
 
 #endif /* __INFINITY_SCHED_H */
