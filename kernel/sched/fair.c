@@ -9011,23 +9011,49 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		record_wakee(p);
 
 		/*
-		 * Infinity: on asymmetric topologies (Intel hybrid, ARM
-		 * big.LITTLE), bias interactive tasks (EMA == 0) toward the
-		 * highest-capacity P-cores.  READ_ONCE guards the lockless
-		 * ema read.
+		 * Infinity: on asymmetric topologies (hybrid P/E cores),
+		 * bias interactive tasks (EMA == 0) toward the highest-
+		 * capacity P-cores.  This avoids placing latency-sensitive
+		 * tasks on E-cores during wakeup.
+		 *
+		 * Prefer a P-core on the task's home node (prev_cpu) to
+		 * preserve cache warmth and memory locality on multi-node
+		 * machines; fall back to any allowed P-core otherwise.
+		 *
+		 * READ_ONCE guards the lockless ema read.
 		 */
 		if (sched_asym_cpucap_active() && READ_ONCE(p->infinity.ema) == 0) {
 			struct asym_cap_data *entry;
+			int best_cpu = -1;
+			int home_node = cpu_to_node(prev_cpu);
+
 			rcu_read_lock();
 			list_for_each_entry_rcu(entry, &asym_cap_list, link) {
-				int cpu = cpumask_first_and(cpu_capacity_span(entry),
-							    &p->cpus_allowed);
-				if (cpu < nr_cpu_ids) {
-					rcu_read_unlock();
-					return cpu;
+				int cpu;
+
+				/*
+				 * First allowed CPU of this capacity group,
+				 * kept as fallback (list is highest-capacity
+				 * first).
+				 */
+				cpu = cpumask_first_and(cpu_capacity_span(entry),
+							&p->cpus_allowed);
+				if (cpu < nr_cpu_ids && best_cpu < 0)
+					best_cpu = cpu;
+
+				/* Prefer a P-core on the task's home node. */
+				for_each_cpu_and(cpu, cpu_capacity_span(entry),
+						 &p->cpus_allowed) {
+					if (cpu_to_node(cpu) == home_node) {
+						rcu_read_unlock();
+						return cpu;
+					}
 				}
 			}
 			rcu_read_unlock();
+
+			if (best_cpu >= 0)
+				return best_cpu;
 		}
 
         if (sched_energy_enabled()) {
