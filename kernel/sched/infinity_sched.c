@@ -222,31 +222,67 @@ static u64 infinity_stats_total(const atomic64_t __percpu *counter)
    return total;
 }
 
+struct infinity_stats_row {
+   const char  *label;
+   char      value[16];
+   char      note[64];
+};
+
+struct infinity_stats_section {
+   const char      *name;
+   struct infinity_stats_row *rows;
+   int         nrows;
+};
+
+static size_t infinity_stats_emit_sep(char *buf, size_t sz, int lw, int vw, int nw)
+{
+   char *p = buf;
+   size_t need = (size_t)lw + vw + nw + 13;
+
+   if (sz < need)
+       return 0;
+
+   *p++ = '+';
+   memset(p, '-', lw + 2);
+   p += lw + 2;
+   *p++ = '+';
+   memset(p, '-', vw + 2);
+   p += vw + 2;
+   *p++ = '+';
+   memset(p, '-', nw + 2);
+   p += nw + 2;
+   *p++ = '+';
+   *p++ = '\n';
+   *p = '\0';
+
+   return need - 2;
+}
+
 static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
                        void *buffer, size_t *lenp,
                        loff_t *ppos)
 {
-   char *buf;
+   /*
+    * The table columns are sized from the widest content in each
+    * column across all sections, so the borders always line up no
+    * matter how the labels, values or notes grow or shrink.  The
+    * buffer is sized from the same measurements, so the output can
+    * never be truncated either.
+    */
+   struct infinity_stats_row cpu_rows[5], rt_rows[1], gpu_rows[8];
+   struct infinity_stats_section sections[3] = {
+       { "CPU", cpu_rows, 5 },
+       { "RT",  rt_rows,  1 },
+       { "GPU", gpu_rows, 8 },
+   };
    u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
    u64 gic, gcca, gpbo, gldr, icf, ismt;
-   char v1[16];
-   const size_t bufsz = 4096;
-
-   /*
-    * Table layout (printf-style, auto-aligned):
-    *
-    *   | %-22s | %13s | %-30s |
-    *   +------------------------+---------------+--------------------------------+
-    */
-   char *SEP = "+------------------------+---------------+--------------------------------+";
-   const char *ROW = "| %-22s | %13s | %-30s |\n";
+   char *buf;
+   size_t bufsz, off = 0;
+   int lw = 0, vw = 0, nw = 0, s, r;
 
    if (write)
        return -EROFS;
-
-   buf = kmalloc(bufsz, GFP_KERNEL);
-   if (!buf)
-       return -ENOMEM;
 
    fbc  = infinity_stats_total(&infinity_futex_boost_count);
    emc  = infinity_stats_total(&infinity_ema_climb_count);
@@ -262,133 +298,140 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    icf  = infinity_stats_total(&infinity_cpufreq_interactive_count);
    ismt = infinity_stats_total(&infinity_smt_interactive_count);
 
-   buf[0] = '\0';
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf),
-         "Infinity Scheduler %s\n\n", infinity_version);
+   /* ---- CPU rows ---- */
+   cpu_rows[0].label = "Futex boosts";
+   fill_pretty_llu(cpu_rows[0].value, sizeof(cpu_rows[0].value), fbc);
+   if (emc)
+       scnprintf(cpu_rows[0].note, sizeof(cpu_rows[0].note),
+             "%llu%% of tasks", mul_u64_u32_div(fbc, 100, emc));
+   else
+       strscpy(cpu_rows[0].note, "N/A", sizeof(cpu_rows[0].note));
 
-   /* ---- CPU ---- */
-   strlcat(buf, "CPU\n", bufsz);
-   strlcat(buf, SEP, bufsz);
-   strlcat(buf, "\n", bufsz);
+   cpu_rows[1].label = "EMA climbs";
+   fill_pretty_llu(cpu_rows[1].value, sizeof(cpu_rows[1].value), emc);
+   if (wkc) {
+       u64 avg_wakeup = mul_u64_u32_div(emc, 100, wkc);
 
-   if (emc) {
-       char pct[16];
-
-       scnprintf(pct, sizeof(pct), "%llu%% of tasks",
-             mul_u64_u32_div(fbc, 100, emc));
-       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-             "Futex boosts",
-             fill_pretty_llu(v1, sizeof(v1), fbc),
-             pct);
-   } else {
-       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-             "Futex boosts",
-             fill_pretty_llu(v1, sizeof(v1), fbc),
-             "N/A");
-   }
-
-   {
-       char avg[32];
-       u64 avg_wakeup = mul_u64_u32_div(emc, 100, max(wkc, 1ULL));
-
-       scnprintf(avg, sizeof(avg), "~%llu.%02llu/wakeup",
+       scnprintf(cpu_rows[1].note, sizeof(cpu_rows[1].note),
+             "~%llu.%02llu/wakeup",
              avg_wakeup / 100, avg_wakeup % 100);
-       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-             "EMA climbs",
-             fill_pretty_llu(v1, sizeof(v1), emc), avg);
-   }
-
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Wakeup decays",
-         fill_pretty_llu(v1, sizeof(v1), wkc), "");
-
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Interactive cpufreq",
-         fill_pretty_llu(v1, sizeof(v1), icf),
-         "frequency ramp events");
-
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "SMT placement",
-         fill_pretty_llu(v1, sizeof(v1), ismt),
-         "interactive moves to idle core");
-
-
-
-   strlcat(buf, SEP, bufsz);
-   strlcat(buf, "\n\n", bufsz);
-
-   /* ---- RT ---- */
-   strlcat(buf, "RT\n", bufsz);
-   strlcat(buf, SEP, bufsz);
-   strlcat(buf, "\n", bufsz);
-
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "RT throttles",
-         fill_pretty_llu(v1, sizeof(v1), rtc),
-         "FIFO rogue demotions");
-
-   strlcat(buf, SEP, bufsz);
-   strlcat(buf, "\n\n", bufsz);
-
-   /* ---- GPU ---- */
-   strlcat(buf, "GPU\n", bufsz);
-   strlcat(buf, SEP, bufsz);
-   strlcat(buf, "\n", bufsz);
-
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Completion entered",
-         fill_pretty_llu(v1, sizeof(v1), gcb),
-         "fence callbacks fired");
-
-   if (gcb) {
-       u64 whole = mul_u64_u32_div(gapp, 100, gcb);
-       u64 frac  = mul_u64_u32_div(gapp, 10000, gcb) % 100;
-       char v2[16];
-
-       scnprintf(v2, sizeof(v2), "%llu.%02llu%%", whole, frac);
-       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-             "Accounting applied",
-             fill_pretty_llu(v1, sizeof(v1), gapp),
-             v2);
    } else {
-       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-             "Accounting applied",
-             fill_pretty_llu(v1, sizeof(v1), gapp),
-             "N/A");
+       strscpy(cpu_rows[1].note, "N/A", sizeof(cpu_rows[1].note));
    }
 
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "  >> lock contention",
-         fill_pretty_llu(v1, sizeof(v1), 0),
-         "(lock contention)");
+   cpu_rows[2].label = "Wakeup decays";
+   fill_pretty_llu(cpu_rows[2].value, sizeof(cpu_rows[2].value), wkc);
+   cpu_rows[2].note[0] = '\0';
 
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "  >> entity not found",
-         fill_pretty_llu(v1, sizeof(v1), gskp),
-         "(no submit timestamp)");
+   cpu_rows[3].label = "Interactive cpufreq";
+   fill_pretty_llu(cpu_rows[3].value, sizeof(cpu_rows[3].value), icf);
+   strscpy(cpu_rows[3].note, "frequency ramp events",
+       sizeof(cpu_rows[3].note));
 
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Idle compensation",
-         fill_pretty_llu(v1, sizeof(v1), gic),
-         "proportional idle boost");
+   cpu_rows[4].label = "SMT placement";
+   fill_pretty_llu(cpu_rows[4].value, sizeof(cpu_rows[4].value), ismt);
+   strscpy(cpu_rows[4].note, "interactive moves to idle core",
+       sizeof(cpu_rows[4].note));
 
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "CPU->GPU coupling",
-         fill_pretty_llu(v1, sizeof(v1), gcca),
-         "interactive vtime reduction");
+   /* ---- RT rows ---- */
+   rt_rows[0].label = "RT throttles";
+   fill_pretty_llu(rt_rows[0].value, sizeof(rt_rows[0].value), rtc);
+   strscpy(rt_rows[0].note, "FIFO rogue demotions",
+       sizeof(rt_rows[0].note));
 
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "GPU->CPU coupling",
-         fill_pretty_llu(v1, sizeof(v1), gpbo),
-         "passover EMA boost");
+   /* ---- GPU rows ---- */
+   gpu_rows[0].label = "Completion entered";
+   fill_pretty_llu(gpu_rows[0].value, sizeof(gpu_rows[0].value), gcb);
+   strscpy(gpu_rows[0].note, "fence callbacks fired",
+       sizeof(gpu_rows[0].note));
 
-   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Drain count",
-         fill_pretty_llu(v1, sizeof(v1), gldr),
-         "batch drain operations");
+   gpu_rows[1].label = "Accounting applied";
+   fill_pretty_llu(gpu_rows[1].value, sizeof(gpu_rows[1].value), gapp);
+   if (gcb)
+       scnprintf(gpu_rows[1].note, sizeof(gpu_rows[1].note),
+             "%llu.%02llu%%",
+             mul_u64_u32_div(gapp, 100, gcb),
+             mul_u64_u32_div(gapp, 10000, gcb) % 100);
+   else
+       strscpy(gpu_rows[1].note, "N/A", sizeof(gpu_rows[1].note));
 
-   strlcat(buf, SEP, bufsz);
-   strlcat(buf, "\n\n", bufsz);
+   gpu_rows[2].label = "  >> lock contention";
+   fill_pretty_llu(gpu_rows[2].value, sizeof(gpu_rows[2].value), 0);
+   strscpy(gpu_rows[2].note, "(lock contention)",
+       sizeof(gpu_rows[2].note));
+
+   gpu_rows[3].label = "  >> entity not found";
+   fill_pretty_llu(gpu_rows[3].value, sizeof(gpu_rows[3].value), gskp);
+   strscpy(gpu_rows[3].note, "(no submit timestamp)",
+       sizeof(gpu_rows[3].note));
+
+   gpu_rows[4].label = "Idle compensation";
+   fill_pretty_llu(gpu_rows[4].value, sizeof(gpu_rows[4].value), gic);
+   strscpy(gpu_rows[4].note, "proportional idle boost",
+       sizeof(gpu_rows[4].note));
+
+   gpu_rows[5].label = "CPU->GPU coupling";
+   fill_pretty_llu(gpu_rows[5].value, sizeof(gpu_rows[5].value), gcca);
+   strscpy(gpu_rows[5].note, "interactive vtime reduction",
+       sizeof(gpu_rows[5].note));
+
+   gpu_rows[6].label = "GPU->CPU coupling";
+   fill_pretty_llu(gpu_rows[6].value, sizeof(gpu_rows[6].value), gpbo);
+   strscpy(gpu_rows[6].note, "passover EMA boost",
+       sizeof(gpu_rows[6].note));
+
+   gpu_rows[7].label = "Drain count";
+   fill_pretty_llu(gpu_rows[7].value, sizeof(gpu_rows[7].value), gldr);
+   strscpy(gpu_rows[7].note, "batch drain operations",
+       sizeof(gpu_rows[7].note));
+
+   /* measure the widest content per column across all sections */
+   for (s = 0; s < 3; s++)
+       for (r = 0; r < sections[s].nrows; r++) {
+           lw = max_t(int, lw, (int)strlen(sections[s].rows[r].label));
+           vw = max_t(int, vw, (int)strlen(sections[s].rows[r].value));
+           nw = max_t(int, nw, (int)strlen(sections[s].rows[r].note));
+       }
+
+   /*
+    * Size the buffer from the same measurements so the rendered
+    * table can never be truncated: the header, per-section name
+    * and two separators, every row, the blank lines between
+    * sections, plus a fixed allowance for the footer lines.
+    */
+   bufsz = strlen("Infinity Scheduler ") + strlen(infinity_version) + 2;
+   for (s = 0; s < 3; s++) {
+       bufsz += strlen(sections[s].name) + 1;
+       bufsz += 2 * ((size_t)lw + vw + nw + 13);
+       bufsz += (size_t)sections[s].nrows * ((size_t)lw + vw + nw + 13);
+       bufsz += 2;
+   }
+   bufsz += 256;
+
+   buf = kmalloc(bufsz, GFP_KERNEL);
+   if (!buf)
+       return -ENOMEM;
+
+   off = scnprintf(buf, bufsz, "Infinity Scheduler %s\n\n",
+           infinity_version);
+
+   for (s = 0; s < 3; s++) {
+       off += scnprintf(buf + off, bufsz - off, "%s\n",
+                sections[s].name);
+       off += infinity_stats_emit_sep(buf + off, bufsz - off,
+                          lw, vw, nw);
+
+       for (r = 0; r < sections[s].nrows; r++)
+           off += scnprintf(buf + off, bufsz - off,
+                    "| %-*s | %*s | %-*s |\n",
+                    lw, sections[s].rows[r].label,
+                    vw, sections[s].rows[r].value,
+                    nw, sections[s].rows[r].note);
+
+       off += infinity_stats_emit_sep(buf + off, bufsz - off,
+                          lw, vw, nw);
+       off += scnprintf(buf + off, bufsz - off, "\n");
+   }
 
    /* Footer */
    if (gcb) {
@@ -398,26 +441,23 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
 
        fill_pretty_llu(w1, sizeof(w1), gapp);
        fill_pretty_llu(w2, sizeof(w2), gcb);
-       scnprintf(buf + strlen(buf), bufsz - strlen(buf),
-             "Accounting confidence: %llu.%02llu%%  (%s / %s completions)\n",
-             whole, frac, w1, w2);
+       off += scnprintf(buf + off, bufsz - off,
+                "Accounting confidence: %llu.%02llu%%  (%s / %s completions)\n",
+                whole, frac, w1, w2);
    } else {
-       strlcat(buf,
-           "Accounting confidence: N/A  (no GPU jobs tracked)\n",
-           bufsz);
+       off += scnprintf(buf + off, bufsz - off,
+                "Accounting confidence: N/A  (no GPU jobs tracked)\n");
    }
 
    if (!gcb)
-       strlcat(buf, "Verdict: No GPU jobs recorded yet\n",
-           bufsz);
+       off += scnprintf(buf + off, bufsz - off,
+                "Verdict: No GPU jobs recorded yet\n");
    else if (gapp >= gcb)
-       strlcat(buf,
-           "Verdict: All counters healthy -- system operating normally\n",
-           bufsz);
+       off += scnprintf(buf + off, bufsz - off,
+                "Verdict: All counters healthy -- system operating normally\n");
    else
-       strlcat(buf,
-           "Verdict: Accounting mismatch detected -- see above for details\n",
-           bufsz);
+       off += scnprintf(buf + off, bufsz - off,
+                "Verdict: Accounting mismatch detected -- see above for details\n");
 
    {
        struct ctl_table tmp = {
