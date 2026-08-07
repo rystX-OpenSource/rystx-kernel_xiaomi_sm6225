@@ -1494,10 +1494,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
 			u64 delta = delta_exec;
 			if (delta > INFINITY_CGROUP_EMA_CLIMB_NS)
 				delta = INFINITY_CGROUP_EMA_CLIMB_NS;
+			u64 old = gcfs_rq->group_ema;
 			gcfs_rq->group_ema += div64_u64(
 				(INFINITY_CGROUP_EMA_CLIMB_NS - gcfs_rq->group_ema) *
 				delta * INFINITY_CGROUP_EMA_ALPHA,
 				INFINITY_CGROUP_EMA_CLIMB_NS * INFINITY_FP_ONE);
+			/* Infinity: the climb is saturating at INFINITY_CGROUP_EMA_CLIMB_NS;
+			 * a regression here indicates wraparound/corruption.
+			 */
+			WARN_ON_ONCE(gcfs_rq->group_ema < old);
 		}
 	}
 
@@ -6733,13 +6738,28 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		if (pcfs_rq->group_ema_sleep_start) {
 			u64 now = rq_clock(rq_of(pcfs_rq));
-			u64 sleep_ns = now - pcfs_rq->group_ema_sleep_start;
-			u64 periods = div64_u64(sleep_ns,
-				INFINITY_CGROUP_EMA_HALFLIFE_NS);
-			if (periods > 63)
-				pcfs_rq->group_ema = 0;
-			else
-				pcfs_rq->group_ema >>= periods;
+
+			/*
+			 * Infinity: group_ema stamps are rq_clock() taken under the
+			 * owning rq's lock (fresh at stamp time).  The arrival may be
+			 * on another rq after migration, so the delta is guarded: a
+			 * backward clock (broken TSC sync / cross-rq skew) retains
+			 * the EMA -- the safe direction, same pattern as the task
+			 * (fair.c) and RT paths.
+			 */
+			if (now > pcfs_rq->group_ema_sleep_start) {
+				u64 old = pcfs_rq->group_ema;
+				u64 sleep_ns = now - pcfs_rq->group_ema_sleep_start;
+				u64 periods = div64_u64(sleep_ns,
+							 INFINITY_CGROUP_EMA_HALFLIFE_NS);
+
+				if (periods > 63)
+					pcfs_rq->group_ema = 0;
+				else
+					pcfs_rq->group_ema >>= periods;
+				/* Infinity: decay must never raise the EMA. */
+				WARN_ON_ONCE(pcfs_rq->group_ema > old);
+			}
 			pcfs_rq->group_ema_sleep_start = 0;
 		}
 	}
