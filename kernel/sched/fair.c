@@ -6948,8 +6948,15 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		cfs_rq->h_nr_idle += h_nr_idle;
 
 		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(cfs_rq))
+		if (cfs_rq_throttled(cfs_rq)) {
+			/* A wakeup landing on a throttled cfs_rq skips the
+			 * clearing below; clear the wake flags so they cannot
+			 * produce a stale boost at unthrottle.
+			 */
+			WRITE_ONCE(p->infinity.futex_waiting, false);
+			WRITE_ONCE(p->infinity.ipc_waiting, false);
 			goto enqueue_throttle;
+		}
 
 		flags = ENQUEUE_WAKEUP;
 	}
