@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * infinity_sched.h — Infinity scheduler API (v4.6-gpu).
+ * infinity_sched.h — Infinity scheduler API (v4.7-gpu).
  *
  * Architecture:
  *
@@ -174,6 +174,8 @@ extern atomic_t infinity_gpu_passover_boosts;
 extern atomic_t infinity_gpu_idle_compensations;
 extern atomic_t infinity_gpu_cpu_coupling_activations;
 extern atomic_t infinity_gpu_lock_drain_rounds;
+extern atomic_t infinity_cpufreq_interactive_count;
+extern atomic_t infinity_smt_interactive_count;
 
 /* ------------------------------------------------------------------ */
 /* API — called from fair.c and rt.c                                   */

@@ -5591,8 +5591,10 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 	 */
 	if (entity_is_task(se)) {
 		struct task_struct *p = task_of(se);
-		if (p->infinity.ema == 0)
+		if (p->infinity.ema == 0) {
 			cpufreq_update_util(rq, SCHED_CPUFREQ_INTERACTIVE);
+			atomic_inc(&infinity_cpufreq_interactive_count);
+		}
 	}
 
 	return se;
@@ -9067,7 +9069,6 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		/* Fast path */
 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
 
-#ifdef CONFIG_INFINITY_SCHED
 		/* SMT interactive placement: if the selected CPU is an SMT
 		 * thread with a busy sibling, and the waking task has low
 		 * EMA, try the primary thread of the same core instead.
@@ -9079,10 +9080,11 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 				topology_sibling_cpumask(new_cpu));
 
 			if (primary != new_cpu &&
-			    cpu_rq(primary)->nr_running == 0)
+			    available_idle_cpu(primary)) {
 				new_cpu = primary;
+				atomic_inc(&infinity_smt_interactive_count);
+			}
 		}
-#endif
 	}
 	rcu_read_unlock();
 

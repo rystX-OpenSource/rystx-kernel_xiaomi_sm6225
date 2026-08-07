@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  *
- * infinity_sched.c — Infinity scheduler algorithm (v4.6-gpu).
+ * infinity_sched.c — Infinity scheduler algorithm (v4.7-gpu).
  *
  * Fully continuous limit-based scheduling:
  *
@@ -52,6 +52,10 @@ atomic_t infinity_gpu_cpu_coupling_activations	= ATOMIC_INIT(0);
 EXPORT_SYMBOL(infinity_gpu_cpu_coupling_activations);
 atomic_t infinity_gpu_lock_drain_rounds		= ATOMIC_INIT(0);
 EXPORT_SYMBOL(infinity_gpu_lock_drain_rounds);
+atomic_t infinity_cpufreq_interactive_count	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_cpufreq_interactive_count);
+atomic_t infinity_smt_interactive_count		= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_smt_interactive_count);
 
 /* ------------------------------------------------------------------ */
 /* Sysctl tunables                                                     */
@@ -199,7 +203,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
 {
    char *buf;
    u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
-   u64 gic, gcca, gpbo, gldr;
+   u64 gic, gcca, gpbo, gldr, icf, ismt;
    char v1[16];
    const size_t bufsz = 4096;
 
@@ -230,10 +234,12 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    gcca = (u64)(unsigned int)atomic_read(&infinity_gpu_cpu_coupling_activations);
    gpbo = (u64)(unsigned int)atomic_read(&infinity_gpu_passover_boosts);
    gldr = (u64)(unsigned int)atomic_read(&infinity_gpu_lock_drain_rounds);
+   icf  = (u64)(unsigned int)atomic_read(&infinity_cpufreq_interactive_count);
+   ismt = (u64)(unsigned int)atomic_read(&infinity_smt_interactive_count);
 
    buf[0] = '\0';
    scnprintf(buf + strlen(buf), bufsz - strlen(buf),
-         "Infinity Scheduler v4.6-gpu\n\n");
+         "Infinity Scheduler %s\n\n", infinity_version);
 
    /* ---- CPU ---- */
    strlcat(buf, "CPU\n", bufsz);
@@ -272,8 +278,16 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
          fill_pretty_llu(v1, sizeof(v1), wkc), "");
 
    scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
-         "Per-task EMA range",
-         "   0 - 10,000", "");
+         "Interactive cpufreq",
+         fill_pretty_llu(v1, sizeof(v1), icf),
+         "frequency ramp events");
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "SMT placement",
+         fill_pretty_llu(v1, sizeof(v1), ismt),
+         "interactive moves to idle core");
+
+
 
    strlcat(buf, SEP, bufsz);
    strlcat(buf, "\n\n", bufsz);

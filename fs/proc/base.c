@@ -3045,7 +3045,6 @@ static int proc_pid_patch_state(struct seq_file *m, struct pid_namespace *ns,
 }
 #endif /* CONFIG_LIVEPATCH */
 
-#ifdef CONFIG_INFINITY_SCHED
 static int proc_infinity_show(struct seq_file *m, struct pid_namespace *ns,
 			      struct pid *pid, struct task_struct *task)
 {
@@ -3058,7 +3057,6 @@ static int proc_infinity_show(struct seq_file *m, struct pid_namespace *ns,
 		   atomic_read(&ctx->gpu_passovers));
 	return 0;
 }
-#endif
 
 /*
  * Thread groups
@@ -3086,9 +3084,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_SCHED_AUTOGROUP
 	REG("autogroup",  S_IRUGO|S_IWUSR, proc_pid_sched_autogroup_operations),
 #endif
-#ifdef CONFIG_INFINITY_SCHED
 	ONE("infinity",   0444, proc_infinity_show),
-#endif
 	REG("comm",      S_IRUGO|S_IWUSR, proc_pid_set_comm_operations),
 #ifdef CONFIG_HAVE_ARCH_TRACEHOOK
 	ONE("syscall",    S_IRUSR, proc_pid_syscall),
