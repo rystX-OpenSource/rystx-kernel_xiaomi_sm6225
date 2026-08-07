@@ -2556,6 +2556,15 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	 * the release threshold is actually reachable for a continuously
 	 * running rogue FIFO (rt_ema otherwise climbs only on consume and
 	 * decays only on wakeup).
+	 *
+	 * Lone-FIFO limitation: native requeue can only yield to
+	 * same-priority competitors; for a FIFO that is alone at its
+	 * priority level the requeue is a no-op by RT semantics (no
+	 * cross-class demotion by design).  The valve still rate-limits
+	 * and drives the synthetic decay, and the tickless fold (see
+	 * infinity_rt_consume) keeps the EMA meaningful when ticks are
+	 * stopped, so a later same-priority arrival is granted the
+	 * re-armed window it deserves.
 	 */
 	if (p->policy != SCHED_RR && !(p->flags & PF_KTHREAD)) {
 		if (p->infinity.rt_ema >= INFINITY_RT_DEMOTE_THRESHOLD) {
@@ -2563,8 +2572,8 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 			    time_after_eq(jiffies,
 					  p->infinity.rt_valve_last_jiffies +
 					  msecs_to_jiffies(INFINITY_RT_REQUEUE_MS))) {
-				p->infinity.rt_valve_armed = true;
-				p->infinity.rt_valve_last_jiffies = jiffies;
+				WRITE_ONCE(p->infinity.rt_valve_armed, true);
+				WRITE_ONCE(p->infinity.rt_valve_last_jiffies, jiffies);
 				requeue_task_rt(rq, p, 0);
 				resched_curr(rq);
 				atomic64_inc(this_cpu_ptr(&infinity_rt_throttle_count));
@@ -2611,7 +2620,7 @@ static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
 	 * Time slice is 0 for SCHED_FIFO tasks
 	 */
 	if (task->policy == SCHED_RR)
-		return sched_rr_timeslice;
+		return infinity_rr_timeslice(task, sched_rr_timeslice);
 	else
 		return 0;
 }

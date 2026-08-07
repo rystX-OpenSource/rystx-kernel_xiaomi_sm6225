@@ -658,24 +658,32 @@ void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
 
 void infinity_rt_consume(struct infinity_ctx *ctx, u64 delta_ns)
 {
-   u64 step;
+   u64 step, ema;
 
-   if (unlikely(ctx->rt_ema >= INFINITY_RT_BUDGET_NS)) {
-       ctx->rt_ema = INFINITY_RT_BUDGET_NS;
+   ema = READ_ONCE(ctx->rt_ema);
+   if (unlikely(ema >= INFINITY_RT_BUDGET_NS)) {
+       WRITE_ONCE(ctx->rt_ema, INFINITY_RT_BUDGET_NS);
        return;
    }
 
-   /* Clamp delta_ns to prevent u64 overflow in the numerator for
-    * tickless (NO_HZ_FULL) configurations where delta_ns can span
-    * hundreds of seconds between calls.  Matches the same clamp
-    * used in infinity_consume for the Fair class. */
-   if (delta_ns > INFINITY_RT_BUDGET_NS)
-       delta_ns = INFINITY_RT_BUDGET_NS;
+   /* Clamp the fold at one time constant: a tickless (NO_HZ_FULL) run
+    * longer than one tau (640ms) saturates the EMA at the ceiling.
+    * The old 10ms delta clamp let a long tickless run add only 1/64
+    * of the remaining gap per call, making the 95% engage threshold
+    * unreachable.  The fold below is identical to the old formula for
+    * deltas under one tau and saturates at or beyond it, so the EMA
+    * now tracks wall-clock runtime.  The early return also bounds the
+    * multiply: delta < tau implies (BUDGET - ema) * delta <
+    * BUDGET * TAU, far below u64 limits.
+    */
+   if (delta_ns >= INFINITY_RT_TAU_NS) {
+       WRITE_ONCE(ctx->rt_ema, INFINITY_RT_BUDGET_NS);
+       return;
+   }
 
-   step = div64_u64((INFINITY_RT_BUDGET_NS - ctx->rt_ema) * delta_ns *
-              INFINITY_RT_ALPHA,
-              INFINITY_RT_BUDGET_NS * INFINITY_FP_ONE);
-   ctx->rt_ema += step;
+   step = div64_u64((INFINITY_RT_BUDGET_NS - ema) * delta_ns,
+                    INFINITY_RT_TAU_NS);
+   WRITE_ONCE(ctx->rt_ema, ema + step);
 }
 
 /* ------------------------------------------------------------------ */

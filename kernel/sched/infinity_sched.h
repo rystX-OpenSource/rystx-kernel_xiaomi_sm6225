@@ -197,6 +197,9 @@ static inline u32 infinity_calc_weight(struct task_struct *p, u64 ema)
 /** RT alpha. */
 #define INFINITY_RT_ALPHA        4
 
+/** RT EMA time constant: one tau of accumulated runtime closes the entire remaining gap (640ms). */
+#define INFINITY_RT_TAU_NS (INFINITY_RT_BUDGET_NS * INFINITY_FP_ONE / INFINITY_RT_ALPHA)
+
 /* ------------------------------------------------------------------ */
 /* External sysctl tunables                                            */
 /* ------------------------------------------------------------------ */
