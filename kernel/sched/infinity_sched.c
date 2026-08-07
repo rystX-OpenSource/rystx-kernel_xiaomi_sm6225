@@ -27,6 +27,7 @@
 #include "infinity_sched.h"
 
 /* ------------------------------------------------------------------ */
+/* Stats counters                                                      */
 /* ------------------------------------------------------------------ */
 /*
  * Per-CPU stat counters: increment sites run on arbitrary CPUs (tick,
@@ -34,8 +35,6 @@
  * one cache line across sockets on multi-node machines.  Per-CPU storage
  * keeps the hot increments local; infinity_stats_total() sums all CPUs.
  */
-/* Stats counters                                                      */
-/* ------------------------------------------------------------------ */
 DEFINE_PER_CPU(atomic64_t, infinity_futex_boost_count);
 EXPORT_PER_CPU_SYMBOL(infinity_futex_boost_count);
 DEFINE_PER_CPU(atomic64_t, infinity_ema_climb_count);
@@ -249,18 +248,18 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    if (!buf)
        return -ENOMEM;
 
-   fbc = infinity_stats_total(&infinity_futex_boost_count);
-   emc = infinity_stats_total(&infinity_ema_climb_count);
-   wkc = infinity_stats_total(&infinity_wakeup_count);
-   rtc = infinity_stats_total(&infinity_rt_throttle_count);
-   gcb = infinity_stats_total(&infinity_gpu_completion_callbacks);
+   fbc  = infinity_stats_total(&infinity_futex_boost_count);
+   emc  = infinity_stats_total(&infinity_ema_climb_count);
+   wkc  = infinity_stats_total(&infinity_wakeup_count);
+   rtc  = infinity_stats_total(&infinity_rt_throttle_count);
+   gcb  = infinity_stats_total(&infinity_gpu_completion_callbacks);
    gapp = infinity_stats_total(&infinity_gpu_accounting_applied);
    gskp = infinity_stats_total(&infinity_gpu_accounting_skipped);
-   gic = infinity_stats_total(&infinity_gpu_idle_compensations);
+   gic  = infinity_stats_total(&infinity_gpu_idle_compensations);
    gcca = infinity_stats_total(&infinity_gpu_cpu_coupling_activations);
    gpbo = infinity_stats_total(&infinity_gpu_passover_boosts);
    gldr = infinity_stats_total(&infinity_gpu_lock_drain_rounds);
-   icf = infinity_stats_total(&infinity_cpufreq_interactive_count);
+   icf  = infinity_stats_total(&infinity_cpufreq_interactive_count);
    ismt = infinity_stats_total(&infinity_smt_interactive_count);
 
    buf[0] = '\0';
