@@ -53,12 +53,12 @@ bool infinity_is_interactive_candidate(struct task_struct *p);
 /* Infinity stats counters (accessible from infinity_sched.c)          */
 /* ------------------------------------------------------------------ */
 #include <linux/atomic.h>
-DECLARE_PER_CPU(atomic_t, infinity_gpu_completion_callbacks);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_accounting_applied);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_accounting_skipped);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_idle_compensations);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_cpu_coupling_activations);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_lock_drain_rounds);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_completion_callbacks);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_accounting_applied);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_accounting_skipped);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_idle_compensations);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_cpu_coupling_activations);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_lock_drain_rounds);
 
 /*
  * Maximum size of the dispatcher ringbuffer - the actual inflight size will be

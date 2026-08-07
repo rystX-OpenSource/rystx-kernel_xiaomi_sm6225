@@ -163,19 +163,19 @@ extern unsigned long infinity_tune_smt_divisor;
 /* Stats counters                                                      */
 /* ------------------------------------------------------------------ */
 
-DECLARE_PER_CPU(atomic_t, infinity_futex_boost_count);
-DECLARE_PER_CPU(atomic_t, infinity_ema_climb_count);
-DECLARE_PER_CPU(atomic_t, infinity_wakeup_count);
-DECLARE_PER_CPU(atomic_t, infinity_rt_throttle_count);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_completion_callbacks);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_accounting_applied);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_accounting_skipped);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_passover_boosts);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_idle_compensations);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_cpu_coupling_activations);
-DECLARE_PER_CPU(atomic_t, infinity_gpu_lock_drain_rounds);
-DECLARE_PER_CPU(atomic_t, infinity_cpufreq_interactive_count);
-DECLARE_PER_CPU(atomic_t, infinity_smt_interactive_count);
+DECLARE_PER_CPU(atomic64_t, infinity_futex_boost_count);
+DECLARE_PER_CPU(atomic64_t, infinity_ema_climb_count);
+DECLARE_PER_CPU(atomic64_t, infinity_wakeup_count);
+DECLARE_PER_CPU(atomic64_t, infinity_rt_throttle_count);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_completion_callbacks);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_accounting_applied);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_accounting_skipped);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_passover_boosts);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_idle_compensations);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_cpu_coupling_activations);
+DECLARE_PER_CPU(atomic64_t, infinity_gpu_lock_drain_rounds);
+DECLARE_PER_CPU(atomic64_t, infinity_cpufreq_interactive_count);
+DECLARE_PER_CPU(atomic64_t, infinity_smt_interactive_count);
 
 /* ------------------------------------------------------------------ */
 /* API — called from fair.c and rt.c                                   */

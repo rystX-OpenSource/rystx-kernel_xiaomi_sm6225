@@ -2551,7 +2551,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	    p->infinity.rt_ema >= INFINITY_RT_DEMOTE_THRESHOLD) {
 		requeue_task_rt(rq, p, 0);
 		resched_curr(rq);
-		atomic_inc(this_cpu_ptr(&infinity_rt_throttle_count));
+		atomic64_inc(this_cpu_ptr(&infinity_rt_throttle_count));
 		return;
 	}
 

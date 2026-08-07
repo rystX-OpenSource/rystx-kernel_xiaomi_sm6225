@@ -582,7 +582,7 @@ static u64 adreno_context_calc_vtime(struct adreno_dispatcher *dispatcher,
 						(u32)idle_ratio, 1U << 16);
 		}
 
-		atomic_inc(this_cpu_ptr(&infinity_gpu_idle_compensations));
+		atomic64_inc(this_cpu_ptr(&infinity_gpu_idle_compensations));
 	} else {
 		effective_total = drawctxt->gpu_time_total;
 	}
@@ -637,7 +637,7 @@ static u64 adreno_context_calc_vtime(struct adreno_dispatcher *dispatcher,
 		rcu_read_unlock();
 
 		if (coupling_boost)
-			atomic_inc(this_cpu_ptr(&infinity_gpu_cpu_coupling_activations));
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_cpu_coupling_activations));
 
 		effective_total -= coupling_boost;
 	}
@@ -757,7 +757,7 @@ static void adreno_dispatcher_update_vtime_locked(
 				climb_ns * INFINITY_GPU_EMA_ALPHA,
 				INFINITY_GPU_EMA_CLIMB_NS * (1ULL << 8));
 
-			atomic_inc(this_cpu_ptr(&infinity_gpu_lock_drain_rounds));
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_lock_drain_rounds));
 		}
 	}
 
@@ -2796,7 +2796,7 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 		if (gpu_ns > INFINITY_GPU_EMA_CLIMB_NS)
 			gpu_ns = INFINITY_GPU_EMA_CLIMB_NS;
 
-		atomic_inc(this_cpu_ptr(&infinity_gpu_completion_callbacks));
+		atomic64_inc(this_cpu_ptr(&infinity_gpu_completion_callbacks));
 
 		/* Upstream splits applied/skipped on whether the drm_sched
 		 * entity survived until drm_sched_get_finished_job().  KGSL
@@ -2809,9 +2809,9 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 		 */
 		if (gpu_ns) {
 			atomic64_add(gpu_ns, &drawctxt->pending_gpu_ns);
-			atomic_inc(this_cpu_ptr(&infinity_gpu_accounting_applied));
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_accounting_applied));
 		} else {
-			atomic_inc(this_cpu_ptr(&infinity_gpu_accounting_skipped));
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_accounting_skipped));
 		}
 	}
 

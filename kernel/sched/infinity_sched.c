@@ -36,31 +36,31 @@
  */
 /* Stats counters                                                      */
 /* ------------------------------------------------------------------ */
-DEFINE_PER_CPU(atomic_t, infinity_futex_boost_count);
+DEFINE_PER_CPU(atomic64_t, infinity_futex_boost_count);
 EXPORT_PER_CPU_SYMBOL(infinity_futex_boost_count);
-DEFINE_PER_CPU(atomic_t, infinity_ema_climb_count);
+DEFINE_PER_CPU(atomic64_t, infinity_ema_climb_count);
 EXPORT_PER_CPU_SYMBOL(infinity_ema_climb_count);
-DEFINE_PER_CPU(atomic_t, infinity_wakeup_count);
+DEFINE_PER_CPU(atomic64_t, infinity_wakeup_count);
 EXPORT_PER_CPU_SYMBOL(infinity_wakeup_count);
-DEFINE_PER_CPU(atomic_t, infinity_rt_throttle_count);
+DEFINE_PER_CPU(atomic64_t, infinity_rt_throttle_count);
 EXPORT_PER_CPU_SYMBOL(infinity_rt_throttle_count);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_completion_callbacks);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_completion_callbacks);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_completion_callbacks);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_accounting_applied);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_accounting_applied);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_accounting_applied);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_accounting_skipped);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_accounting_skipped);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_accounting_skipped);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_passover_boosts);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_passover_boosts);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_passover_boosts);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_idle_compensations);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_idle_compensations);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_idle_compensations);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_cpu_coupling_activations);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_cpu_coupling_activations);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_cpu_coupling_activations);
-DEFINE_PER_CPU(atomic_t, infinity_gpu_lock_drain_rounds);
+DEFINE_PER_CPU(atomic64_t, infinity_gpu_lock_drain_rounds);
 EXPORT_PER_CPU_SYMBOL(infinity_gpu_lock_drain_rounds);
-DEFINE_PER_CPU(atomic_t, infinity_cpufreq_interactive_count);
+DEFINE_PER_CPU(atomic64_t, infinity_cpufreq_interactive_count);
 EXPORT_PER_CPU_SYMBOL(infinity_cpufreq_interactive_count);
-DEFINE_PER_CPU(atomic_t, infinity_smt_interactive_count);
+DEFINE_PER_CPU(atomic64_t, infinity_smt_interactive_count);
 EXPORT_PER_CPU_SYMBOL(infinity_smt_interactive_count);
 
 /* ------------------------------------------------------------------ */
@@ -163,43 +163,45 @@ static __maybe_unused void fmt_val(char *buf, size_t sz, u64 val, unsigned int w
    }
 }
 /* ------------------------------------------------------------------ */
-/* val_from_u64 -- Format u64 into string with comma separators.       *
- * Result is right-aligned in a 13-char field (null-terminated).       *
- * If the formatted value exceeds 13 characters, the leftmost digits   *
- * are truncated (keeps rightmost digits) to prevent table columns     *
- * from shifting.
+/*
+ * fill_pretty_llu - format u64 with K/M/B/T/Qa/Qi suffixes, two
+ * decimal digits, floor-truncated (1230 -> "1.23K").  The output is
+ * at most 8 characters, so the table columns never shift regardless
+ * of how large the counters grow.
  */
-/* ------------------------------------------------------------------ */
+static const struct infinity_suffix {
+   u64      base;
+   const char  *suffix;
+} infinity_suffixes[] = {
+   { 1000000000000000000ULL, "Qi" },
+   { 1000000000000000ULL,    "Qa" },
+   { 1000000000000ULL,       "T"  },
+   { 1000000000ULL,          "B"  },
+   { 1000000ULL,             "M"  },
+   { 1000ULL,                "K"  },
+};
+
 static char *fill_pretty_llu(char *buf, size_t sz, u64 val)
 {
-   char raw[24];
-   char tmp[32];
-   int raw_len, i, pos = 0, keep;
+   u64 q, r, frac;
+   int i;
 
-   if (val == 0) {
-       scnprintf(tmp, sizeof(tmp), "0");
-   } else {
-       scnprintf(raw, sizeof(raw), "%llu", (unsigned long long)val);
-       raw_len = strlen(raw);
-       for (i = 0; i < raw_len; i++) {
-           if (i > 0 && (raw_len - i) % 3 == 0)
-               tmp[pos++] = ',';
-           tmp[pos++] = raw[i];
-       }
-       tmp[pos] = '\0';
+   for (i = 0; i < ARRAY_SIZE(infinity_suffixes); i++) {
+       if (val < infinity_suffixes[i].base)
+           continue;
+
+       q = div64_u64_rem(val, infinity_suffixes[i].base, &r);
+       frac = mul_u64_u32_div(r, 100, infinity_suffixes[i].base);
+       scnprintf(buf, sz, "%llu.%02llu%s",
+             (unsigned long long)q, (unsigned long long)frac,
+             infinity_suffixes[i].suffix);
+       return buf;
    }
 
-   /* Truncate leftmost digits if too long for the 14-char column */
-   pos = strlen(tmp);
-   if (pos > 14) {
-       keep = pos - 14;
-       /* Advance past the truncation point */
-       scnprintf(buf, sz, "%13s", tmp + keep);
-   } else {
-       scnprintf(buf, sz, "%13s", tmp);
-   }
+   scnprintf(buf, sz, "%llu", (unsigned long long)val);
    return buf;
 }
+
 /* ------------------------------------------------------------------ */
 /* Stats display handler                                               */
 /* ------------------------------------------------------------------ */
@@ -207,16 +209,16 @@ static char *fill_pretty_llu(char *buf, size_t sz, u64 val)
  * infinity_stats_total - sum a per-CPU stat counter across all CPUs.
  *
  * Each increment lands on exactly one CPU's counter, so the sum is the
- * true total.  Cast through unsigned int to preserve the 32-bit wrap
- * semantics of atomic_read() (no sign extension for counters past 2^31).
+ * true total.  64-bit counters cannot wrap in practice, so the sum is
+ * exact for any value the kernel can produce.
  */
-static u64 infinity_stats_total(const atomic_t __percpu *counter)
+static u64 infinity_stats_total(const atomic64_t __percpu *counter)
 {
    u64 total = 0;
    int cpu;
 
    for_each_possible_cpu(cpu)
-       total += (u64)(unsigned int)atomic_read(per_cpu_ptr(counter, cpu));
+       total += atomic64_read(per_cpu_ptr(counter, cpu));
 
    return total;
 }
@@ -237,7 +239,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
     *   | %-22s | %13s | %-30s |
     *   +------------------------+---------------+--------------------------------+
     */
-   const char *SEP = "+------------------------+---------------+---------------------------+";
+   char *SEP = "+------------------------+---------------+--------------------------------+";
    const char *ROW = "| %-22s | %13s | %-30s |\n";
 
    if (write)
@@ -274,7 +276,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
        char pct[16];
 
        scnprintf(pct, sizeof(pct), "%llu%% of tasks",
-             div64_u64(fbc * 100ULL, emc));
+             mul_u64_u32_div(fbc, 100, emc));
        scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
              "Futex boosts",
              fill_pretty_llu(v1, sizeof(v1), fbc),
@@ -287,8 +289,8 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    }
 
    {
-       char avg[24];
-       u64 avg_wakeup = div64_u64(emc * 100ULL, max(wkc, 1ULL));
+       char avg[32];
+       u64 avg_wakeup = mul_u64_u32_div(emc, 100, max(wkc, 1ULL));
 
        scnprintf(avg, sizeof(avg), "~%llu.%02llu/wakeup",
              avg_wakeup / 100, avg_wakeup % 100);
@@ -340,8 +342,8 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
          "fence callbacks fired");
 
    if (gcb) {
-       u64 whole = div64_u64(gapp * 100ULL, gcb);
-       u64 frac  = div64_u64(gapp * 10000ULL, gcb) % 100;
+       u64 whole = mul_u64_u32_div(gapp, 100, gcb);
+       u64 frac  = mul_u64_u32_div(gapp, 10000, gcb) % 100;
        char v2[16];
 
        scnprintf(v2, sizeof(v2), "%llu.%02llu%%", whole, frac);
@@ -391,22 +393,15 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
 
    /* Footer */
    if (gcb) {
-       u64 whole = div64_u64(gapp * 100ULL, gcb);
-       u64 frac  = div64_u64(gapp * 10000ULL, gcb) % 100;
-       char w1[16], w2[16], *p1, *p2;
+       u64 whole = mul_u64_u32_div(gapp, 100, gcb);
+       u64 frac  = mul_u64_u32_div(gapp, 10000, gcb) % 100;
+       char w1[16], w2[16];
 
        fill_pretty_llu(w1, sizeof(w1), gapp);
        fill_pretty_llu(w2, sizeof(w2), gcb);
-       /* Strip leading spaces for the confidence line */
-       p1 = w1;
-       while (*p1 == ' ')
-           p1++;
-       p2 = w2;
-       while (*p2 == ' ')
-           p2++;
        scnprintf(buf + strlen(buf), bufsz - strlen(buf),
              "Accounting confidence: %llu.%02llu%%  (%s / %s completions)\n",
-             whole, frac, p1, p2);
+             whole, frac, w1, w2);
    } else {
        strlcat(buf,
            "Accounting confidence: N/A  (no GPU jobs tracked)\n",
@@ -425,8 +420,14 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
            "Verdict: Accounting mismatch detected -- see above for details\n",
            bufsz);
 
-   *lenp = simple_read_from_buffer(buffer, *lenp, ppos, buf,
-                   strnlen(buf, bufsz));
+   {
+       struct ctl_table tmp = {
+           .data       = buf,
+           .maxlen     = bufsz,
+       };
+
+       proc_dostring(&tmp, write, buffer, lenp, ppos);
+   }
    kfree(buf);
    return 0;
 }
@@ -450,7 +451,7 @@ static struct ctl_table infinity_sysctl_table[] = {
    },
    {
        .procname   = "infinity_version",
-       .data       = infinity_version,
+       .data       = (char *)infinity_version,
        .maxlen     = sizeof(infinity_version),
        .mode       = 0444,
        .proc_handler   = proc_dostring,
@@ -518,7 +519,7 @@ void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns,
             alpha,
             INFINITY_BUDGET_MAX_NS * INFINITY_FP_ONE);
    ctx->ema += step;
-   atomic_inc(this_cpu_ptr(&infinity_ema_climb_count));
+   atomic64_inc(this_cpu_ptr(&infinity_ema_climb_count));
 }
 
 /* ------------------------------------------------------------------ */
@@ -542,7 +543,7 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
            u64 extra_ns = sleep_ns * min(passovers, 8);
 
            sleep_ns += extra_ns;
-           atomic_inc(this_cpu_ptr(&infinity_gpu_passover_boosts));
+           atomic64_inc(this_cpu_ptr(&infinity_gpu_passover_boosts));
        }
    }
 
@@ -574,7 +575,7 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
            }
        }
    }
-   atomic_inc(this_cpu_ptr(&infinity_wakeup_count));
+   atomic64_inc(this_cpu_ptr(&infinity_wakeup_count));
 }
 
 /* ------------------------------------------------------------------ */
