@@ -9079,7 +9079,13 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			int primary = cpumask_first(
 				topology_sibling_cpumask(new_cpu));
 
+			/*
+			 * The primary thread must be allowed for this task:
+			 * select_idle_sibling() guarantees new_cpu is in
+			 * p->cpus_allowed, but the sibling core may not be.
+			 */
 			if (primary != new_cpu &&
+			    cpumask_test_cpu(primary, &p->cpus_allowed) &&
 			    available_idle_cpu(primary)) {
 				new_cpu = primary;
 				atomic_inc(&infinity_smt_interactive_count);
