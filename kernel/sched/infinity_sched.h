@@ -171,8 +171,16 @@ static inline u32 infinity_calc_weight(struct task_struct *p, u64 ema)
 /** Cgroup EMA half-life for idle decay (16ms). */
 #define INFINITY_CGROUP_EMA_HALFLIFE_NS    16000000ULL
 
-/** Maximum group weight reduction (50% — never fully starves). */
-#define INFINITY_CGROUP_WEIGHT_REDUCE_PCT 50
+/** Shield v2: engage at 40% aggregate EMA, linear to 50% reduction at 100%,
+ *  quantized to 5pp steps (at most one reweight per bucket crossing).
+ */
+#define INFINITY_SHIELD_ENGAGE_PCT        40
+#define INFINITY_SHIELD_MAX_REDUCE_PCT        50
+#define INFINITY_SHIELD_STEP_PCT        5
+/** Cross-CPU max recompute window (ms) -- half the 16ms empty-rq half-life. */
+#define INFINITY_SHIELD_RESCAN_MS        8
+#define INFINITY_SHIELD_ENGAGE_THRESHOLD_NS \
+    (INFINITY_CGROUP_EMA_CLIMB_NS * INFINITY_SHIELD_ENGAGE_PCT / 100ULL)
 
 /* ------------------------------------------------------------------ */
 /* RT EMA constants                                                    */
@@ -209,6 +217,7 @@ DECLARE_PER_CPU(atomic64_t, infinity_gpu_cpu_coupling_activations);
 DECLARE_PER_CPU(atomic64_t, infinity_gpu_lock_drain_rounds);
 DECLARE_PER_CPU(atomic64_t, infinity_cpufreq_interactive_count);
 DECLARE_PER_CPU(atomic64_t, infinity_smt_interactive_count);
+DECLARE_PER_CPU(atomic64_t, infinity_shield_engage_count);
 
 /* ------------------------------------------------------------------ */
 /* API — called from fair.c and rt.c                                   */

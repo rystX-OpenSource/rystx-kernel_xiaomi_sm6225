@@ -1503,6 +1503,20 @@ static void update_curr(struct cfs_rq *cfs_rq)
 			 * a regression here indicates wraparound/corruption.
 			 */
 			WARN_ON_ONCE(gcfs_rq->group_ema < old);
+#ifdef CONFIG_FAIR_GROUP_SCHED
+			/* Shield v2: publish the new high-water mark upward only
+			 * (no contention: most ticks find local <= max and take one
+			 * READ_ONCE + compare).
+			 */
+			{
+				struct task_group *tg = gcfs_rq->tg;
+				u64 max = READ_ONCE(tg->infinity_shield.shield_ema_max);
+
+				if (gcfs_rq->group_ema > max)
+					WRITE_ONCE(tg->infinity_shield.shield_ema_max,
+						   gcfs_rq->group_ema);
+			}
+#endif
 		}
 	}
 
@@ -3858,17 +3872,71 @@ static void update_cfs_group(struct sched_entity *se)
 	shares = calc_group_shares(gcfs_rq);
 #endif
 
-	/* Infinity: reduce group shares when aggregate EMA is elevated.
-	 * This feeds directly into the PELT-aware reweight_entity(), so the
-	 * load balancer sees the reduced weight consistently — unlike the old
-	 * update_deadline() approach which created a tug-of-war with
-	 * update_cfs_group() on every tick. */
-	if (gcfs_rq->group_ema > 0) {
+	/* Infinity: shield v2 -- bounded cross-CPU max recompute.
+	 * At most once per INFINITY_SHIELD_RESCAN_MS per task_group.
+	 * Safe without hotplug locks: always runs under rq->lock with
+	 * preemption disabled, so no RCU grace period can elapse and
+	 * tg->cfs_rq[] (allocated for all possible CPUs, freed only with
+	 * the tg) stays valid.  cpus_read_lock() is forbidden here: hotplug
+	 * holds cpus_write_lock and then takes rq locks, so a reader blocked
+	 * behind the writer while holding rq->lock would AB-BA deadlock.
+	 * Offline CPUs are skipped via cpu_online() -- their group_ema is
+	 * frozen (no ticks/decay on a dead CPU) and a permanently high
+	 * offline value would otherwise lock the shield ON; skipping them
+	 * bounds a stuck max to one rescan window.  cpu_online() is a
+	 * racy-but-benign bit test: a stale read self-corrects on the next
+	 * scan (<= 8ms).
+	 */
+	{
+		struct task_group *tg = gcfs_rq->tg;
+
+		if (READ_ONCE(tg->infinity_shield.shield_ema_max_stale) &&
+		    time_after(jiffies, tg->infinity_shield.shield_last_scan_jiffies +
+					msecs_to_jiffies(INFINITY_SHIELD_RESCAN_MS))) {
+			u64 max = 0;
+			int i;
+
+			for_each_possible_cpu(i) {
+				struct cfs_rq *crq = tg->cfs_rq[i];
+
+				if (!cpu_online(i))
+					continue;
+				if (READ_ONCE(crq->group_ema) > max)
+					max = READ_ONCE(crq->group_ema);
+			}
+			WRITE_ONCE(tg->infinity_shield.shield_ema_max, max);
+			WRITE_ONCE(tg->infinity_shield.shield_ema_max_stale, false);
+			WRITE_ONCE(tg->infinity_shield.shield_last_scan_jiffies, jiffies);
+		}
+	}
+
+	/* Infinity: shield v2 -- quantized ramp.  Engage decision from
+	 * the tg-wide max (any CPU hammering => engage), ramp amount from
+	 * the LOCAL cfs_rq EMA only (a quiet CPU computes red == 0 and
+	 * never reweights -- no oscillation).
+	 */
+	if (READ_ONCE(gcfs_rq->tg->infinity_shield.shield_ema_max) >=
+	    INFINITY_SHIELD_ENGAGE_THRESHOLD_NS) {
 		u64 ema_pct = div64_u64(gcfs_rq->group_ema * 100ULL,
 					INFINITY_CGROUP_EMA_CLIMB_NS);
-		if (ema_pct > 50) {
-			long reduced = shares * (100 - INFINITY_CGROUP_WEIGHT_REDUCE_PCT) / 100;
-			shares = max(reduced, (long)MIN_SHARES);
+
+		if (ema_pct >= INFINITY_SHIELD_ENGAGE_PCT) {
+			u64 red = div64_u64((ema_pct - INFINITY_SHIELD_ENGAGE_PCT) *
+					    INFINITY_SHIELD_MAX_REDUCE_PCT,
+					    100ULL - INFINITY_SHIELD_ENGAGE_PCT);
+			/* quantize DOWN to steps of INFINITY_SHIELD_STEP_PCT:
+			 * reweight_entity() fires at most once per bucket
+			 * crossing, never per tick
+			 */
+			red = (red / INFINITY_SHIELD_STEP_PCT) *
+			      INFINITY_SHIELD_STEP_PCT;
+
+			if (red) {
+				long reduced = shares * (100ULL - red) / 100ULL;
+
+				shares = max_t(long, reduced, MIN_SHARES);
+				atomic64_inc(this_cpu_ptr(&infinity_shield_engage_count));
+			}
 		}
 	}
 
@@ -6787,6 +6855,18 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 					pcfs_rq->group_ema >>= periods;
 				/* Infinity: decay must never raise the EMA. */
 				WARN_ON_ONCE(pcfs_rq->group_ema > old);
+			}
+			/* Shield v2: any decay may invalidate the tg-wide max; the
+			 * local rq cannot know it is the max-holder cheaply, so mark
+			 * stale and let the next update_cfs_group() scan (bounded,
+			 * see update_cfs_group) recompute.
+			 */
+			{
+				struct task_group *tg = pcfs_rq->tg;
+
+				if (READ_ONCE(tg->infinity_shield.shield_ema_max) > 0)
+					WRITE_ONCE(tg->infinity_shield.shield_ema_max_stale,
+						   true);
 			}
 			pcfs_rq->group_ema_sleep_start = 0;
 		}

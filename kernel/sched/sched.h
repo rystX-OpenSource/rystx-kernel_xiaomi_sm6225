@@ -475,6 +475,17 @@ struct task_group {
 	 */
 	atomic_long_t		load_avg ____cacheline_aligned;
 #endif
+	/*
+	 * Infinity: shield v2 cross-CPU detection cache.  Kept in its own
+	 * cacheline, strictly separated from the hot load_avg line above.
+	 * Written only on upward EMA moves (rare) and stale-marking;
+	 * read once per update_cfs_group() invocation.
+	 */
+	struct {
+		u64		shield_ema_max;
+		unsigned long	shield_last_scan_jiffies;
+		bool		shield_ema_max_stale;
+	} ____cacheline_aligned infinity_shield;
 #endif
 
 #ifdef CONFIG_RT_GROUP_SCHED

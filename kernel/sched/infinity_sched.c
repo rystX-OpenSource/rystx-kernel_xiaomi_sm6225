@@ -41,6 +41,8 @@ DEFINE_PER_CPU(atomic64_t, infinity_ipc_boost_count);
 EXPORT_PER_CPU_SYMBOL(infinity_ipc_boost_count);
 DEFINE_PER_CPU(atomic64_t, infinity_ipc_wakeup_count);
 EXPORT_PER_CPU_SYMBOL(infinity_ipc_wakeup_count);
+DEFINE_PER_CPU(atomic64_t, infinity_shield_engage_count);
+EXPORT_PER_CPU_SYMBOL(infinity_shield_engage_count);
 DEFINE_PER_CPU(atomic64_t, infinity_ema_climb_count);
 EXPORT_PER_CPU_SYMBOL(infinity_ema_climb_count);
 DEFINE_PER_CPU(atomic64_t, infinity_wakeup_count);
@@ -262,6 +264,25 @@ static size_t infinity_stats_emit_sep(char *buf, size_t sz, int lw, int vw, int 
    return need - 2;
 }
 
+#ifdef CONFIG_FAIR_GROUP_SCHED
+/*
+ * tg_shield_visitor -- count task groups whose shield is engaged (cached
+ * cross-CPU EMA max at/above the engage threshold).  Read-only, no control
+ * path; called under rcu_read_lock() from the stats handler, which is what
+ * walk_tg_tree_from() requires.
+ */
+static int tg_shield_visitor(struct task_group *tg, void *data)
+{
+   int *n = data;
+
+   if (tg != &root_task_group &&
+       READ_ONCE(tg->infinity_shield.shield_ema_max) >=
+       INFINITY_SHIELD_ENGAGE_THRESHOLD_NS)
+       (*n)++;
+   return 0;
+}
+#endif
+
 static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
                        void *buffer, size_t *lenp,
                        loff_t *ppos)
@@ -273,15 +294,15 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
     * buffer is sized from the same measurements, so the output can
     * never be truncated either.
     */
-   struct infinity_stats_row cpu_rows[7], rt_rows[1], gpu_rows[8];
+   struct infinity_stats_row cpu_rows[9], rt_rows[1], gpu_rows[8];
    struct infinity_stats_section sections[3] = {
-       { "CPU", cpu_rows, 7 },
+       { "CPU", cpu_rows, 9 },
        { "RT",  rt_rows,  1 },
        { "GPU", gpu_rows, 8 },
    };
    u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
    u64 gic, gcca, gpbo, gldr, icf, ismt;
-   u64 ipb, ipw;
+   u64 ipb, ipw, sec;
    char *buf;
    size_t bufsz, off = 0;
    int lw = 0, vw = 0, nw = 0, s, r;
@@ -304,6 +325,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    ismt = infinity_stats_total(&infinity_smt_interactive_count);
    ipb  = infinity_stats_total(&infinity_ipc_boost_count);
    ipw  = infinity_stats_total(&infinity_ipc_wakeup_count);
+   sec  = infinity_stats_total(&infinity_shield_engage_count);
 
    /* ---- CPU rows ---- */
    cpu_rows[0].label = "Futex boosts";
@@ -353,6 +375,25 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    fill_pretty_llu(cpu_rows[6].value, sizeof(cpu_rows[6].value), ipw);
    strscpy(cpu_rows[6].note, "wait_woken candidates",
        sizeof(cpu_rows[6].note));
+
+   cpu_rows[7].label = "Shield engages";
+   fill_pretty_llu(cpu_rows[7].value, sizeof(cpu_rows[7].value), sec);
+   strscpy(cpu_rows[7].note, "group share reductions applied",
+       sizeof(cpu_rows[7].note));
+
+   {
+       int n = 0;
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+       rcu_read_lock();
+       walk_tg_tree_from(&root_task_group, tg_shield_visitor, tg_nop, &n);
+       rcu_read_unlock();
+#endif
+       cpu_rows[8].label = "Group shields";
+       fill_pretty_llu(cpu_rows[8].value, sizeof(cpu_rows[8].value), n);
+       strscpy(cpu_rows[8].note, "groups defending interactive tasks",
+           sizeof(cpu_rows[8].note));
+   }
 
    /* ---- RT rows ---- */
    rt_rows[0].label = "RT throttles";
