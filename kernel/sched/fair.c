@@ -6720,22 +6720,30 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		u64 now = rq_clock(rq_of(task_cfs_rq(p)));
 		if (p->infinity.last_sleep_ns && now > p->infinity.last_sleep_ns)
 			infinity_wakeup(&p->infinity, now - p->infinity.last_sleep_ns);
-#ifdef CONFIG_FAIR_GROUP_SCHED
-		{
-			struct cfs_rq *pcfs_rq = cfs_rq_of(&p->se);
-			if (pcfs_rq->group_ema_sleep_start) {
-				u64 sleep_ns = now - pcfs_rq->group_ema_sleep_start;
-				u64 periods = div64_u64(sleep_ns,
-					INFINITY_CGROUP_EMA_HALFLIFE_NS);
-				if (periods > 63)
-					pcfs_rq->group_ema = 0;
-				else
-					pcfs_rq->group_ema >>= periods;
-				pcfs_rq->group_ema_sleep_start = 0;
-			}
-		}
-#endif
 	}
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	/*
+	 * Group EMA decay: if this cfs_rq was idle (sleep_start set) and a
+	 * task is (re)entering, apply exponential decay using the elapsed
+	 * idle time.  Also covers ENQUEUE_MIGRATED so the idle window is
+	 * not deferred past the end of the idle period.
+	 */
+	if (flags & (ENQUEUE_WAKEUP | ENQUEUE_MIGRATED)) {
+		struct cfs_rq *pcfs_rq = cfs_rq_of(&p->se);
+
+		if (pcfs_rq->group_ema_sleep_start) {
+			u64 now = rq_clock(rq_of(pcfs_rq));
+			u64 sleep_ns = now - pcfs_rq->group_ema_sleep_start;
+			u64 periods = div64_u64(sleep_ns,
+				INFINITY_CGROUP_EMA_HALFLIFE_NS);
+			if (periods > 63)
+				pcfs_rq->group_ema = 0;
+			else
+				pcfs_rq->group_ema >>= periods;
+			pcfs_rq->group_ema_sleep_start = 0;
+		}
+	}
+#endif
 
 	int h_nr_idle = task_has_idle_policy(p);
 	int h_nr_runnable = 1;
