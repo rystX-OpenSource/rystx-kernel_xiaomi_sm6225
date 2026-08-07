@@ -242,5 +242,14 @@ bool infinity_is_interactive_candidate(struct task_struct *p);
  * of the budget to prevent unit mismatch errors.
  */
 #define INFINITY_RT_DEMOTE_THRESHOLD    (INFINITY_RT_BUDGET_NS * 95ULL / 100ULL)
+/** RT valve: release (re-arm) threshold -- 10pp hysteresis band. */
+#define INFINITY_RT_REARM_THRESHOLD    (INFINITY_RT_BUDGET_NS * 85ULL / 100ULL)
+/** RT valve: min interval between forced requeues while engaged (ms). */
+#define INFINITY_RT_REQUEUE_MS        5
+/** RT valve: synthetic sleep applied to rt_ema on each forced requeue
+ *  (100ms => 57% of the current EMA remains: one requeue drops a
+ *  100%-burner from 95-100% to ~54-57%, below the 85% re-arm point).
+ */
+#define INFINITY_RT_REQUEUE_DECAY_NS    100000000ULL
 
 #endif /* __INFINITY_SCHED_H */

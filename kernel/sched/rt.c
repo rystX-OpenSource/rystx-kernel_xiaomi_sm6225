@@ -2545,14 +2545,39 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 
 	/* Infinity: force a rogue SCHED_FIFO (>95% rt_ema) to yield natively
 	 * within the RT class — no cross-class demotion needed.  Kernel
-	 * threads (migration, watchdog, IRQ handlers) are exempt. */
-	if (p->policy != SCHED_RR &&
-	    !(p->flags & PF_KTHREAD) &&
-	    p->infinity.rt_ema >= INFINITY_RT_DEMOTE_THRESHOLD) {
-		requeue_task_rt(rq, p, 0);
-		resched_curr(rq);
-		atomic64_inc(this_cpu_ptr(&infinity_rt_throttle_count));
-		return;
+	 * threads (migration, watchdog, IRQ handlers) are exempt.
+	 * Hysteresis: engage >= 95%, re-arm only after rt_ema drops below
+	 * 85% (INFINITY_RT_REARM_THRESHOLD).  Rate limit: at most one
+	 * requeue per INFINITY_RT_REQUEUE_MS while engaged; the window is
+	 * jiffies-based because task_tick_rt() may run on a remote CPU
+	 * under NO_HZ_FULL tick offload (jiffies is global).  The rate
+	 * limit gates both requeue_task_rt() and resched_curr().  On the
+	 * forced requeue, rt_ema is decayed by a fixed synthetic sleep so
+	 * the release threshold is actually reachable for a continuously
+	 * running rogue FIFO (rt_ema otherwise climbs only on consume and
+	 * decays only on wakeup).
+	 */
+	if (p->policy != SCHED_RR && !(p->flags & PF_KTHREAD)) {
+		if (p->infinity.rt_ema >= INFINITY_RT_DEMOTE_THRESHOLD) {
+			if (!p->infinity.rt_valve_armed ||
+			    time_after_eq(jiffies,
+					  p->infinity.rt_valve_last_jiffies +
+					  msecs_to_jiffies(INFINITY_RT_REQUEUE_MS))) {
+				p->infinity.rt_valve_armed = true;
+				p->infinity.rt_valve_last_jiffies = jiffies;
+				requeue_task_rt(rq, p, 0);
+				resched_curr(rq);
+				atomic64_inc(this_cpu_ptr(&infinity_rt_throttle_count));
+				infinity_rt_wakeup(&p->infinity,
+						   INFINITY_RT_REQUEUE_DECAY_NS);
+			}
+			return;
+		}
+		if (p->infinity.rt_valve_armed &&
+		    p->infinity.rt_ema < INFINITY_RT_REARM_THRESHOLD) {
+			p->infinity.rt_valve_armed = false;
+			p->infinity.rt_valve_last_jiffies = 0;
+		}
 	}
 
 	/*

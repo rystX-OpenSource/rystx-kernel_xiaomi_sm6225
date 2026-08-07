@@ -702,6 +702,8 @@ void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
    ctx->futex_waiting = false;
    ctx->ipc_waiting = false;
    ctx->ipc_last_boost = 0;
+   ctx->rt_valve_armed = false;
+   ctx->rt_valve_last_jiffies = 0;
 }
 
 /* ------------------------------------------------------------------ */

@@ -820,6 +820,8 @@ struct infinity_ctx {
 	bool		futex_waiting;
 	bool		ipc_waiting;
 	u64		ipc_last_boost;	/* Last IPC boost timestamp (ns) */
+	bool		rt_valve_armed;
+	unsigned long	rt_valve_last_jiffies;
 
 	/**
 	 * @gpu_passovers: GPU scheduling pass-over count.
