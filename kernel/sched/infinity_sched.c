@@ -27,35 +27,41 @@
 #include "infinity_sched.h"
 
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/*
+ * Per-CPU stat counters: increment sites run on arbitrary CPUs (tick,
+ * wakeup, GPU fence callbacks), and a single global atomic would bounce
+ * one cache line across sockets on multi-node machines.  Per-CPU storage
+ * keeps the hot increments local; infinity_stats_total() sums all CPUs.
+ */
 /* Stats counters                                                      */
 /* ------------------------------------------------------------------ */
-
-atomic_t infinity_futex_boost_count	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_futex_boost_count);
-atomic_t infinity_ema_climb_count	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_ema_climb_count);
-atomic_t infinity_wakeup_count		= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_wakeup_count);
-atomic_t infinity_rt_throttle_count	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_rt_throttle_count);
-atomic_t infinity_gpu_completion_callbacks	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_completion_callbacks);
-atomic_t infinity_gpu_accounting_applied	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_accounting_applied);
-atomic_t infinity_gpu_accounting_skipped	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_accounting_skipped);
-atomic_t infinity_gpu_passover_boosts = ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_passover_boosts);
-atomic_t infinity_gpu_idle_compensations	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_idle_compensations);
-atomic_t infinity_gpu_cpu_coupling_activations	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_cpu_coupling_activations);
-atomic_t infinity_gpu_lock_drain_rounds		= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_gpu_lock_drain_rounds);
-atomic_t infinity_cpufreq_interactive_count	= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_cpufreq_interactive_count);
-atomic_t infinity_smt_interactive_count		= ATOMIC_INIT(0);
-EXPORT_SYMBOL(infinity_smt_interactive_count);
+DEFINE_PER_CPU(atomic_t, infinity_futex_boost_count);
+EXPORT_PER_CPU_SYMBOL(infinity_futex_boost_count);
+DEFINE_PER_CPU(atomic_t, infinity_ema_climb_count);
+EXPORT_PER_CPU_SYMBOL(infinity_ema_climb_count);
+DEFINE_PER_CPU(atomic_t, infinity_wakeup_count);
+EXPORT_PER_CPU_SYMBOL(infinity_wakeup_count);
+DEFINE_PER_CPU(atomic_t, infinity_rt_throttle_count);
+EXPORT_PER_CPU_SYMBOL(infinity_rt_throttle_count);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_completion_callbacks);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_completion_callbacks);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_accounting_applied);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_accounting_applied);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_accounting_skipped);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_accounting_skipped);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_passover_boosts);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_passover_boosts);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_idle_compensations);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_idle_compensations);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_cpu_coupling_activations);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_cpu_coupling_activations);
+DEFINE_PER_CPU(atomic_t, infinity_gpu_lock_drain_rounds);
+EXPORT_PER_CPU_SYMBOL(infinity_gpu_lock_drain_rounds);
+DEFINE_PER_CPU(atomic_t, infinity_cpufreq_interactive_count);
+EXPORT_PER_CPU_SYMBOL(infinity_cpufreq_interactive_count);
+DEFINE_PER_CPU(atomic_t, infinity_smt_interactive_count);
+EXPORT_PER_CPU_SYMBOL(infinity_smt_interactive_count);
 
 /* ------------------------------------------------------------------ */
 /* Sysctl tunables                                                     */
@@ -197,6 +203,24 @@ static char *fill_pretty_llu(char *buf, size_t sz, u64 val)
 /* ------------------------------------------------------------------ */
 /* Stats display handler                                               */
 /* ------------------------------------------------------------------ */
+/*
+ * infinity_stats_total - sum a per-CPU stat counter across all CPUs.
+ *
+ * Each increment lands on exactly one CPU's counter, so the sum is the
+ * true total.  Cast through unsigned int to preserve the 32-bit wrap
+ * semantics of atomic_read() (no sign extension for counters past 2^31).
+ */
+static u64 infinity_stats_total(const atomic_t __percpu *counter)
+{
+   u64 total = 0;
+   int cpu;
+
+   for_each_possible_cpu(cpu)
+       total += (u64)(unsigned int)atomic_read(per_cpu_ptr(counter, cpu));
+
+   return total;
+}
+
 static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
                        void *buffer, size_t *lenp,
                        loff_t *ppos)
@@ -223,19 +247,19 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    if (!buf)
        return -ENOMEM;
 
-   fbc  = (u64)(unsigned int)atomic_read(&infinity_futex_boost_count);
-   emc  = (u64)(unsigned int)atomic_read(&infinity_ema_climb_count);
-   wkc  = (u64)(unsigned int)atomic_read(&infinity_wakeup_count);
-   rtc  = (u64)(unsigned int)atomic_read(&infinity_rt_throttle_count);
-   gcb  = (u64)(unsigned int)atomic_read(&infinity_gpu_completion_callbacks);
-   gapp = (u64)(unsigned int)atomic_read(&infinity_gpu_accounting_applied);
-   gskp = (u64)(unsigned int)atomic_read(&infinity_gpu_accounting_skipped);
-   gic  = (u64)(unsigned int)atomic_read(&infinity_gpu_idle_compensations);
-   gcca = (u64)(unsigned int)atomic_read(&infinity_gpu_cpu_coupling_activations);
-   gpbo = (u64)(unsigned int)atomic_read(&infinity_gpu_passover_boosts);
-   gldr = (u64)(unsigned int)atomic_read(&infinity_gpu_lock_drain_rounds);
-   icf  = (u64)(unsigned int)atomic_read(&infinity_cpufreq_interactive_count);
-   ismt = (u64)(unsigned int)atomic_read(&infinity_smt_interactive_count);
+   fbc = infinity_stats_total(&infinity_futex_boost_count);
+   emc = infinity_stats_total(&infinity_ema_climb_count);
+   wkc = infinity_stats_total(&infinity_wakeup_count);
+   rtc = infinity_stats_total(&infinity_rt_throttle_count);
+   gcb = infinity_stats_total(&infinity_gpu_completion_callbacks);
+   gapp = infinity_stats_total(&infinity_gpu_accounting_applied);
+   gskp = infinity_stats_total(&infinity_gpu_accounting_skipped);
+   gic = infinity_stats_total(&infinity_gpu_idle_compensations);
+   gcca = infinity_stats_total(&infinity_gpu_cpu_coupling_activations);
+   gpbo = infinity_stats_total(&infinity_gpu_passover_boosts);
+   gldr = infinity_stats_total(&infinity_gpu_lock_drain_rounds);
+   icf = infinity_stats_total(&infinity_cpufreq_interactive_count);
+   ismt = infinity_stats_total(&infinity_smt_interactive_count);
 
    buf[0] = '\0';
    scnprintf(buf + strlen(buf), bufsz - strlen(buf),
@@ -494,7 +518,7 @@ void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns,
             alpha,
             INFINITY_BUDGET_MAX_NS * INFINITY_FP_ONE);
    ctx->ema += step;
-   atomic_inc(&infinity_ema_climb_count);
+   atomic_inc(this_cpu_ptr(&infinity_ema_climb_count));
 }
 
 /* ------------------------------------------------------------------ */
@@ -518,7 +542,7 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
            u64 extra_ns = sleep_ns * min(passovers, 8);
 
            sleep_ns += extra_ns;
-           atomic_inc(&infinity_gpu_passover_boosts);
+           atomic_inc(this_cpu_ptr(&infinity_gpu_passover_boosts));
        }
    }
 
@@ -550,7 +574,7 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
            }
        }
    }
-   atomic_inc(&infinity_wakeup_count);
+   atomic_inc(this_cpu_ptr(&infinity_wakeup_count));
 }
 
 /* ------------------------------------------------------------------ */

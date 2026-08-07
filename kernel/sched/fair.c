@@ -5288,7 +5288,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
 	    task_of(se)->infinity.futex_waiting) {
 		vslice >>= 1;
-		atomic_inc(&infinity_futex_boost_count);
+		atomic_inc(this_cpu_ptr(&infinity_futex_boost_count));
 	}
 
 	/*
@@ -5593,7 +5593,7 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 		struct task_struct *p = task_of(se);
 		if (p->infinity.ema == 0) {
 			cpufreq_update_util(rq, SCHED_CPUFREQ_INTERACTIVE);
-			atomic_inc(&infinity_cpufreq_interactive_count);
+			atomic_inc(this_cpu_ptr(&infinity_cpufreq_interactive_count));
 		}
 	}
 
@@ -9114,7 +9114,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 			    cpumask_test_cpu(primary, &p->cpus_allowed) &&
 			    available_idle_cpu(primary)) {
 				new_cpu = primary;
-				atomic_inc(&infinity_smt_interactive_count);
+				atomic_inc(this_cpu_ptr(&infinity_smt_interactive_count));
 			}
 		}
 	}
