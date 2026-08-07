@@ -2789,8 +2789,23 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 		if (gpu_ns > INFINITY_GPU_EMA_CLIMB_NS)
 			gpu_ns = INFINITY_GPU_EMA_CLIMB_NS;
 
-		if (gpu_ns)
+		atomic_inc(&infinity_gpu_completion_callbacks);
+
+		/* Upstream splits applied/skipped on whether the drm_sched
+		 * entity survived until drm_sched_get_finished_job().  KGSL
+		 * retires with the drawobj still holding a context reference,
+		 * so the context is always live and that split cannot occur.
+		 * The counters keep their diagnostic meaning against the
+		 * failure mode this path does have: a drawobj that never
+		 * reached sendcmd(), or a backward per-CPU clock delta,
+		 * leaves nothing to account.
+		 */
+		if (gpu_ns) {
 			atomic64_add(gpu_ns, &drawctxt->pending_gpu_ns);
+			atomic_inc(&infinity_gpu_accounting_applied);
+		} else {
+			atomic_inc(&infinity_gpu_accounting_skipped);
+		}
 	}
 
 	kgsl_drawobj_destroy(drawobj);

@@ -5286,8 +5286,10 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * reducing IPC wakeup latency.
 	 */
 	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
-	    task_of(se)->infinity.futex_waiting)
+	    task_of(se)->infinity.futex_waiting) {
 		vslice >>= 1;
+		atomic_inc(&infinity_futex_boost_count);
+	}
 
 	/*
 	 * EEVDF: vd_i = ve_i + r_i/w_i

@@ -163,6 +163,13 @@ extern unsigned long infinity_tune_smt_divisor;
 /* Stats counters                                                      */
 /* ------------------------------------------------------------------ */
 
+extern atomic_t infinity_futex_boost_count;
+extern atomic_t infinity_ema_climb_count;
+extern atomic_t infinity_wakeup_count;
+extern atomic_t infinity_rt_throttle_count;
+extern atomic_t infinity_gpu_completion_callbacks;
+extern atomic_t infinity_gpu_accounting_applied;
+extern atomic_t infinity_gpu_accounting_skipped;
 extern atomic_t infinity_gpu_passover_boosts;
 
 /* ------------------------------------------------------------------ */

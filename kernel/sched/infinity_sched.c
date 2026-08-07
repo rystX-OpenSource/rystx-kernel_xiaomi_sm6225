@@ -17,8 +17,10 @@
  * (uclamp declarations, EMA tracking, futex_waiting flag).
  */
 
+#include <linux/fs.h>
 #include <linux/math64.h>
 #include <linux/sysctl.h>
+#include <linux/string.h>
 #include <uapi/linux/sched/types.h>
 #include "sched.h"
 #include "infinity_sched.h"
@@ -27,6 +29,20 @@
 /* Stats counters                                                      */
 /* ------------------------------------------------------------------ */
 
+atomic_t infinity_futex_boost_count	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_futex_boost_count);
+atomic_t infinity_ema_climb_count	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_ema_climb_count);
+atomic_t infinity_wakeup_count		= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_wakeup_count);
+atomic_t infinity_rt_throttle_count	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_rt_throttle_count);
+atomic_t infinity_gpu_completion_callbacks	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_completion_callbacks);
+atomic_t infinity_gpu_accounting_applied	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_accounting_applied);
+atomic_t infinity_gpu_accounting_skipped	= ATOMIC_INIT(0);
+EXPORT_SYMBOL(infinity_gpu_accounting_skipped);
 atomic_t infinity_gpu_passover_boosts = ATOMIC_INIT(0);
 EXPORT_SYMBOL(infinity_gpu_passover_boosts);
 
@@ -58,6 +74,293 @@ static int clamp_smt_divisor(struct ctl_table *table, int write,
    return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/* Human-readable number formatting                                    */
+/* ------------------------------------------------------------------ */
+static __maybe_unused void fmt_human(char *buf, size_t sz, u64 val)
+{
+   static const struct {
+       u64 divisor;
+       const char *unit;
+   } table[] = {
+       { 1000000000000000000ULL, "E" },
+       { 1000000000000000ULL,    "P" },
+       { 1000000000000ULL,       "T" },
+       { 1000000000ULL,          "B" },
+       { 1000000ULL,             "M" },
+       { 1000ULL,                "K" },
+   };
+   int i;
+   char tmp[32];
+
+   for (i = 0; i < ARRAY_SIZE(table); i++) {
+       if (val >= table[i].divisor) {
+           u64 whole = val / table[i].divisor;
+           u64 frac = (val % table[i].divisor) /
+                  (table[i].divisor / 100);
+           scnprintf(tmp, sizeof(tmp), "%llu.%02llu %s",
+                 whole, frac, table[i].unit);
+           strlcat(buf, tmp, sz);
+           return;
+       }
+   }
+
+   scnprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)val);
+   strlcat(buf, tmp, sz);
+}
+/* ------------------------------------------------------------------ */
+/* fmt_val -- Write val to buf with comma separators, right-aligned    *
+ * to @width.  If @width is 0, no padding is applied.
+ */
+/* ------------------------------------------------------------------ */
+static __maybe_unused void fmt_val(char *buf, size_t sz, u64 val, unsigned int width)
+{
+   char tmp[32];
+   unsigned int len;
+
+   if (val == 0) {
+       scnprintf(tmp, sizeof(tmp), "0");
+   } else {
+       char raw[24];
+       int raw_len, i, pos = 0;
+
+       scnprintf(raw, sizeof(raw), "%llu", (unsigned long long)val);
+       raw_len = strlen(raw);
+
+       for (i = 0; i < raw_len; i++) {
+           if (i > 0 && (raw_len - i) % 3 == 0)
+               tmp[pos++] = ',';
+           tmp[pos++] = raw[i];
+       }
+       tmp[pos] = '\0';
+   }
+
+   len = strlen(tmp);
+   if (width > 0 && len < width) {
+       char padded[32];
+
+       scnprintf(padded, sizeof(padded), "%*s", width, tmp);
+       strlcat(buf, padded, sz);
+   } else {
+       strlcat(buf, tmp, sz);
+   }
+}
+/* ------------------------------------------------------------------ */
+/* val_from_u64 -- Format u64 into string with comma separators.       *
+ * Result is right-aligned in a 13-char field (null-terminated).       *
+ * If the formatted value exceeds 13 characters, the leftmost digits   *
+ * are truncated (keeps rightmost digits) to prevent table columns     *
+ * from shifting.
+ */
+/* ------------------------------------------------------------------ */
+static char *fill_pretty_llu(char *buf, size_t sz, u64 val)
+{
+   char raw[24];
+   char tmp[32];
+   int raw_len, i, pos = 0, keep;
+
+   if (val == 0) {
+       scnprintf(tmp, sizeof(tmp), "0");
+   } else {
+       scnprintf(raw, sizeof(raw), "%llu", (unsigned long long)val);
+       raw_len = strlen(raw);
+       for (i = 0; i < raw_len; i++) {
+           if (i > 0 && (raw_len - i) % 3 == 0)
+               tmp[pos++] = ',';
+           tmp[pos++] = raw[i];
+       }
+       tmp[pos] = '\0';
+   }
+
+   /* Truncate leftmost digits if too long for the 14-char column */
+   pos = strlen(tmp);
+   if (pos > 14) {
+       keep = pos - 14;
+       /* Advance past the truncation point */
+       scnprintf(buf, sz, "%13s", tmp + keep);
+   } else {
+       scnprintf(buf, sz, "%13s", tmp);
+   }
+   return buf;
+}
+/* ------------------------------------------------------------------ */
+/* Stats display handler                                               */
+/* ------------------------------------------------------------------ */
+static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
+                       void *buffer, size_t *lenp,
+                       loff_t *ppos)
+{
+   char buf[1536];
+   u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
+   char v1[16];
+   const size_t bufsz = sizeof(buf);
+
+   /*
+    * Table layout (printf-style, auto-aligned):
+    *
+    *   | %-22s | %13s | %-26s |
+    *   +------------------------+---------------+----------------------------+
+    *
+    * %-22s accounts for Unicode box-drawing in tree branch labels
+    * (each Unicode char = 3 bytes, 1 visible).  Total row width: 71.
+    */
+   const char *SEP = "+------------------------+---------------+----------------------------+";
+   const char *ROW = "| %-22s | %13s | %-26s |\n";
+
+   if (write)
+       return -EROFS;
+
+   fbc  = (u64)(unsigned int)atomic_read(&infinity_futex_boost_count);
+   emc  = (u64)(unsigned int)atomic_read(&infinity_ema_climb_count);
+   wkc  = (u64)(unsigned int)atomic_read(&infinity_wakeup_count);
+   rtc  = (u64)(unsigned int)atomic_read(&infinity_rt_throttle_count);
+   gcb  = (u64)(unsigned int)atomic_read(&infinity_gpu_completion_callbacks);
+   gapp = (u64)(unsigned int)atomic_read(&infinity_gpu_accounting_applied);
+   gskp = (u64)(unsigned int)atomic_read(&infinity_gpu_accounting_skipped);
+
+   buf[0] = '\0';
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf),
+         "Infinity Scheduler v4.6-gpu\n\n");
+
+   /* ---- CPU ---- */
+   strlcat(buf, "CPU\n", bufsz);
+   strlcat(buf, SEP, bufsz);
+   strlcat(buf, "\n", bufsz);
+
+   if (emc) {
+       char pct[16];
+
+       scnprintf(pct, sizeof(pct), "%llu%% of tasks",
+             div64_u64(fbc * 100ULL, emc));
+       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+             "Futex boosts",
+             fill_pretty_llu(v1, sizeof(v1), fbc),
+             pct);
+   } else {
+       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+             "Futex boosts",
+             fill_pretty_llu(v1, sizeof(v1), fbc),
+             "N/A");
+   }
+
+   {
+       char avg[24];
+       u64 avg_wakeup = div64_u64(emc * 100ULL, max(wkc, 1ULL));
+
+       scnprintf(avg, sizeof(avg), "~%llu.%02llu/wakeup",
+             avg_wakeup / 100, avg_wakeup % 100);
+       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+             "EMA climbs",
+             fill_pretty_llu(v1, sizeof(v1), emc), avg);
+   }
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "Wakeup decays",
+         fill_pretty_llu(v1, sizeof(v1), wkc), "");
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "Per-task EMA range",
+         "   0 - 10,000", "");
+
+   strlcat(buf, SEP, bufsz);
+   strlcat(buf, "\n\n", bufsz);
+
+   /* ---- RT ---- */
+   strlcat(buf, "RT\n", bufsz);
+   strlcat(buf, SEP, bufsz);
+   strlcat(buf, "\n", bufsz);
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "RT throttles",
+         fill_pretty_llu(v1, sizeof(v1), rtc),
+         "0 rogue SCHED_FIFO");
+
+   strlcat(buf, SEP, bufsz);
+   strlcat(buf, "\n\n", bufsz);
+
+   /* ---- GPU ---- */
+   strlcat(buf, "GPU\n", bufsz);
+   strlcat(buf, SEP, bufsz);
+   strlcat(buf, "\n", bufsz);
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "Completion entered",
+         fill_pretty_llu(v1, sizeof(v1), gcb),
+         "fence callbacks fired");
+
+   if (gcb) {
+       u64 whole = div64_u64(gapp * 100ULL, gcb);
+       u64 frac  = div64_u64(gapp * 10000ULL, gcb) % 100;
+       char v2[16];
+
+       scnprintf(v2, sizeof(v2), "%llu.%02llu%%", whole, frac);
+       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+             "Accounting applied",
+             fill_pretty_llu(v1, sizeof(v1), gapp),
+             v2);
+   } else {
+       scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+             "Accounting applied",
+             fill_pretty_llu(v1, sizeof(v1), gapp),
+             "N/A");
+   }
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "  >> lock contention",
+         fill_pretty_llu(v1, sizeof(v1), 0),
+         "(lock contention)");
+
+   scnprintf(buf + strlen(buf), bufsz - strlen(buf), ROW,
+         "  >> entity not found",
+         fill_pretty_llu(v1, sizeof(v1), gskp),
+         "(no submit timestamp)");
+
+   strlcat(buf, SEP, bufsz);
+   strlcat(buf, "\n\n", bufsz);
+
+   /* Footer */
+   if (gcb) {
+       u64 whole = div64_u64(gapp * 100ULL, gcb);
+       u64 frac  = div64_u64(gapp * 10000ULL, gcb) % 100;
+       char w1[16], w2[16], *p1, *p2;
+
+       fill_pretty_llu(w1, sizeof(w1), gapp);
+       fill_pretty_llu(w2, sizeof(w2), gcb);
+       /* Strip leading spaces for the confidence line */
+       p1 = w1;
+       while (*p1 == ' ')
+           p1++;
+       p2 = w2;
+       while (*p2 == ' ')
+           p2++;
+       scnprintf(buf + strlen(buf), bufsz - strlen(buf),
+             "Accounting confidence: %llu.%02llu%%  (%s / %s completions)\n",
+             whole, frac, p1, p2);
+   } else {
+       strlcat(buf,
+           "Accounting confidence: N/A  (no GPU jobs tracked)\n",
+           bufsz);
+   }
+
+   if (gcb && gapp == gcb)
+       strlcat(buf,
+           "Verdict: All counters healthy -- system operating normally\n",
+           bufsz);
+   else if (gcb && gapp < gcb)
+       strlcat(buf,
+           "Verdict: Accounting mismatch detected -- see above for details\n",
+           bufsz);
+   else
+       strlcat(buf, "Verdict: No GPU jobs recorded yet\n",
+           bufsz);
+
+   *lenp = simple_read_from_buffer(buffer, *lenp, ppos, buf,
+                   strnlen(buf, bufsz));
+   return 0;
+}
+/* ------------------------------------------------------------------ */
+/* Sysctl table                                                        */
+/* ------------------------------------------------------------------ */
 static struct ctl_table infinity_sysctl_table[] = {
    {
        .procname   = "infinity_smt_divisor",
@@ -79,6 +382,13 @@ static struct ctl_table infinity_sysctl_table[] = {
        .maxlen     = sizeof(infinity_version),
        .mode       = 0444,
        .proc_handler   = proc_dostring,
+   },
+   {
+       .procname   = "infinity_stats",
+       .data       = NULL,
+       .maxlen     = 0,
+       .mode       = 0444,
+       .proc_handler   = infinity_stats_proc_handler,
    },
    {}
 };
@@ -136,6 +446,7 @@ void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns,
             alpha,
             INFINITY_BUDGET_MAX_NS * INFINITY_FP_ONE);
    ctx->ema += step;
+   atomic_inc(&infinity_ema_climb_count);
 }
 
 /* ------------------------------------------------------------------ */
@@ -191,6 +502,7 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
            }
        }
    }
+   atomic_inc(&infinity_wakeup_count);
 }
 
 /* ------------------------------------------------------------------ */
