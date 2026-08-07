@@ -643,6 +643,7 @@ void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
    ctx->ipc_last_boost = 0;
    ctx->rt_valve_armed = false;
    ctx->rt_valve_last_jiffies = 0;
+   ctx->divergence_streak = 0;
 }
 
 /* ------------------------------------------------------------------ */

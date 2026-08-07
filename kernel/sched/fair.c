@@ -7149,7 +7149,10 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	/* Infinity: EMA vs PELT divergence diagnostic (observability only).
 	 * One compare per sleep; flags tasks whose EMA classification
-	 * (hog vs interactive) differs from PELT by > 50pp.
+	 * (hog vs interactive) differs from PELT by > 50pp.  The flag is
+	 * raised only after INFINITY_DIVERGENCE_STREAK consecutive
+	 * divergent sleeps, so a transient single-burst noise is filtered
+	 * out and one counter bump is emitted per divergence episode.
 	 */
 	if (flags & DEQUEUE_SLEEP) {
 		u64 ema = READ_ONCE(p->infinity.ema);
@@ -7158,8 +7161,14 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 						INFINITY_BUDGET_MAX_NS);
 		u64 diff = ema_units > util ? ema_units - util : util - ema_units;
 
-		if (diff > INFINITY_DIVERGENCE_THRESHOLD_UNITS)
-			atomic64_inc(this_cpu_ptr(&infinity_divergence_count));
+		if (diff > INFINITY_DIVERGENCE_THRESHOLD_UNITS) {
+			p->infinity.divergence_streak++;
+			if (p->infinity.divergence_streak ==
+			    INFINITY_DIVERGENCE_STREAK)
+				atomic64_inc(this_cpu_ptr(&infinity_divergence_count));
+		} else {
+			p->infinity.divergence_streak = 0;
+		}
 	}
 
 	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);

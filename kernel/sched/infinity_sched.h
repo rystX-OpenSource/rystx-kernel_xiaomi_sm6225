@@ -265,5 +265,7 @@ bool infinity_is_interactive_candidate(struct task_struct *p);
 #define INFINITY_DIVERGENCE_THRESHOLD        50
 #define INFINITY_DIVERGENCE_THRESHOLD_UNITS \
     (INFINITY_DIVERGENCE_THRESHOLD * SCHED_CAPACITY_SCALE / 100)
+/** PELT divergence diagnostic: consecutive divergent sleeps before flagging. */
+#define INFINITY_DIVERGENCE_STREAK        3
 
 #endif /* __INFINITY_SCHED_H */
