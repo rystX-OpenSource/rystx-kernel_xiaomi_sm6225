@@ -2077,6 +2077,22 @@ static void remove_invalidated_cmdobjs(struct kgsl_device *device,
 				&drawobj->context->events, drawobj->timestamp);
 			mutex_unlock(&device->mutex);
 
+			/*
+			 * Infinity: destroyed without passing through
+			 * retire_cmdobj(), so any GPU time this drawobj
+			 * consumed never reaches pending_gpu_ns and the
+			 * context's vtime understates what it used.
+			 *
+			 * The loss is counted rather than recovered.  The
+			 * elapsed delta across a fault is dominated by the
+			 * hang-detection timeout, not by real GPU work, so
+			 * accumulating it would inflate the context's vtime by
+			 * orders of magnitude and starve it after every
+			 * recovery -- worse than the undercount.  Counting
+			 * keeps the drop visible in kernel.infinity_stats
+			 * instead of silent.
+			 */
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_accounting_skipped));
 			kgsl_drawobj_destroy(drawobj);
 		}
 	}
@@ -2394,6 +2410,14 @@ static void recover_dispatch_q(struct kgsl_device *device,
 
 			mark_guilty_context(device, drawobj->context->id);
 			adreno_drawctxt_invalidate(device, drawobj->context);
+			/*
+			 * Infinity: this drawobj is destroyed without passing
+			 * through retire_cmdobj(), so whatever GPU time it
+			 * consumed never reaches pending_gpu_ns.  Count the
+			 * drop rather than accumulating it -- see
+			 * remove_invalidated_cmdobjs() for why.
+			 */
+			atomic64_inc(this_cpu_ptr(&infinity_gpu_accounting_skipped));
 			kgsl_drawobj_destroy(drawobj);
 
 			ptr = DRAWQUEUE_NEXT(ptr,
