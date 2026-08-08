@@ -9288,6 +9288,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		 * This prevents an interactive task from sharing execution
 		 * units with a batch task on the other SMT thread.
 		 */
+#ifdef CONFIG_SCHED_SMT
 		if (sched_smt_active() && READ_ONCE(p->infinity.ema) < 1000) {
 			int primary = cpumask_first(
 				topology_sibling_cpumask(new_cpu));
@@ -9304,6 +9305,79 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 				atomic64_inc(this_cpu_ptr(&infinity_smt_interactive_count));
 			}
 		}
+#else
+		/*
+		 * Infinity: heterogeneous-capacity equivalent of the SMT
+		 * interactive placement above.
+		 *
+		 * ARM big.LITTLE has no SMT siblings, so the block above
+		 * compiles out entirely and infinity_smt_interactive_count
+		 * can never leave zero.  The intent still applies: keep an
+		 * interactive task off the execution resource it would have
+		 * to share.  Upstream's contention is a batch task stealing
+		 * execution units from the other SMT thread; here it is a
+		 * slower core stretching the task's runtime outright.
+		 *
+		 * Only the predicate and the target change -- the
+		 * secondary-thread test becomes a below-max-capacity test,
+		 * and "the primary thread of the same core" becomes "an idle
+		 * CPU in a higher-capacity group".  The action is identical:
+		 * one re-placement and the same counter, so
+		 * infinity_smt_interactive_count keeps one meaning on both
+		 * topologies -- an interactive wakeup moved off a contended
+		 * execution resource.
+		 *
+		 * asym_cap_list is ordered descending by capacity, so the
+		 * walk takes the best available upgrade first and still
+		 * finds a mid-tier core on 3-tier DynamIQ when no big core
+		 * is idle.  It stops once the entries are no longer faster
+		 * than new_cpu, so this can only move the task up.
+		 *
+		 * The idle and affinity requirements are the SMT path's:
+		 * select_idle_sibling() has already returned a reasonable
+		 * CPU, so it is only overridden for a strictly better one.
+		 * cpu_active() is additionally required because the capacity
+		 * spans are built from cpu_possible_mask and so keep offline
+		 * CPUs, whose runqueues read as idle -- the SMT path needs no
+		 * such test, as the sibling masks track hotplug.
+		 *
+		 * The RCU read lock is held across the for_each_domain()
+		 * walk above, which is what the list walk requires -- unlike
+		 * the ema == 0 bias earlier in this function, which runs
+		 * before that lock is taken and so acquires its own.
+		 */
+		if (sched_asym_cpucap_active() &&
+		    READ_ONCE(p->infinity.ema) < 1000) {
+			unsigned long cur_cap =
+				arch_scale_cpu_capacity(new_cpu);
+			struct asym_cap_data *entry;
+			int faster_cpu = -1;
+
+			list_for_each_entry_rcu(entry, &asym_cap_list, link) {
+				int cpu;
+
+				if (entry->capacity <= cur_cap)
+					break;
+
+				for_each_cpu_and(cpu, cpu_capacity_span(entry),
+						 &p->cpus_allowed) {
+					if (cpu_active(cpu) &&
+					    available_idle_cpu(cpu)) {
+						faster_cpu = cpu;
+						break;
+					}
+				}
+
+				if (faster_cpu >= 0)
+					break;
+			}
+
+			if (faster_cpu >= 0) {
+				new_cpu = faster_cpu;
+				atomic64_inc(this_cpu_ptr(&infinity_smt_interactive_count));
+			}
+		}
+#endif
 	}
 	rcu_read_unlock();
 
