@@ -23,6 +23,7 @@
 
 #include "pelt.h"
 #include "walt.h"
+#include "infinity_sched.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
@@ -4104,6 +4105,9 @@ void sched_exec(void)
 	struct task_struct *p = current;
 	unsigned long flags;
 	int dest_cpu;
+
+	/* Infinity: exec() starts a new image -- reset per-image scheduler state */
+	infinity_exec_reset(&p->infinity);
 
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
 	dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), WF_EXEC);

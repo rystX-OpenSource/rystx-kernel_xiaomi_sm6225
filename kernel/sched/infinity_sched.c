@@ -649,6 +649,25 @@ void infinity_fork_init(struct infinity_ctx *ctx, u64 now)
 }
 
 /* ------------------------------------------------------------------ */
+/* infinity_exec_reset — clear per-image scheduler state on exec       */
+/* ------------------------------------------------------------------ */
+
+void infinity_exec_reset(struct infinity_ctx *ctx)
+{
+   /* exec() reuses the same task: the previous image's EMA penalty,
+    * RT valve state, IPC rate limit and divergence streak must not
+    * carry over into the new image (fork() already reinitializes
+    * everything for new tasks).
+    */
+   WRITE_ONCE(ctx->ema, 0);
+   WRITE_ONCE(ctx->rt_ema, 0);
+   WRITE_ONCE(ctx->ipc_last_boost, 0);
+   WRITE_ONCE(ctx->rt_valve_armed, false);
+   WRITE_ONCE(ctx->rt_valve_last_jiffies, 0);
+   ctx->divergence_streak = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* (Removed in v4.5: carriage_ns, auto_carriage_ns, two-pole,          *
  * prev_ema, infinity_slice, infinity_vruntime_scale,                  *
  * infinity_wakeup_scale.  All subsumed by weight modulation.)         */
