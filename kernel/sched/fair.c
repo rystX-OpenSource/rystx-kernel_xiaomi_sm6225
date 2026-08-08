@@ -1278,10 +1278,18 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 			struct task_struct *p__ = task_of(se);
 
 			/*
-			 * SMT halving: on the secondary SMT thread,
-			 * reduce the slice further.
+			 * Shorten the slice on the weaker of two execution
+			 * resources, so the scheduler reaches another
+			 * placement decision sooner.  Which resource that is
+			 * depends on the topology: the secondary SMT thread
+			 * under CONFIG_SCHED_SMT, a below-max-capacity core
+			 * otherwise.  Both arms apply the same
+			 * infinity_smt_divisor penalty.
 			 */
 #ifdef CONFIG_SCHED_SMT
+			/* SMT halving: on the secondary SMT thread, reduce
+			 * the slice further.
+			 */
 			{
 				int cpu = cpu_of(rq_of(cfs_rq));
 				const struct cpumask *sibling_mask =
@@ -9282,13 +9290,19 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		/* Fast path */
 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
 
-		/* SMT interactive placement: if the selected CPU is an SMT
-		 * thread with a busy sibling, and the waking task has low
-		 * EMA, try the primary thread of the same core instead.
-		 * This prevents an interactive task from sharing execution
-		 * units with a batch task on the other SMT thread.
+		/* Interactive placement: if the CPU just selected shares a
+		 * contended execution resource, and the waking task has low
+		 * EMA, move it to an uncontended one.  Which resource that is
+		 * depends on the topology: an SMT thread with a busy sibling
+		 * under CONFIG_SCHED_SMT, a below-max-capacity core
+		 * otherwise.  Both arms perform the same single re-placement
+		 * and increment the same counter.
 		 */
 #ifdef CONFIG_SCHED_SMT
+		/* SMT: prefer the primary thread of the same core, so an
+		 * interactive task does not share execution units with a
+		 * batch task on the other SMT thread.
+		 */
 		if (sched_smt_active() && READ_ONCE(p->infinity.ema) < 1000) {
 			int primary = cpumask_first(
 				topology_sibling_cpumask(new_cpu));
