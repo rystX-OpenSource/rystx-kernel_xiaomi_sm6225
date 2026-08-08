@@ -2719,9 +2719,9 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 		 */
 		if (!timeout || timeout->task) {
 			/* Infinity: signal futex-waiting for vslice boost on wakeup */
-			current->infinity.futex_waiting = true;
+			WRITE_ONCE(current->infinity.futex_waiting, true);
 			freezable_schedule();
-			current->infinity.futex_waiting = false;
+			WRITE_ONCE(current->infinity.futex_waiting, false);
 		}
 	}
 	__set_current_state(TASK_RUNNING);

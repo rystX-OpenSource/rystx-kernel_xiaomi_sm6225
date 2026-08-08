@@ -2567,10 +2567,10 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	 * re-armed window it deserves.
 	 */
 	if (p->policy != SCHED_RR && !(p->flags & PF_KTHREAD)) {
-		if (p->infinity.rt_ema >= INFINITY_RT_DEMOTE_THRESHOLD) {
-			if (!p->infinity.rt_valve_armed ||
+		if (READ_ONCE(p->infinity.rt_ema) >= INFINITY_RT_DEMOTE_THRESHOLD) {
+			if (!READ_ONCE(p->infinity.rt_valve_armed) ||
 			    time_after_eq(jiffies,
-					  p->infinity.rt_valve_last_jiffies +
+					  READ_ONCE(p->infinity.rt_valve_last_jiffies) +
 					  msecs_to_jiffies(INFINITY_RT_REQUEUE_MS))) {
 				WRITE_ONCE(p->infinity.rt_valve_armed, true);
 				WRITE_ONCE(p->infinity.rt_valve_last_jiffies, jiffies);
@@ -2582,10 +2582,10 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 			}
 			return;
 		}
-		if (p->infinity.rt_valve_armed &&
-		    p->infinity.rt_ema < INFINITY_RT_REARM_THRESHOLD) {
-			p->infinity.rt_valve_armed = false;
-			p->infinity.rt_valve_last_jiffies = 0;
+		if (READ_ONCE(p->infinity.rt_valve_armed) &&
+		    READ_ONCE(p->infinity.rt_ema) < INFINITY_RT_REARM_THRESHOLD) {
+			WRITE_ONCE(p->infinity.rt_valve_armed, false);
+			WRITE_ONCE(p->infinity.rt_valve_last_jiffies, 0);
 		}
 	}
 

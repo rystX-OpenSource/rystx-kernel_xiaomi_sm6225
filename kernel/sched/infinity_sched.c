@@ -529,7 +529,7 @@ late_initcall(infinity_sched_init);
 void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns,
               unsigned long cpu_capacity)
 {
-   u64 step;
+   u64 step, ema;
    u32 alpha;
 
    /*
@@ -548,14 +548,14 @@ void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns,
        alpha = 2048 + (u32)div64_u64(2048ULL * cpu_capacity,
                      SCHED_CAPACITY_SCALE);
 
-   if (ctx->ema >= INFINITY_BUDGET_MAX_NS)
+   ema = READ_ONCE(ctx->ema);
+   if (ema >= INFINITY_BUDGET_MAX_NS)
        return;
 
    if (delta_ns > INFINITY_BUDGET_MAX_NS)
        delta_ns = INFINITY_BUDGET_MAX_NS;
 
-   step = div64_u64((INFINITY_BUDGET_MAX_NS - ctx->ema) * delta_ns *
-            alpha,
+   step = div64_u64((INFINITY_BUDGET_MAX_NS - ema) * delta_ns * alpha,
             INFINITY_BUDGET_MAX_NS * INFINITY_FP_ONE);
    /*
     * With alpha up to 4096 (FP_ONE = 256) the step can exceed the
@@ -564,9 +564,9 @@ void infinity_consume(struct infinity_ctx *ctx, u64 delta_ns,
     * but the raw value must stay within [0, BUDGET] so the
     * /proc/<pid>/infinity reading and the EMA invariants hold).
     */
-   if (step > INFINITY_BUDGET_MAX_NS - ctx->ema)
-       step = INFINITY_BUDGET_MAX_NS - ctx->ema;
-   ctx->ema += step;
+   if (step > INFINITY_BUDGET_MAX_NS - ema)
+       step = INFINITY_BUDGET_MAX_NS - ema;
+   WRITE_ONCE(ctx->ema, ema + step);
    atomic64_inc(this_cpu_ptr(&infinity_ema_climb_count));
 }
 
@@ -606,22 +606,24 @@ void infinity_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
        periods = div64_u64_rem(sleep_ns, 24000000ULL, &residual);
 
        if (periods > 63) {
-           ctx->ema = 0;
+           WRITE_ONCE(ctx->ema, 0);
        } else {
-           ctx->ema >>= periods;
+           u64 ema = READ_ONCE(ctx->ema);
 
-           if (residual && ctx->ema) {
+           ema >>= periods;
+
+           if (residual && ema) {
                u64 fraction = div64_u64(residual *
                    INFINITY_FP_ONE, 24000000ULL);
-               u64 linear = (ctx->ema * fraction) >>
+               u64 linear = (ema * fraction) >>
                    INFINITY_FP_SHIFT;
                u64 quad = ((linear * fraction) >>
                    INFINITY_FP_SHIFT) >> 1;
 
                if (linear > quad)
-                   ctx->ema -= min(ctx->ema,
-                           linear - quad);
+                   ema -= min(ema, linear - quad);
            }
+           WRITE_ONCE(ctx->ema, ema);
        }
    }
    atomic64_inc(this_cpu_ptr(&infinity_wakeup_count));
@@ -700,20 +702,22 @@ void infinity_rt_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
    periods = div64_u64_rem(sleep_ns, 160000000ULL, &residual);
 
    if (periods > 63) {
-       ctx->rt_ema = 0;
+       WRITE_ONCE(ctx->rt_ema, 0);
    } else {
-       ctx->rt_ema >>= periods;
-       if (residual && ctx->rt_ema) {
+       u64 ema = READ_ONCE(ctx->rt_ema);
+
+       ema >>= periods;
+       if (residual && ema) {
            u64 fraction = div64_u64(residual *
                INFINITY_FP_ONE, 160000000ULL);
-           u64 linear = (ctx->rt_ema * fraction) >>
+           u64 linear = (ema * fraction) >>
                INFINITY_FP_SHIFT;
            u64 quad = ((linear * fraction) >>
                INFINITY_FP_SHIFT) >> 1;
            if (linear > quad)
-               ctx->rt_ema -= min(ctx->rt_ema,
-                          linear - quad);
+               ema -= min(ema, linear - quad);
        }
+       WRITE_ONCE(ctx->rt_ema, ema);
    }
 }
 
@@ -724,13 +728,13 @@ void infinity_rt_wakeup(struct infinity_ctx *ctx, u64 sleep_ns)
 unsigned int infinity_rr_timeslice(struct task_struct *p,
                   unsigned int rr_default)
 {
+   u64 rt_ema = READ_ONCE(p->infinity.rt_ema);
    u64 decay_pct;
 
-   if (!p->infinity.rt_ema)
+   if (!rt_ema)
        return rr_default;
 
-   decay_pct = div64_u64(p->infinity.rt_ema * 90ULL,
-                 INFINITY_RT_BUDGET_NS);
+   decay_pct = div64_u64(rt_ema * 90ULL, INFINITY_RT_BUDGET_NS);
    if (decay_pct > 90)
        decay_pct = 90;
 

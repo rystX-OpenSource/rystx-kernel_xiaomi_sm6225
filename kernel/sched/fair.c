@@ -5369,13 +5369,13 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * reducing IPC wakeup latency.
 	 */
 	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
-	    task_of(se)->infinity.futex_waiting) {
+	    READ_ONCE(task_of(se)->infinity.futex_waiting)) {
 		vslice >>= 1;
 		atomic64_inc(this_cpu_ptr(&infinity_futex_boost_count));
 	}
 
 	if (entity_is_task(se) && (flags & ENQUEUE_WAKEUP) &&
-	    task_of(se)->infinity.ipc_waiting &&
+	    READ_ONCE(task_of(se)->infinity.ipc_waiting) &&
 	    !(task_of(se)->flags & PF_KTHREAD)) {
 		/* Infinity: IPC candidates -- all wait_woken wakeups. */
 		u64 now = rq_clock(rq_of(cfs_rq));
@@ -5707,7 +5707,7 @@ pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
 	 */
 	if (entity_is_task(se)) {
 		struct task_struct *p = task_of(se);
-		if (p->infinity.ema == 0) {
+		if (READ_ONCE(p->infinity.ema) == 0) {
 			cpufreq_update_util(rq, SCHED_CPUFREQ_INTERACTIVE);
 			atomic64_inc(this_cpu_ptr(&infinity_cpufreq_interactive_count));
 		}
@@ -6834,8 +6834,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	/* Infinity: EMA decay on wakeup */
 	if (flags & ENQUEUE_WAKEUP) {
 		u64 now = rq_clock(rq_of(task_cfs_rq(p)));
-		if (p->infinity.last_sleep_ns && now > p->infinity.last_sleep_ns)
-			infinity_wakeup(&p->infinity, now - p->infinity.last_sleep_ns);
+		u64 last_sleep = READ_ONCE(p->infinity.last_sleep_ns);
+
+		if (last_sleep && now > last_sleep)
+			infinity_wakeup(&p->infinity, now - last_sleep);
 	}
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/*
@@ -6847,7 +6849,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & (ENQUEUE_WAKEUP | ENQUEUE_MIGRATED)) {
 		struct cfs_rq *pcfs_rq = cfs_rq_of(&p->se);
 
-		if (pcfs_rq->group_ema_sleep_start) {
+		if (READ_ONCE(pcfs_rq->group_ema_sleep_start)) {
 			u64 now = rq_clock(rq_of(pcfs_rq));
 
 			/*
@@ -6858,18 +6860,20 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			 * the EMA -- the safe direction, same pattern as the task
 			 * (fair.c) and RT paths.
 			 */
-			if (now > pcfs_rq->group_ema_sleep_start) {
-				u64 old = pcfs_rq->group_ema;
-				u64 sleep_ns = now - pcfs_rq->group_ema_sleep_start;
+			if (now > READ_ONCE(pcfs_rq->group_ema_sleep_start)) {
+				u64 old = READ_ONCE(pcfs_rq->group_ema);
+				u64 sleep_ns = now -
+					READ_ONCE(pcfs_rq->group_ema_sleep_start);
 				u64 periods = div64_u64(sleep_ns,
 							 INFINITY_CGROUP_EMA_HALFLIFE_NS);
 
 				if (periods > 63)
-					pcfs_rq->group_ema = 0;
+					WRITE_ONCE(pcfs_rq->group_ema, 0);
 				else
-					pcfs_rq->group_ema >>= periods;
+					WRITE_ONCE(pcfs_rq->group_ema,
+						   old >> periods);
 				/* Infinity: decay must never raise the EMA. */
-				WARN_ON_ONCE(pcfs_rq->group_ema > old);
+				WARN_ON_ONCE(READ_ONCE(pcfs_rq->group_ema) > old);
 			}
 			/* Shield v2: any decay may invalidate the tg-wide max; the
 			 * local rq cannot know it is the max-holder cheaply, so mark
@@ -6883,7 +6887,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 					WRITE_ONCE(tg->infinity_shield.shield_ema_max_stale,
 						   true);
 			}
-			pcfs_rq->group_ema_sleep_start = 0;
+			WRITE_ONCE(pcfs_rq->group_ema_sleep_start, 0);
 		}
 	}
 #endif
@@ -6963,11 +6967,11 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	if (flags & ENQUEUE_WAKEUP) {
 		/* Check futex_waiting before clearing — triggers freq ramp for IPC wakeups */
-		if (p->infinity.futex_waiting)
+		if (READ_ONCE(p->infinity.futex_waiting))
 			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
 
-		p->infinity.futex_waiting = false;
-		p->infinity.ipc_waiting = false;
+		WRITE_ONCE(p->infinity.futex_waiting, false);
+		WRITE_ONCE(p->infinity.ipc_waiting, false);
 
 		if (p->in_iowait)
 			cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
@@ -7160,10 +7164,10 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	/* Infinity: record sleep start */
 	/* Infinity: record sleep start */
 	if (flags & DEQUEUE_SLEEP) {
-		p->infinity.last_sleep_ns = rq_clock(rq_of(task_cfs_rq(p)));
+		WRITE_ONCE(p->infinity.last_sleep_ns, rq_clock(rq_of(task_cfs_rq(p))));
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		if (cfs_rq_of(&p->se)->nr_queued == 0)
-			cfs_rq_of(&p->se)->group_ema_sleep_start = rq_clock(rq);
+			WRITE_ONCE(cfs_rq_of(&p->se)->group_ema_sleep_start, rq_clock(rq));
 #endif
 	}
 	if (!p->se.sched_delayed)
@@ -9284,7 +9288,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		 * This prevents an interactive task from sharing execution
 		 * units with a batch task on the other SMT thread.
 		 */
-		if (sched_smt_active() && p->infinity.ema < 1000) {
+		if (sched_smt_active() && READ_ONCE(p->infinity.ema) < 1000) {
 			int primary = cpumask_first(
 				topology_sibling_cpumask(new_cpu));
 
