@@ -78,22 +78,23 @@ unsigned long infinity_tune_smt_divisor = INFINITY_SMT_DIVISOR_DEFAULT;
 static int infinity_running_flag = 1;
 static char infinity_version[] = "v4.8-gpu";
 
+/* Infinity: smt_divisor bounds.  Out-of-range writes are rejected by the
+ * proc layer (extra1/extra2) instead of silently clamped, closing the
+ * window where an out-of-range value was briefly visible to scheduler
+ * ticks.  The handler only reports changes.
+ */
 static int clamp_smt_divisor(struct ctl_table *table, int write,
                 void *buf, size_t *lenp, loff_t *ppos)
 {
-   int ret;
    unsigned long old, val;
-   struct ctl_table tmp = *table;
+   int ret;
 
    old = READ_ONCE(infinity_tune_smt_divisor);
-   val = old;
-   tmp.data = &val;
-   ret = proc_doulongvec_minmax(&tmp, write, buf, lenp, ppos);
+   ret = proc_doulongvec_minmax(table, write, buf, lenp, ppos);
    if (write && ret == 0) {
-       val = clamp(val, INFINITY_SMT_DIVISOR_MIN, INFINITY_SMT_DIVISOR_MAX);
+       val = READ_ONCE(infinity_tune_smt_divisor);
        if (val != old)
            pr_info("Infinity: smt_divisor %lu -> %lu\n", old, val);
-       WRITE_ONCE(infinity_tune_smt_divisor, val);
    }
    return ret;
 }
@@ -473,6 +474,9 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
 /* ------------------------------------------------------------------ */
 /* Sysctl table                                                        */
 /* ------------------------------------------------------------------ */
+static unsigned long infinity_smt_divisor_min = INFINITY_SMT_DIVISOR_MIN;
+static unsigned long infinity_smt_divisor_max = INFINITY_SMT_DIVISOR_MAX;
+
 static struct ctl_table infinity_sysctl_table[] = {
    {
        .procname   = "infinity_smt_divisor",
@@ -480,6 +484,8 @@ static struct ctl_table infinity_sysctl_table[] = {
        .maxlen     = sizeof(unsigned long),
        .mode       = 0644,
        .proc_handler   = clamp_smt_divisor,
+       .extra1     = &infinity_smt_divisor_min,
+       .extra2     = &infinity_smt_divisor_max,
    },
    {
        .procname   = "infinity_running",
