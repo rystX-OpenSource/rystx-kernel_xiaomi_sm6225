@@ -22,6 +22,7 @@
  * states scx_mlfq classified in, and no other path changes a task's level.
  */
 #include "sched.h"
+#include "mlfq_sched.h"
 
 /*
  * A task asking for a minimum utilization is telling the scheduler it is
