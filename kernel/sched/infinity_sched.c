@@ -226,11 +226,11 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
     * buffer is sized from the same measurements, so the output can
     * never be truncated either.
     */
-   struct infinity_stats_row cpu_rows[10], rt_rows[1], gpu_rows[8];
+   struct infinity_stats_row cpu_rows[10], rt_rows[1], gpu_rows[7];
    struct infinity_stats_section sections[3] = {
        { "CPU", cpu_rows, 10 },
        { "RT",  rt_rows,  1 },
-       { "GPU", gpu_rows, 8 },
+       { "GPU", gpu_rows, 7 },
    };
    u64 fbc, emc, wkc, rtc, gcb, gapp, gskp;
    u64 gic, gcca, gpbo, gldr, icf, ismt;
@@ -337,7 +337,7 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    /* ---- RT rows ---- */
    rt_rows[0].label = "RT throttles";
    fill_pretty_llu(rt_rows[0].value, sizeof(rt_rows[0].value), rtc);
-   strscpy(rt_rows[0].note, "FIFO rogue demotions",
+   strscpy(rt_rows[0].note, "FIFO rogue requeues",
        sizeof(rt_rows[0].note));
 
    /* ---- GPU rows ---- */
@@ -356,35 +356,30 @@ static int infinity_stats_proc_handler(struct ctl_table *ctl, int write,
    else
        strscpy(gpu_rows[1].note, "N/A", sizeof(gpu_rows[1].note));
 
-   gpu_rows[2].label = "  >> lock contention";
-   fill_pretty_llu(gpu_rows[2].value, sizeof(gpu_rows[2].value), 0);
-   strscpy(gpu_rows[2].note, "(lock contention)",
+   gpu_rows[2].label = "  >> entity not found";
+   fill_pretty_llu(gpu_rows[2].value, sizeof(gpu_rows[2].value), gskp);
+   strscpy(gpu_rows[2].note, "(no submit timestamp)",
        sizeof(gpu_rows[2].note));
 
-   gpu_rows[3].label = "  >> entity not found";
-   fill_pretty_llu(gpu_rows[3].value, sizeof(gpu_rows[3].value), gskp);
-   strscpy(gpu_rows[3].note, "(no submit timestamp)",
+   gpu_rows[3].label = "Idle compensation";
+   fill_pretty_llu(gpu_rows[3].value, sizeof(gpu_rows[3].value), gic);
+   strscpy(gpu_rows[3].note, "proportional idle boost",
        sizeof(gpu_rows[3].note));
 
-   gpu_rows[4].label = "Idle compensation";
-   fill_pretty_llu(gpu_rows[4].value, sizeof(gpu_rows[4].value), gic);
-   strscpy(gpu_rows[4].note, "proportional idle boost",
+   gpu_rows[4].label = "CPU->GPU coupling";
+   fill_pretty_llu(gpu_rows[4].value, sizeof(gpu_rows[4].value), gcca);
+   strscpy(gpu_rows[4].note, "interactive vtime reduction",
        sizeof(gpu_rows[4].note));
 
-   gpu_rows[5].label = "CPU->GPU coupling";
-   fill_pretty_llu(gpu_rows[5].value, sizeof(gpu_rows[5].value), gcca);
-   strscpy(gpu_rows[5].note, "interactive vtime reduction",
+   gpu_rows[5].label = "GPU->CPU coupling";
+   fill_pretty_llu(gpu_rows[5].value, sizeof(gpu_rows[5].value), gpbo);
+   strscpy(gpu_rows[5].note, "passover EMA boost",
        sizeof(gpu_rows[5].note));
 
-   gpu_rows[6].label = "GPU->CPU coupling";
-   fill_pretty_llu(gpu_rows[6].value, sizeof(gpu_rows[6].value), gpbo);
-   strscpy(gpu_rows[6].note, "passover EMA boost",
+   gpu_rows[6].label = "Drain count";
+   fill_pretty_llu(gpu_rows[6].value, sizeof(gpu_rows[6].value), gldr);
+   strscpy(gpu_rows[6].note, "batch drain operations",
        sizeof(gpu_rows[6].note));
-
-   gpu_rows[7].label = "Drain count";
-   fill_pretty_llu(gpu_rows[7].value, sizeof(gpu_rows[7].value), gldr);
-   strscpy(gpu_rows[7].note, "batch drain operations",
-       sizeof(gpu_rows[7].note));
 
    /* measure the widest content per column across all sections */
    for (s = 0; s < 3; s++)
