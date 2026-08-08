@@ -771,10 +771,22 @@ unsigned int infinity_rr_timeslice(struct task_struct *p,
 /* tasks are meant to yield to everything by construction.  The KGSL    */
 /* dispatcher calls this before reading a task's infinity_ctx or        */
 /* crediting it a GPU pass-over.                                       */
+/*                                                                     */
+/* Exiting tasks are excluded too.  Both dispatcher call sites resolve  */
+/* a task with pid_task() under rcu_read_lock() and hold no reference,  */
+/* so a task can enter do_exit() between the lookup and this test.      */
+/* Such a task will never reach infinity_wakeup() again, so a pass-over */
+/* credited to it is spent from a budget capped at                      */
+/* INFINITY_GPU_PASSOVER_MAX_ENTITIES neighbours and can never be       */
+/* consumed.  PF_EXITING is set at the top of do_exit(), earlier than   */
+/* exit_state, so it is the more inclusive of the two signals.  The     */
+/* read is a READ_ONCE because the flag's only writer is the exiting    */
+/* task itself, racing with this lockless reader.                       */
 /* ------------------------------------------------------------------ */
 bool infinity_is_interactive_candidate(struct task_struct *p)
 {
    return p->sched_class == &fair_sched_class &&
-          !task_has_idle_policy(p);
+          !task_has_idle_policy(p) &&
+          !(READ_ONCE(p->flags) & PF_EXITING);
 }
 EXPORT_SYMBOL_GPL(infinity_is_interactive_candidate);
