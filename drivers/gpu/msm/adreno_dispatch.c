@@ -1317,15 +1317,45 @@ static void _adreno_dispatcher_issuecmds(struct adreno_device *adreno_dev)
 
 	spin_lock(&dispatcher->plist_lock);
 
+	/*
+	 * Infinity: re-key both re-add paths against the current
+	 * min_gpu_vtime.
+	 *
+	 * pending.prio is a quantized delta from min_gpu_vtime, not an
+	 * absolute vtime, so it is only meaningful against the watermark it
+	 * was computed from.  min_gpu_vtime advances every time a context is
+	 * selected above, so a key computed before that selection now
+	 * overstates the delta and sorts the context farther back than its
+	 * vtime warrants -- a context that was at the front and merely failed
+	 * to submit would drop behind contexts that have consumed more GPU
+	 * time.  Re-projecting the unchanged cached_gpu_vtime onto the current
+	 * watermark restores the correct position.
+	 *
+	 * Only the projection is redone.  This is not a new submission, so
+	 * adreno_dispatcher_update_vtime_locked() is deliberately not called:
+	 * it would stamp gpu_time_last_active with the requeue time and
+	 * collapse gpu_last_submit_interval, corrupting the idle decay and
+	 * job-type heuristics for a context that never got to run.  The
+	 * pending_gpu_ns drain stays on the enqueue path, where the next
+	 * dispatcher_queue_context() picks it up.
+	 *
+	 * The node is off every list between plist_del() and plist_add(),
+	 * which is what makes it safe to write pending.prio here.
+	 */
+
 	/* Put the contexts that couldn't submit back on the pending list */
 	plist_for_each_entry_safe(drawctxt, next, &busy_list, pending) {
 		plist_del(&drawctxt->pending, &busy_list);
+		drawctxt->pending.prio = adreno_context_vtime_prio(dispatcher,
+				drawctxt->cached_gpu_vtime);
 		plist_add(&drawctxt->pending, &dispatcher->pending);
 	}
 
 	/* Now put the contexts that need to be requeued back on the list */
 	plist_for_each_entry_safe(drawctxt, next, &requeue, pending) {
 		plist_del(&drawctxt->pending, &requeue);
+		drawctxt->pending.prio = adreno_context_vtime_prio(dispatcher,
+				drawctxt->cached_gpu_vtime);
 		plist_add(&drawctxt->pending, &dispatcher->pending);
 	}
 
