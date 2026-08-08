@@ -1420,11 +1420,11 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
  		rt_se->timeout = 0;
 
 		/* Infinity: RR EMA decay on wakeup for adaptive timeslice */
-		if (p->infinity.rt_last_sleep_ns) {
+		if (READ_ONCE(p->infinity.rt_last_sleep_ns)) {
 			u64 now = rq_clock(rq);
-			if (now > p->infinity.rt_last_sleep_ns)
+			if (now > READ_ONCE(p->infinity.rt_last_sleep_ns))
 				infinity_rt_wakeup(&p->infinity,
-					now - p->infinity.rt_last_sleep_ns);
+					now - READ_ONCE(p->infinity.rt_last_sleep_ns));
 		}
 	}
 
@@ -1446,7 +1446,7 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 
 	/* Infinity: record sleep timestamp for RR EMA decay */
 	if ((flags & DEQUEUE_SLEEP) && p)
-		p->infinity.rt_last_sleep_ns = rq_clock(rq);
+		WRITE_ONCE(p->infinity.rt_last_sleep_ns, rq_clock(rq));
 
 	dequeue_pushable_task(rq, p);
 

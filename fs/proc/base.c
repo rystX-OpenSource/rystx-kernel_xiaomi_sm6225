@@ -3050,9 +3050,9 @@ static int proc_infinity_show(struct seq_file *m, struct pid_namespace *ns,
 {
 	struct infinity_ctx *ctx = &task->infinity;
 
-	seq_printf(m, "ema:\t\t%llu\n", ctx->ema);
-	seq_printf(m, "rt_ema:\t\t%llu\n", ctx->rt_ema);
-	seq_printf(m, "futex_waiting:\t%d\n", ctx->futex_waiting);
+	seq_printf(m, "ema:\t\t%llu\n", READ_ONCE(ctx->ema));
+	seq_printf(m, "rt_ema:\t\t%llu\n", READ_ONCE(ctx->rt_ema));
+	seq_printf(m, "futex_waiting:\t%d\n", READ_ONCE(ctx->futex_waiting));
 	seq_printf(m, "gpu_passovers:\t%d\n",
 		   atomic_read(&ctx->gpu_passovers));
 	seq_printf(m, "util_avg:\t%lu\n", READ_ONCE(task->se.avg.util_avg));

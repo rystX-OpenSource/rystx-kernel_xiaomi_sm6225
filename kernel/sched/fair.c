@@ -86,7 +86,7 @@ static void infinity_update_weight(struct cfs_rq *cfs_rq,
 	u64 ema;
 	u32 new_weight;
 
-	ema = p->infinity.ema;
+	ema = READ_ONCE(p->infinity.ema);
 	if (ema > INFINITY_BUDGET_MAX_NS)
 		ema = INFINITY_BUDGET_MAX_NS;
 	new_weight = infinity_calc_weight(p, ema);
