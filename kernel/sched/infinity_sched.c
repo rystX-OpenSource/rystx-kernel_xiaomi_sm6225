@@ -76,7 +76,7 @@ EXPORT_PER_CPU_SYMBOL(infinity_smt_interactive_count);
 
 unsigned long infinity_tune_smt_divisor = INFINITY_SMT_DIVISOR_DEFAULT;
 static int infinity_running_flag = 1;
-static char infinity_version[] = "v4.8-gpu";
+static char infinity_version[] = "v4.8-gpu-kgsl";
 
 /* Infinity: smt_divisor bounds.  Out-of-range writes are rejected by the
  * proc layer (extra1/extra2) instead of silently clamped, closing the
