@@ -122,6 +122,34 @@ static inline int pmdp_clear_flush_young(struct vm_area_struct *vma,
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 #endif
 
+/*
+ * ptep_get() / pmdp_get() -- backported from Linux 6.19.8
+ * include/linux/pgtable.h (upstream commit c33c7948d0a3 "mm/gup: use
+ * ptep_get_lockless()" and the ptep_get() conversion series around it).
+ *
+ * Accessors for a single page-table entry.  4.19 dereferences *ptep
+ * directly at every call site; the accessor exists upstream so that
+ * arches needing a non-trivial read (contpte on arm64, for instance) can
+ * override it, and so that the read is explicitly READ_ONCE() rather than
+ * a plain load the compiler may split or re-issue.
+ *
+ * Placed at the same point in the header as upstream, and left overridable
+ * via #ifndef so an arch can supply its own.
+ */
+#ifndef ptep_get
+static inline pte_t ptep_get(pte_t *ptep)
+{
+	return READ_ONCE(*ptep);
+}
+#endif
+
+#ifndef pmdp_get
+static inline pmd_t pmdp_get(pmd_t *pmdp)
+{
+	return READ_ONCE(*pmdp);
+}
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 				       unsigned long address,
@@ -675,6 +703,53 @@ static inline void ptep_modify_prot_commit(struct mm_struct *mm,
 #define arch_leave_lazy_mmu_mode()	do {} while (0)
 #define arch_flush_lazy_mmu_mode()	do {} while (0)
 #endif
+
+/*
+ * PTE batching primitives, backported from Linux 6.19.8
+ * include/linux/pgtable.h:240-268 (upstream commits 4c1eb5ed8e97 "mm: Introduce
+ * pte_batch_hint()" and 583ceaaa3392 "mm: Introduce pte_advance_pfn()").
+ * Placed here, right after the lazy-MMU block, exactly as upstream orders them.
+ */
+#ifndef PFN_PTE_SHIFT
+#define PFN_PTE_SHIFT	PAGE_SHIFT
+#endif
+
+#ifndef pte_batch_hint
+/**
+ * pte_batch_hint - Number of pages that can be added to batch without scanning.
+ * @ptep: Page table pointer for the entry.
+ * @pte: Page table entry.
+ *
+ * Some architectures know that a set of contiguous ptes all map the same
+ * contiguous memory with the same permissions. In this case, it can provide a
+ * hint to aid pte batching without the core code needing to scan every pte.
+ *
+ * An architecture implementation may ignore the PTE accessed state. Further,
+ * the dirty state must apply atomically to all the PTEs described by the hint.
+ *
+ * May be overridden by the architecture, else pte_batch_hint is always 1.
+ */
+static inline unsigned int pte_batch_hint(pte_t *ptep, pte_t pte)
+{
+	return 1;
+}
+#endif
+
+/*
+ * The generic form assumes the PFN sits in one contiguous run of PTE bits
+ * starting at PFN_PTE_SHIFT, so incrementing the PFN is a plain add.  That
+ * holds on x86; arm64 with CONFIG_ARM64_PA_BITS_52 splits the address across
+ * PTE_ADDR_LOW and PTE_ADDR_HIGH and therefore overrides this (see
+ * arch/arm64/include/asm/pgtable.h), just as upstream does.
+ */
+#ifndef pte_advance_pfn
+static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+{
+	return __pte(pte_val(pte) + (nr << PFN_PTE_SHIFT));
+}
+#endif
+
+#define pte_next_pfn(pte)	pte_advance_pfn(pte, 1)
 
 /*
  * A facility to provide batching of the reload of page tables and

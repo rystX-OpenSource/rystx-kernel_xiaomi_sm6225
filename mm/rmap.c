@@ -65,6 +65,7 @@
 #include <linux/page_idle.h>
 #include <linux/memremap.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/lru_marie.h>
 
 #include <asm/tlbflush.h>
 
@@ -771,7 +772,20 @@ static bool page_referenced_one(struct page *page, struct vm_area_struct *vma,
 			return false; /* To break the loop */
 		}
 
-		if (pvmw.pte) {
+		if (0) {
+			/*
+			 * Upstream's chain opens with
+			 *   if (lru_gen_enabled() && pvmw.pte) { ... }
+			 * MGLRU does not exist in this tree, so the chain opens
+			 * with Marie instead; the dummy head keeps the branch
+			 * order (and the #ifdef shape) identical to the patch.
+			 */
+#ifdef CONFIG_LRU_MARIE
+		} else if (lru_marie_enabled() && pvmw.pte) {
+			if (lru_marie_look_around(&pvmw, hpage_nr_pages(page)))
+				referenced++;
+#endif
+		} else if (pvmw.pte) {
 			if (ptep_clear_flush_young_notify(vma, address,
 						pvmw.pte)) {
 				/*

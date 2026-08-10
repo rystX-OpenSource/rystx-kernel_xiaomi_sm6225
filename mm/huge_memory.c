@@ -8,6 +8,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/mm.h>
+#include <linux/lru_marie.h>
 #include <linux/sched.h>
 #include <linux/sched/coredump.h>
 #include <linux/sched/numa_balancing.h>

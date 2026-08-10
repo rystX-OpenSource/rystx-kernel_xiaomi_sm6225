@@ -483,4 +483,99 @@ int __alloc_bucket_spinlocks(spinlock_t **locks, unsigned int *lock_mask,
 
 void free_bucket_spinlocks(spinlock_t *locks);
 
+/*
+ * Scope-based lock guards.  Hard-copied from 6.19.8
+ * include/linux/spinlock.h:535-618 (upstream commit d6e0dbdcaa0f "locking:
+ * Introduce __cleanup() based infrastructure" and the follow-ups that moved
+ * the lock classes next to the locks they wrap), kept at the end of the file
+ * as upstream has them so scoped_guard(spinlock_irq, ...) &c. resolve wherever
+ * <linux/spinlock.h> is already included.
+ *
+ * Two deviations from the upstream block, both consequences of this tree's
+ * reduced <linux/cleanup.h> backport rather than of the locks themselves:
+ *
+ *  - The DEFINE_LOCK_GUARD_1_COND() try-lock variants are omitted.  That
+ *    macro needs typeof_member(), which 4.19 does not have, so cleanup.h left
+ *    it out; see the "Deliberately omitted" note there.  Nothing in this tree
+ *    uses a conditional lock guard -- Marie's one try-lock site (the scanner's
+ *    per-L2-range claim) calls marie_bm_range_trylock() directly.
+ *
+ *  - cleanup.h is included here explicitly.  Upstream's spinlock.h carries the
+ *    same include (cachy:64); this tree's did not, and the header is otherwise
+ *    reachable only from the two Marie files that include it by hand.  It costs
+ *    nothing new in the include graph: cleanup.h pulls only <linux/compiler.h>
+ *    (already included above) and <linux/err.h>, which adds just types.h and
+ *    asm/errno.h.
+ *
+ * Every primitive used below already exists in this tree unchanged:
+ * raw_spin_lock_nested() (:218/:232), spin_lock_nested() (:357),
+ * SINGLE_DEPTH_NESTING (lockdep.h:631, reached via spinlock_types.h:18), and
+ * the rwlock irq/irqsave family (rwlock.h:75-117, reached via :302 above).
+ */
+#include <linux/cleanup.h>
+
+DEFINE_LOCK_GUARD_1(raw_spinlock, raw_spinlock_t,
+		    raw_spin_lock(_T->lock),
+		    raw_spin_unlock(_T->lock))
+
+DEFINE_LOCK_GUARD_1(raw_spinlock_nested, raw_spinlock_t,
+		    raw_spin_lock_nested(_T->lock, SINGLE_DEPTH_NESTING),
+		    raw_spin_unlock(_T->lock))
+
+DEFINE_LOCK_GUARD_1(raw_spinlock_irq, raw_spinlock_t,
+		    raw_spin_lock_irq(_T->lock),
+		    raw_spin_unlock_irq(_T->lock))
+
+DEFINE_LOCK_GUARD_1(raw_spinlock_bh, raw_spinlock_t,
+		    raw_spin_lock_bh(_T->lock),
+		    raw_spin_unlock_bh(_T->lock))
+
+DEFINE_LOCK_GUARD_1(raw_spinlock_irqsave, raw_spinlock_t,
+		    raw_spin_lock_irqsave(_T->lock, _T->flags),
+		    raw_spin_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
+
+DEFINE_LOCK_GUARD_1(spinlock, spinlock_t,
+		    spin_lock(_T->lock),
+		    spin_unlock(_T->lock))
+
+DEFINE_LOCK_GUARD_1(spinlock_irq, spinlock_t,
+		    spin_lock_irq(_T->lock),
+		    spin_unlock_irq(_T->lock))
+
+DEFINE_LOCK_GUARD_1(spinlock_bh, spinlock_t,
+		    spin_lock_bh(_T->lock),
+		    spin_unlock_bh(_T->lock))
+
+DEFINE_LOCK_GUARD_1(spinlock_irqsave, spinlock_t,
+		    spin_lock_irqsave(_T->lock, _T->flags),
+		    spin_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
+
+DEFINE_LOCK_GUARD_1(read_lock, rwlock_t,
+		    read_lock(_T->lock),
+		    read_unlock(_T->lock))
+
+DEFINE_LOCK_GUARD_1(read_lock_irq, rwlock_t,
+		    read_lock_irq(_T->lock),
+		    read_unlock_irq(_T->lock))
+
+DEFINE_LOCK_GUARD_1(read_lock_irqsave, rwlock_t,
+		    read_lock_irqsave(_T->lock, _T->flags),
+		    read_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
+
+DEFINE_LOCK_GUARD_1(write_lock, rwlock_t,
+		    write_lock(_T->lock),
+		    write_unlock(_T->lock))
+
+DEFINE_LOCK_GUARD_1(write_lock_irq, rwlock_t,
+		    write_lock_irq(_T->lock),
+		    write_unlock_irq(_T->lock))
+
+DEFINE_LOCK_GUARD_1(write_lock_irqsave, rwlock_t,
+		    write_lock_irqsave(_T->lock, _T->flags),
+		    write_unlock_irqrestore(_T->lock, _T->flags),
+		    unsigned long flags)
+
 #endif /* __LINUX_SPINLOCK_H */

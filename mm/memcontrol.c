@@ -33,6 +33,7 @@
 
 #include <linux/page_counter.h>
 #include <linux/memcontrol.h>
+#include <linux/lru_marie.h>
 #include <linux/cgroup.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
@@ -3566,6 +3567,20 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
 	else
 		vm_swappiness = val;
 
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Notify Marie so its global swap_bias controller resets to neutral
+	 * under the new value. Desktop/global-only: a single node-wide
+	 * atomic64, so the reset is one atomic64_set, not scoped to @memcg.
+	 * See lru_marie.h.
+	 *
+	 * Upstream carries this hunk in mm/memcontrol-v1.c, which was split
+	 * out of memcontrol.c in 6.11 (commit 4b8ebc5f4d4e); in this tree the
+	 * cgroup-v1 files still live here.
+	 */
+	lru_marie_swappiness_changed();
+#endif
+
 	return 0;
 }
 
@@ -6244,6 +6259,18 @@ static void uncharge_page(struct page *page, struct uncharge_gather *ug)
 	}
 
 	ug->dummy_page = page;
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Last point this page's memcg is live: settle Marie's global
+	 * counters (marie_nr_pages + the lruvec's vmstat lru_size) for
+	 * any page that escaped evict (scan bit still set). The
+	 * page-free hook that follows runs after mem_cgroup is zeroed
+	 * and cannot resolve the lruvec. No-op for the common case (bit
+	 * already retired by the normal evict path).
+	 */
+	lru_marie_uncharge_backstop(page, page->mem_cgroup);
+#endif
+
 	page->mem_cgroup = NULL;
 }
 

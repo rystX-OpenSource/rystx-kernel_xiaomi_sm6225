@@ -52,6 +52,22 @@ static inline void set_max_mapnr(unsigned long limit) { }
 #endif
 
 extern unsigned long totalram_pages;
+
+/*
+ * totalram_pages() -- accessor spelling, from Linux 6.19.8 include/linux/mm.h
+ * (upstream commit ca79b0c211af "mm: convert totalram_pages and
+ * totalhigh_pages variables to atomic" turned the bare variable into an
+ * atomic_long_t behind this accessor in 5.0).
+ *
+ * Defined as a function-like macro rather than a static inline so that the
+ * plain variable keeps working unchanged: a function-like macro is only
+ * expanded when the name is immediately followed by '(', so the declaration
+ * above and this tree's ~100 existing bare `totalram_pages` uses are left
+ * completely alone, while code written against the post-5.0 API compiles as
+ * is.  Converting the variable itself would be a treewide change well outside
+ * the scope of this backport.
+ */
+#define totalram_pages()	(totalram_pages)
 extern void * high_memory;
 extern int page_cluster;
 
@@ -806,6 +822,21 @@ static inline unsigned int compound_order(struct page *page)
 	if (!PageHead(page))
 		return 0;
 	return page[1].compound_order;
+}
+
+/*
+ * compound_nr() returns the number of pages in this potentially compound
+ * page.  compound_nr() can be called on a tail page, and is defined to
+ * return 1 in that case.
+ *
+ * Backported from 6.19.8 (include/linux/mm.h) and rewritten in struct page
+ * terms: compound_order() already returns 0 for anything that is not a head
+ * page, so the PG_head test and folio_large_nr_pages() collapse into a
+ * single shift.
+ */
+static inline unsigned long compound_nr(struct page *page)
+{
+	return 1UL << compound_order(page);
 }
 
 static inline void set_compound_order(struct page *page, unsigned int order)

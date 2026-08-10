@@ -89,6 +89,33 @@ static inline pteval_t __phys_to_pte_val(phys_addr_t phys)
 #define pte_page(pte)		(pfn_to_page(pte_pfn(pte)))
 
 /*
+ * Select all bits except the pfn
+ *
+ * Both helpers are hard-copied from Linux 6.19.8
+ * arch/arm64/include/asm/pgtable.h:495-507 (upstream commit 583ceaaa3392).
+ * They are needed unmodified here because this arch cannot use the generic
+ * pte_advance_pfn() in <linux/pgtable.h>: under CONFIG_ARM64_PA_BITS_52 the
+ * physical address is split between PTE_ADDR_LOW and PTE_ADDR_HIGH, so a plain
+ * add to pte_val() would corrupt the high bits.  Round-tripping through
+ * pte_pfn()/pfn_pte() goes via __pte_to_phys()/__phys_to_pte_val() and so
+ * handles both the 48-bit and 52-bit encodings.  4.19's pte_pfn()/pfn_pte()
+ * above are already identical to upstream's, so the copy is verbatim.
+ */
+#define pte_pgprot pte_pgprot
+static inline pgprot_t pte_pgprot(pte_t pte)
+{
+	unsigned long pfn = pte_pfn(pte);
+
+	return __pgprot(pte_val(pfn_pte(pfn, __pgprot(0))) ^ pte_val(pte));
+}
+
+#define pte_advance_pfn pte_advance_pfn
+static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+{
+	return pfn_pte(pte_pfn(pte) + nr, pte_pgprot(pte));
+}
+
+/*
  * The following only work if pte_present(). Undefined behaviour otherwise.
  */
 #define pte_present(pte)	(!!(pte_val(pte) & (PTE_VALID | PTE_PROT_NONE)))

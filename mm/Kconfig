@@ -827,6 +827,78 @@ config GUP_BENCHMARK
 config ARCH_HAS_PTE_SPECIAL
 	bool
 
+# Marie LRU {
+config LRU_MARIE
+	bool "Marie LRU"
+	def_bool y
+	depends on MMU
+	help
+	  Marie LRU represents each page's reclaim state as a single
+	  byte in a flat per-PFN array allocated once at boot. install,
+	  delete, and aging are all single byte writes — there is no
+	  allocation in any fault-path Marie operation, and no linked
+	  lists for the reclaim path to chase. isolate batches the array
+	  with SIMD plus a persistent cursor, so a 32-page batch
+	  typically costs a few hundred PFNs of sequential read.
+
+	  The PTE young-bit walker is SIMD-accelerated and auto-dispatched
+	  at boot (AVX-512F > AVX2 > SSE2 on x86; NEON on arm64; scalar
+	  elsewhere); a bloom-filter forward feedback from rmap keeps
+	  walker cost on hot PMDs.
+
+	  Memory cost: ~1 byte per RAM PFN (4 MiB on 16 GiB, 16 MiB on
+	  64 GiB, capped at 4 GiB by the 32-bit PFN limit Marie requires).
+
+	  The compile-time default (enabled or disabled) is controlled by
+	  LRU_MARIE_DEFAULT_ON; either way, the lru_marie=0/1 kernel
+	  cmdline argument overrides it at boot (selected once at boot --
+	  there is no runtime toggle). When disabled, vmscan falls through
+	  to the in-tree LRU paths unchanged.
+
+	  Say Y unless you understand what this is.
+
+config LRU_MARIE_DEFAULT_ON
+	bool "Enable Marie LRU by default at boot"
+	depends on LRU_MARIE
+	default y
+	help
+	  Marie LRU's reclaim path is selected once at boot via a static
+	  key. This option controls the compile-time default of that
+	  key: Y means Marie starts enabled unless overridden with
+	  lru_marie=0 on the kernel command line; N means Marie starts
+	  disabled unless overridden with lru_marie=1.
+
+	  The kernel command line always has the final say either
+	  direction; this option only changes what happens when no
+	  lru_marie= argument is given.
+
+	  Say Y unless you specifically want Marie off by default.
+
+config LRU_MARIE_DEFRAG
+	bool "Marie defragmentation"
+	depends on LRU_MARIE && COMPACTION
+	default y
+	help
+	  Marie defragmentation reuses Marie's dense per-PFN state array and
+	  aging generations to drive memory defragmentation at far lower cost
+	  than mainline compaction: it scores 2 MiB pageblocks by the cost to
+	  evacuate them and clears only the few cold/unmapped stragglers of
+	  near-empty movable blocks -- MOVE (reusing migrate_pages()) or, for
+	  cold-dead clean file, a cheap DROP.
+
+	  When enabled, the /sys/kernel/mm/lru_marie/defrag switch (default 1)
+	  makes Marie defrag REPLACE stock compaction inside kcompactd on both
+	  paths (demand = MOVE+DROP, proactive = MOVE-only); write 0 to fall
+	  back to stock kernel compaction at runtime. The histogram adds one
+	  atomic per Marie gen transition (install/aging/free). When N, all hooks
+	  compile out and the kernel image is identical to plain Marie. See
+	  mm/lru_marie/defrag_design.md.
+
+	  Prototype: verified safe (refault-free migration, bounded DROP, no
+	  corruption); the yield-vs-stock A/B is real-HW territory and not yet
+	  done. Default y on this Marie tree; set N to exclude it entirely.
+# }
+
 endmenu
 
 config MEMFD_ASHMEM_SHIM

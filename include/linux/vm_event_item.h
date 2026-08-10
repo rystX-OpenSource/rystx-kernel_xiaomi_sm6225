@@ -35,6 +35,31 @@ enum vm_event_item { PGPGIN, PGPGOUT, PGPGOUTCLEAN, PSWPIN, PSWPOUT,
 		PGSCAN_KSWAPD,
 		PGSCAN_DIRECT,
 		PGSCAN_DIRECT_THROTTLE,
+		/*
+		 * Per-type scan/steal counters, hard-copied from 6.19.8
+		 * include/linux/vm_event_item.h:52-55 (added by upstream commit
+		 * 57e9cc50f4dd "mm: vmscan: make global slab shrink lockless"'s
+		 * era rework of the reclaim stats; 4.19 only had the
+		 * KSWAPD/DIRECT reclaimer split, not the anon/file one).
+		 *
+		 * Inserted at upstream's position, directly after
+		 * PGSCAN_DIRECT_THROTTLE.  The ANON member of each pair MUST
+		 * stay immediately followed by its FILE member: Marie indexes
+		 * them as "PGSCAN_ANON + type" / "PGSTEAL_ANON + type" with
+		 * type in {0,1} (mm/lru_marie/state.c:2233 and :2257), exactly
+		 * as upstream's shrink_lruvec() does.
+		 *
+		 * Every addition here needs a matching string added at the
+		 * same index in mm/vmstat.c's vmstat_text[] -- on this tree
+		 * that array is still a positional initialiser rather than
+		 * 6.x's designated [I(...)] = form, so a missing entry does not
+		 * fail to build, it silently shifts every later /proc/vmstat
+		 * label by one.
+		 */
+		PGSCAN_ANON,
+		PGSCAN_FILE,
+		PGSTEAL_ANON,
+		PGSTEAL_FILE,
 #ifdef CONFIG_NUMA
 		PGSCAN_ZONE_RECLAIM_FAILED,
 #endif

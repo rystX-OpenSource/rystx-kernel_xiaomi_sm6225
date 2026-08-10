@@ -15,6 +15,7 @@
 #include <linux/file.h>
 #include <linux/mm.h>
 #include <linux/pagemap.h>
+#include <linux/rmap.h>	/* enum ttu_flags: shrink_page_list() below */
 #include <linux/tracepoint-defs.h>
 
 /*
@@ -87,11 +88,217 @@ extern unsigned long highest_memmap_pfn;
  */
 #define MAX_RECLAIM_RETRIES 16
 
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Maximum number of swap-write failures (incremented by mm/page_io.c
+ * end_swap_bio_write on bio->bi_status != 0) tolerated within a single
+ * __alloc_pages_slowpath attempt before the early-OOM gate gives up. Lets
+ * a handful of transient failures (concurrent ZRAM ops, brief retry
+ * windows) recover, but trips OOM well before MAX_RECLAIM_RETRIES on
+ * sustained backend rejection. Marie-only; omitted under
+ * CONFIG_LRU_MARIE=n.
+ */
+#define MAX_SWAP_WRITE_FAIL_RETRIES 16
+
+#endif
+
 /*
  * in mm/vmscan.c:
+ *
+ * struct scan_control is private to vmscan.c. Out-of-tree LRU
+ * experiments (mm/lru_marie) read/update individual fields via the
+ * sc_* accessors declared below; the struct itself is opaque to
+ * everything outside vmscan.c.
  */
+struct scan_control;
+
 extern int isolate_lru_page(struct page *page);
 extern void putback_lru_page(struct page *page);
+struct reclaim_stat;
+/*
+ * Upstream's declaration is the 5-argument form; this tree's definition still
+ * carries the @ttu_flags parameter and returns unsigned long.  Declare what
+ * vmscan.c actually defines -- mm/lru_marie/state_compat.h's
+ * marie_shrink_page_list() wrapper supplies the extra argument, so Marie's
+ * call sites stay spelled the upstream way.
+ */
+unsigned long shrink_page_list(struct list_head *page_list,
+		struct pglist_data *pgdat, struct scan_control *sc,
+		enum ttu_flags ttu_flags, struct reclaim_stat *stat,
+		bool ignore_references);
+int vmscan_reclaimer_offset(struct scan_control *sc);
+bool vmscan_can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
+				   struct scan_control *sc);
+
+/*
+ * scan_control accessors -- read/update the few fields out-of-tree
+ * readers need without exposing the struct layout. All defined in
+ * vmscan.c next to the struct definition; trivial enough that the
+ * compiler routinely inlines the body across LTO. Non-LTO builds
+ * pay one extra call per use, which lands only on cold paths
+ * (entry of marie_state_shrink_lruvec and the inner tier loop).
+ */
+int  sc_priority(const struct scan_control *sc);
+int  sc_reclaim_idx(const struct scan_control *sc);
+bool sc_reclaim_target_reached(const struct scan_control *sc);
+void sc_add_reclaimed(struct scan_control *sc, unsigned long nr);
+gfp_t sc_gfp_mask(const struct scan_control *sc);
+bool sc_cgroup_reclaim(const struct scan_control *sc);
+
+/*
+ * reclaim_throttle() and the VMSCAN_THROTTLE_* states arrived in 5.19
+ * (commit 8cd7c588decf); mm/lru_marie/state_compat.h supplies the no-op
+ * stub this tree needs, so no declaration belongs here.
+ */
+
+/*
+ * page_isolate_lru - take @page off its LRU list, keeping the isolation ref.
+ *
+ * From Linux 6.19.8 folio_isolate_lru() (mm/internal.h:538), expressed in this
+ * tree's struct page terms.  isolate_lru_page() above is the same operation
+ * with the opposite return convention -- 0 on success / -EBUSY on failure,
+ * where the folio-era helper returns true on success -- so normalise to the
+ * upstream boolean and let callers read the way upstream does.
+ *
+ * Everything past the return value matches: both unlink the page from its LRU
+ * list and leave the caller holding the isolation reference.
+ */
+static inline bool page_isolate_lru(struct page *page)
+{
+	return isolate_lru_page(page) == 0;
+}
+
+/*
+ * page_rmappable_page - finish preparing a freshly allocated compound page
+ * for rmap, from Linux 6.19.8 page_rmappable_folio() (mm/internal.h:775),
+ * expressed in this tree's struct page terms.
+ *
+ * Upstream's folio_set_large_rmappable() arms the deferred-split machinery on
+ * a large folio.  4.19 spells that prep_transhuge_page(): it initialises the
+ * deferred_list head and installs TRANSHUGE_PAGE_DTOR, which is the same
+ * preparation under the pre-folio layout.  It stores the list head in the
+ * second tail page and so requires order >= 2; the only compound LRU pages in
+ * this tree are THPs at HPAGE_PMD_ORDER, and the !CONFIG_TRANSPARENT_HUGEPAGE
+ * build gets the no-op stub from <linux/huge_mm.h>.
+ *
+ * PageTransHuge() is the struct page reading of upstream's folio_test_large():
+ * callers reach here after prep_compound_page(), so PageHead() is already set
+ * for every order > 0 and clear for order 0.
+ */
+static inline struct page *page_rmappable_page(struct page *page)
+{
+	if (page && PageTransHuge(page))
+		prep_transhuge_page(page);
+	return page;
+}
+
+/*
+ * PTE batch detection, from Linux 6.19.8 mm/internal.h:203-320 (upstream
+ * folio_pte_batch_flags(), commit c0f7f3ecf8f2 and successors), expressed in
+ * this tree's struct page terms.
+ *
+ * Adaptations:
+ *   - "folio" becomes the compound page: folio_pfn()+folio_nr_pages() become
+ *     page_to_pfn(compound_head())+compound_nr(), which is the same span.
+ *   - FPB_MERGE_WRITE is dropped.  It needs pte_mkwrite(pte, vma), whose @vma
+ *     parameter only appeared in 6.7, and no caller in this tree sets it; the
+ *     remaining flags cover every in-tree use.  Re-add it from the same 6.19.8
+ *     source (together with the @vma argument) if a caller ever needs it.
+ *   - The VM_WARN_ON_FOLIO() assertions are dropped along with the folio type.
+ */
+typedef int __bitwise fpb_t;
+
+/* Compare PTEs respecting the dirty bit. */
+#define FPB_RESPECT_DIRTY		((__force fpb_t)BIT(0))
+
+/* Compare PTEs respecting the soft-dirty bit. */
+#define FPB_RESPECT_SOFT_DIRTY		((__force fpb_t)BIT(1))
+
+/* Compare PTEs respecting the writable bit. */
+#define FPB_RESPECT_WRITE		((__force fpb_t)BIT(2))
+
+/*
+ * Merge PTE young and dirty bits: the returned PTE has them set if any PTE in
+ * the batch did.
+ */
+#define FPB_MERGE_YOUNG_DIRTY		((__force fpb_t)BIT(4))
+
+static inline pte_t __pte_batch_clear_ignored(pte_t pte, fpb_t flags)
+{
+	if (!(flags & FPB_RESPECT_DIRTY))
+		pte = pte_mkclean(pte);
+	if (likely(!(flags & FPB_RESPECT_SOFT_DIRTY)))
+		pte = pte_clear_soft_dirty(pte);
+	if (likely(!(flags & FPB_RESPECT_WRITE)))
+		pte = pte_wrprotect(pte);
+	return pte_mkold(pte);
+}
+
+/**
+ * page_pte_batch - detect a PTE batch for a compound page
+ * @page: The compound page to detect a PTE batch for.
+ * @ptep: Page table pointer for the first entry.
+ * @ptentp: Pointer to a COPY of the first page table entry whose flags this
+ *	    function updates based on @flags if appropriate.
+ * @max_nr: The maximum number of table entries to consider.
+ * @flags: Flags to modify the PTE batch semantics.
+ *
+ * Detect a PTE batch: consecutive (present) PTEs that map consecutive
+ * pages of the same compound page in a single VMA and a single page table.
+ *
+ * All PTEs inside a PTE batch have the same PTE bits set, excluding the PFN,
+ * the accessed bit, writable bit, dirty bit (unless FPB_RESPECT_DIRTY is set)
+ * and soft-dirty bit (unless FPB_RESPECT_SOFT_DIRTY is set).
+ *
+ * @ptep must map any page of the compound page.  max_nr must be at least one
+ * and must be limited by the caller so scanning cannot exceed a single VMA and
+ * a single page table.
+ *
+ * Return: the number of table entries in the batch.
+ */
+static inline unsigned int page_pte_batch(struct page *page, pte_t *ptep,
+					  pte_t *ptentp, unsigned int max_nr,
+					  fpb_t flags)
+{
+	bool any_young = false, any_dirty = false;
+	pte_t expected_pte, pte = *ptentp;
+	struct page *head = compound_head(page);
+	unsigned int nr, cur_nr;
+
+	/*
+	 * Limit max_nr to the actual remaining PFNs in the page we could batch.
+	 */
+	max_nr = min_t(unsigned long, max_nr,
+		       page_to_pfn(head) + compound_nr(head) - pte_pfn(pte));
+
+	nr = pte_batch_hint(ptep, pte);
+	expected_pte = __pte_batch_clear_ignored(pte_advance_pfn(pte, nr), flags);
+	ptep = ptep + nr;
+
+	while (nr < max_nr) {
+		pte = ptep_get(ptep);
+
+		if (!pte_same(__pte_batch_clear_ignored(pte, flags), expected_pte))
+			break;
+
+		if (flags & FPB_MERGE_YOUNG_DIRTY) {
+			any_young |= pte_young(pte);
+			any_dirty |= pte_dirty(pte);
+		}
+
+		cur_nr = pte_batch_hint(ptep, pte);
+		expected_pte = pte_advance_pfn(expected_pte, cur_nr);
+		ptep += cur_nr;
+		nr += cur_nr;
+	}
+
+	if (any_young)
+		*ptentp = pte_mkyoung(*ptentp);
+	if (any_dirty)
+		*ptentp = pte_mkdirty(*ptentp);
+
+	return min(nr, max_nr);
+}
 
 /*
  * in mm/rmap.c:
@@ -122,6 +329,30 @@ struct alloc_context {
 	int migratetype;
 	enum zone_type high_zoneidx;
 	bool spread_dirty_pages;
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Snapshot of nr_swap_write_failed at the entry to
+	 * __alloc_pages_slowpath. should_reclaim_retry takes the delta to
+	 * decide whether the swap backend has rejected enough writes during
+	 * THIS allocation attempt to skip the rest of the reclaim retry
+	 * budget and OOM directly. See include/linux/swap.h for the
+	 * counter's contract. Marie-only; omitted under CONFIG_LRU_MARIE=n.
+	 */
+	long initial_swap_write_failed;
+#endif
+
+	/*
+	 * Snapshot of the global workingset refault counters (anon + file) at
+	 * the previous should_reclaim_retry check for this allocation.
+	 * should_reclaim_retry takes the delta to tell real reclaim progress
+	 * from a thrash treadmill: when the pages reclaimed during a retry
+	 * loop are dwarfed by working-set refaults over the same window, the
+	 * "progress" is other tasks' working sets being pulled straight back
+	 * in, and must not keep resetting no_progress_loops (else a RAM-backed
+	 * swap device that never looks full livelocks the OOM path forever).
+	 */
+	unsigned long last_refaults;
 };
 
 #define ac_classzone_idx(ac) zonelist_zone_idx(ac->preferred_zoneref)

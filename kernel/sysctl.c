@@ -89,6 +89,9 @@
 #ifdef CONFIG_RT_MUTEXES
 #include <linux/rtmutex.h>
 #endif
+#ifdef CONFIG_LRU_MARIE
+#include <linux/lru_marie.h>
+#endif
 #if defined(CONFIG_PROVE_LOCKING) || defined(CONFIG_LOCK_STAT)
 #include <linux/lockdep.h>
 #endif
@@ -1711,6 +1714,33 @@ static struct ctl_table kern_table[] = {
 	{ }
 };
 
+#ifdef CONFIG_LRU_MARIE
+/*
+ * vm.swappiness write notifier for the Marie LRU controller. Calls
+ * the default proc_dointvec_minmax to perform range-checked storage
+ * into vm_swappiness, then, on a successful write, notifies Marie so
+ * it can reset every per-lruvec swap_bias counter. The notification
+ * is skipped on read or on validation failure -- only an actual
+ * value change should trigger controller reset.
+ *
+ * Note: we always notify on a successful write even when the new
+ * value equals the old one. The cost is one xa walk; the alternative
+ * (snapshot+compare) would require atomicity guarantees that
+ * proc_dointvec_minmax does not provide, and gives no practical
+ * benefit since reset-to-zero is idempotent.
+ */
+static int marie_swappiness_sysctl_handler(struct ctl_table *table,
+					   int write, void *buffer,
+					   size_t *lenp, loff_t *ppos)
+{
+	int ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+
+	if (write && !ret)
+		lru_marie_swappiness_changed();
+	return ret;
+}
+#endif
+
 static struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
@@ -1835,7 +1865,17 @@ static struct ctl_table vm_table[] = {
 		.data		= &vm_swappiness,
 		.maxlen		= sizeof(vm_swappiness),
 		.mode		= 0644,
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Marie wraps the default minmax handler so that a sysctl
+		 * write resets the single global swap_bias counter to zero.
+		 * See mm/lru_marie/state.c::marie_swap_bias_update for the
+		 * controller this notification clears.
+		 */
+		.proc_handler	= marie_swappiness_sysctl_handler,
+#else
 		.proc_handler	= proc_dointvec_minmax,
+#endif
 		.extra1		= &zero,
 		.extra2		= &one_hundred,
 	},

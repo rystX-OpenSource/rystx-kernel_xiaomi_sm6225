@@ -14,6 +14,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/lru_marie.h>
 #include <linux/sched.h>
 #include <linux/kernel_stat.h>
 #include <linux/swap.h>
@@ -59,17 +60,57 @@ static DEFINE_PER_CPU(struct pagevec, activate_page_pvecs);
  */
 static void __page_cache_release(struct page *page)
 {
+	/*
+	 * PG_lru is the "on an LRU list, still holding +nr LRU accounting"
+	 * signal. A page that Marie's reclaim isolate already claimed has
+	 * PG_lru clear and its Marie counters already wound down
+	 * (marie_account_evict_isolate); only its per-PFN TRACKED byte stays
+	 * set, until the buddy handoff (marie_state_drop_pfn_at_free). Gating
+	 * the Marie del path on PG_lru -- not TRACKED alone -- keeps such an
+	 * isolated page from being evict-accounted a SECOND time here: that
+	 * double count (a TRACKED-only gate over-firing on the isolate path)
+	 * drove marie_nr_pages and the per-mlv scan counters negative, which
+	 * in turn fed a runaway reclaim scan. Legacy del is already
+	 * PG_lru-gated, so an off-LRU page was always a no-op here anyway.
+	 *
+	 * For an on-LRU page, TRACKED then selects Marie del over legacy
+	 * del. Both debit mz->lru_zone_size now (marie_update_lru_size is
+	 * unified with legacy update_lru_size), so the choice is about the
+	 * LIST, not the count: a TRACKED page sits on a Marie self-loop, so
+	 * legacy del_page_from_lru_list's list_del would corrupt it -- it must
+	 * go through lru_marie_release_page, which unlinks the self-loop and
+	 * debits mz. See lru_marie_release_page's contract in
+	 * <linux/lru_marie.h>.
+	 *
+	 * Upstream restructures this into an early return because its
+	 * __page_cache_release() has nothing after the LRU block and hands the
+	 * caller's batched lruvec/flags down. This tree's version still owes
+	 * __ClearPageWaiters() + mem_cgroup_uncharge() afterwards and owns its
+	 * lock locally, so the Marie branch nests inside the PageLRU block and
+	 * drops the lock lru_marie_release_page() leaves held.
+	 */
 	if (PageLRU(page)) {
 		struct zone *zone = page_zone(page);
 		struct lruvec *lruvec;
 		unsigned long flags;
 
-		spin_lock_irqsave(zone_lru_lock(zone), flags);
-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
-		VM_BUG_ON_PAGE(!PageLRU(page), page);
-		__ClearPageLRU(page);
-		del_page_from_lru_list(page, lruvec, page_off_lru(page));
-		spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled() && lru_marie_test_tracked(page)) {
+			struct lruvec *mlruvec = NULL;
+
+			/* Relocks to @page's lruvec and leaves it held. */
+			lru_marie_release_page(page, &mlruvec, &flags);
+			unlock_page_lruvec_irqrestore(mlruvec, flags);
+		} else
+#endif
+		{
+			spin_lock_irqsave(zone_lru_lock(zone), flags);
+			lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
+			VM_BUG_ON_PAGE(!PageLRU(page), page);
+			__ClearPageLRU(page);
+			del_page_from_lru_list(page, lruvec, page_off_lru(page));
+			spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+		}
 	}
 	__ClearPageWaiters(page);
 	mem_cgroup_uncharge(page);
@@ -209,6 +250,20 @@ static void pagevec_lru_move_fn(struct pagevec *pvec,
 
 		lruvec = mem_cgroup_page_lruvec(page, pgdat);
 		(*move_fn)(page, lruvec, arg);
+
+		/*
+		 * Upstream's folio_batch_move_lru() ends each iteration with a
+		 * trailing folio_set_lru(), re-publishing the PG_lru that
+		 * folio_batch_add_and_move() speculatively cleared; the patch
+		 * adds a `continue` there so a Marie-tracked folio (whose
+		 * PG_lru the install already published, and which the lock-free
+		 * reclaim isolate may have legitimately cleared) is not stamped
+		 * PG_lru again. That clear/set pair only exists because the
+		 * per-lruvec lru_lock rework (5.11, commit 6168d0da2b47) made
+		 * PG_lru the isolation token. This tree still serialises on
+		 * pgdat->lru_lock and leaves PG_lru set for the whole move, so
+		 * there is no re-set to skip and the hunk collapses to nothing.
+		 */
 	}
 	if (pgdat)
 		spin_unlock_irqrestore(&pgdat->lru_lock, flags);
@@ -222,6 +277,50 @@ static void pagevec_move_tail_fn(struct page *page, struct lruvec *lruvec,
 	int *pgmoved = arg;
 
 	if (PageLRU(page) && !PageUnevictable(page)) {
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * This rotate-batch move_fn can run in hardirq: the
+		 * pagevec_move_tail batch is flushed from end_page_writeback()
+		 * in the block-completion IRQ (e.g. nvme_irq -> blk_mq
+		 * completion). Marie's del_page_from_lru_list /
+		 * add_page_to_lru_list_tail hooks must not run there: they
+		 * assert !in_hardirq(), and lru_marie_add_page() would ADOPT the
+		 * page into Marie (which never credits mz->lru_zone_size) right
+		 * after the legacy del already did mz -nr, underflowing
+		 * mz->lru_zone_size.
+		 *
+		 * Under Marie, handle the rotate without those hooks:
+		 *   - a tracked page does not sit on the legacy list and ages by
+		 *     gen rotation, so rotate-to-tail is a no-op -- skip it;
+		 *   - a non-tracked page is on the legacy lruvec list
+		 *     (mz-accounted), so rotate it with pure legacy list ops
+		 *     (this mirrors del_page_from_lru_list +
+		 *     add_page_to_lru_list_tail for an evictable, non-tracked
+		 *     page, minus the Marie hooks).
+		 *
+		 * Upstream counts PGROTATED here via __count_vm_events(); this
+		 * tree tallies it in the *pgmoved out-param that
+		 * pagevec_move_tail() sums, so the bump stays there.
+		 */
+		if (lru_marie_enabled()) {
+			long nr_pages = hpage_nr_pages(page);
+			int zid = page_zonenum(page);
+			enum lru_list lru;
+
+			if (lru_marie_test_tracked(page))
+				return;
+
+			lru = page_lru(page);
+			list_del(&page->lru);
+			update_lru_size(lruvec, lru, zid, -nr_pages);
+			ClearPageActive(page);
+			lru = page_lru(page);
+			update_lru_size(lruvec, lru, zid, nr_pages);
+			list_add_tail(&page->lru, &lruvec->lists[lru]);
+			(*pgmoved)++;
+			return;
+		}
+#endif
 		del_page_from_lru_list(page, lruvec, page_lru(page));
 		ClearPageActive(page);
 		add_page_to_lru_list_tail(page, lruvec, page_lru(page));
@@ -253,6 +352,15 @@ void rotate_reclaimable_page(struct page *page)
 		struct pagevec *pvec;
 		unsigned long flags;
 
+#ifdef CONFIG_LRU_MARIE
+		/* Marie pages bypass legacy LRU lists; apply the rotate on the
+		 * per-PFN state (demote toward prompt reclaim) instead of
+		 * queueing the legacy pagevec_move_tail batch.
+		 * See lru_marie_rotate(). */
+		if (lru_marie_rotate(page))
+			return;
+#endif
+
 		get_page(page);
 		local_irq_save(flags);
 		pvec = this_cpu_ptr(&lru_rotate_pvecs);
@@ -272,6 +380,12 @@ static void update_page_reclaim_stat(struct lruvec *lruvec,
 		reclaim_stat->recent_rotated[file]++;
 }
 
+/*
+ * lru_marie_orphan_add() (the non-adopting legacy add for untracked orphans
+ * inside a del+add move_fn) lives in mm/lru_marie/core.c so vmscan.c's reclaim
+ * putback can share it; declared in <linux/lru_marie.h>.
+ */
+
 static void __activate_page(struct page *page, struct lruvec *lruvec,
 			    void *arg)
 {
@@ -279,10 +393,26 @@ static void __activate_page(struct page *page, struct lruvec *lruvec,
 		int file = page_is_file_cache(page);
 		int lru = page_lru_base_type(page);
 
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Tracked Marie pages are never on legacy lists (the swap.c
+		 * entry gates divert them); guard defensively, and route the
+		 * untracked orphan's re-add away from lru_marie_add_page()'s
+		 * adopt path.
+		 */
+		if (lru_marie_enabled() && lru_marie_test_tracked(page))
+			return;
+#endif
+
 		del_page_from_lru_list(page, lruvec, lru);
 		SetPageActive(page);
 		lru += LRU_ACTIVE;
-		add_page_to_lru_list(page, lruvec, lru);
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled())
+			lru_marie_orphan_add(lruvec, page, false);
+		else
+#endif
+			add_page_to_lru_list(page, lruvec, lru);
 		trace_mm_lru_activate(page);
 
 		__count_vm_event(PGACTIVATE);
@@ -308,8 +438,22 @@ void activate_page(struct page *page)
 {
 	page = compound_head(page);
 	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
-		struct pagevec *pvec = &get_cpu_var(activate_page_pvecs);
+		struct pagevec *pvec;
 
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Marie pages bypass legacy LRU lists; apply the promote on the
+		 * per-PFN state instead of queueing the legacy __activate_page
+		 * batch. This must precede get_cpu_var(), which disables
+		 * preemption -- the early return may not happen between it and
+		 * the matching put_cpu_var(), so the declaration below is split
+		 * from its initialiser.
+		 */
+		if (lru_marie_activate(page))
+			return;
+#endif
+
+		pvec = &get_cpu_var(activate_page_pvecs);
 		get_page(page);
 		if (!pagevec_add(pvec, page) || PageCompound(page))
 			pagevec_lru_move_fn(pvec, __activate_page, NULL);
@@ -327,6 +471,20 @@ void activate_page(struct page *page)
 	struct zone *zone = page_zone(page);
 
 	page = compound_head(page);
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Marie pages bypass legacy LRU lists; the promote happens on the
+	 * per-PFN state in lru_marie_activate().
+	 *
+	 * Upstream's !CONFIG_SMP folio_activate() opens with
+	 * folio_test_clear_lru() and therefore has to folio_set_lru() again
+	 * before returning down the Marie path. This tree's variant never
+	 * speculatively clears PG_lru (it just takes lru_lock), so there is
+	 * nothing to re-publish and the return is bare.
+	 */
+	if (lru_marie_activate(page))
+		return;
+#endif
 	spin_lock_irq(zone_lru_lock(zone));
 	__activate_page(page, mem_cgroup_page_lruvec(page, zone->zone_pgdat), NULL);
 	spin_unlock_irq(zone_lru_lock(zone));
@@ -373,6 +531,36 @@ static void __lru_cache_activate_page(struct page *page)
 void mark_page_accessed(struct page *page)
 {
 	page = compound_head(page);
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Marie: do NOT feed the explicit access signal into the tier.
+	 *
+	 * Tier has no decay -- marie_state_inc_tier only ever raises it
+	 * (reset to 0 happens solely on the saturate->head promotion), and
+	 * survivor re-publish preserves it (target_tier = max(prev, w)). So
+	 * a per-access bump, which fires on essentially every read / pagecache
+	 * hit / fault (generic_file_buffered_read, pagecache_get_page, shmem,
+	 * gup, ...), is unbounded and monotonic: pages pin at hot_votes >= 1
+	 * in page_check_references (permanent KEEP) or churn on the head-gen
+	 * promotion treadmill. Under memory pressure that starves reclaim --
+	 * file stalls above the clean_min_ratio floor and anon is never
+	 * swapped -- and the machine OOMs with swap free.
+	 *
+	 * Marie's hotness instead comes from the (rate-limited, kswapd-driven)
+	 * walker young-bit scan plus the rmap young bits read at reclaim time
+	 * in page_check_references; both self-pace and clear, so they do not
+	 * accumulate. Routing mark_page_accessed here can be revisited only
+	 * once tier gains a decay/aging mechanism. lru_marie_mark_accessed()
+	 * is kept (dormant) for that future. Return without falling through to
+	 * the legacy activate path, which would re-tier via add_page_to_lru_list.
+	 *
+	 * Upstream places this immediately after folio_mark_accessed()'s
+	 * opening lru_gen_enabled() block; this tree has no MGLRU, so the gate
+	 * is the first thing in the function instead.
+	 */
+	if (lru_marie_enabled())
+		return;
+#endif
 	if (!PageActive(page) && !PageUnevictable(page) &&
 			PageReferenced(page)) {
 
@@ -509,6 +697,11 @@ static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec,
 	if (page_mapped(page))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled() && lru_marie_test_tracked(page))
+		return;
+#endif
+
 	active = PageActive(page);
 	file = page_is_file_cache(page);
 	lru = page_lru_base_type(page);
@@ -516,7 +709,12 @@ static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec,
 	del_page_from_lru_list(page, lruvec, lru + active);
 	ClearPageActive(page);
 	ClearPageReferenced(page);
-	add_page_to_lru_list(page, lruvec, lru);
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled())
+		lru_marie_orphan_add(lruvec, page, false);
+	else
+#endif
+		add_page_to_lru_list(page, lruvec, lru);
 
 	if (PageWriteback(page) || PageDirty(page)) {
 		/*
@@ -529,6 +727,13 @@ static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec,
 		/*
 		 * The page's writeback ends up during pagevec
 		 * We moves tha page into tail of inactive.
+		 *
+		 * Upstream splits this into a second lruvec_add_folio_tail()
+		 * call because its version re-adds the folio only here; this
+		 * tree already re-added above and merely relocates within the
+		 * same list, so the Marie orphan-add above covers the
+		 * accounting and the list_move_tail stays as-is. A tracked page
+		 * never reaches this point (gated out at the top).
 		 */
 		list_move_tail(&page->lru, &lruvec->lists[lru]);
 		__count_vm_event(PGROTATED);
@@ -546,10 +751,20 @@ static void lru_deactivate_fn(struct page *page, struct lruvec *lruvec,
 		int file = page_is_file_cache(page);
 		int lru = page_lru_base_type(page);
 
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled() && lru_marie_test_tracked(page))
+			return;
+#endif
+
 		del_page_from_lru_list(page, lruvec, lru + LRU_ACTIVE);
 		ClearPageActive(page);
 		ClearPageReferenced(page);
-		add_page_to_lru_list(page, lruvec, lru);
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled())
+			lru_marie_orphan_add(lruvec, page, false);
+		else
+#endif
+			add_page_to_lru_list(page, lruvec, lru);
 
 		__count_vm_events(PGDEACTIVATE, hpage_nr_pages(page));
 		update_page_reclaim_stat(lruvec, file, 0);
@@ -563,6 +778,11 @@ static void lru_lazyfree_fn(struct page *page, struct lruvec *lruvec,
 	    !PageSwapCache(page) && !PageUnevictable(page)) {
 		bool active = PageActive(page);
 
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled() && lru_marie_test_tracked(page))
+			return;
+#endif
+
 		del_page_from_lru_list(page, lruvec,
 				       LRU_INACTIVE_ANON + active);
 		ClearPageActive(page);
@@ -573,7 +793,12 @@ static void lru_lazyfree_fn(struct page *page, struct lruvec *lruvec,
 		 * pages
 		 */
 		ClearPageSwapBacked(page);
-		add_page_to_lru_list(page, lruvec, LRU_INACTIVE_FILE);
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled())
+			lru_marie_orphan_add(lruvec, page, false);
+		else
+#endif
+			add_page_to_lru_list(page, lruvec, LRU_INACTIVE_FILE);
 
 		__count_vm_events(PGLAZYFREE, hpage_nr_pages(page));
 		count_memcg_page_event(page, PGLAZYFREE);
@@ -635,6 +860,13 @@ void deactivate_file_page(struct page *page)
 	if (PageUnevictable(page))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	/* Marie pages bypass legacy LRU lists; apply the demote on the
+	 * per-PFN state instead of queueing the legacy batch. */
+	if (lru_marie_deactivate(page))
+		return;
+#endif
+
 	if (likely(get_page_unless_zero(page))) {
 		struct pagevec *pvec = &get_cpu_var(lru_deactivate_file_pvecs);
 
@@ -655,8 +887,15 @@ void deactivate_file_page(struct page *page)
 void deactivate_page(struct page *page)
 {
 	if (PageLRU(page) && PageActive(page) && !PageUnevictable(page)) {
-		struct pagevec *pvec = &get_cpu_var(lru_deactivate_pvecs);
+		struct pagevec *pvec;
 
+#ifdef CONFIG_LRU_MARIE
+		/* Before get_cpu_var(): see activate_page(). */
+		if (lru_marie_deactivate(page))
+			return;
+#endif
+
+		pvec = &get_cpu_var(lru_deactivate_pvecs);
 		get_page(page);
 		if (!pagevec_add(pvec, page) || PageCompound(page))
 			pagevec_lru_move_fn(pvec, lru_deactivate_fn, NULL);
@@ -675,8 +914,19 @@ void mark_page_lazyfree(struct page *page)
 {
 	if (PageLRU(page) && PageAnon(page) && PageSwapBacked(page) &&
 	    !PageSwapCache(page) && !PageUnevictable(page)) {
-		struct pagevec *pvec = &get_cpu_var(lru_lazyfree_pvecs);
+		struct pagevec *pvec;
 
+#ifdef CONFIG_LRU_MARIE
+		/* Marie pages bypass legacy LRU lists; lru_marie_lazyfree()
+		 * clears PG_swapbacked synchronously (MADV_FREE:
+		 * free-without-writeback) and demotes on the per-PFN state
+		 * instead of queueing the legacy batch. Before get_cpu_var():
+		 * see activate_page(). */
+		if (lru_marie_lazyfree(page))
+			return;
+#endif
+
+		pvec = &get_cpu_var(lru_lazyfree_pvecs);
 		get_page(page);
 		if (!pagevec_add(pvec, page) || PageCompound(page))
 			pagevec_lru_move_fn(pvec, lru_lazyfree_fn, NULL);
@@ -880,11 +1130,49 @@ void lru_add_page_tail(struct page *page, struct page *page_tail,
 	if (!list)
 		SetPageLRU(page_tail);
 
-	if (likely(PageLRU(page)))
-		list_add_tail(&page_tail->lru, &page->lru);
-	else if (list) {
+	if (likely(PageLRU(page))) {
+		/* head is still on lru (and we have it frozen) */
+		if (PageUnevictable(page)) {
+			list_add_tail(&page_tail->lru, &page->lru);
+		} else {
+#ifdef CONFIG_LRU_MARIE
+			/*
+			 * If Marie owns @page (the head), the legacy
+			 * list_add_tail below would put the new tail on the
+			 * legacy LRU without a TRACKED state byte, leaving it
+			 * invisible to Marie's per-PFN bookkeeping (the TRACKED
+			 * state byte + marie_nr_pages). Route through Marie's
+			 * split helper which sets TRACKED,
+			 * publishes the per-PFN state at the same gen as
+			 * @page, and increments the page counter. The
+			 * helper falls back to plain list_add_tail when
+			 * @page is not Marie-tracked, so the static branch
+			 * is the only gate the !lru_marie_enabled() case sees.
+			 */
+			if (lru_marie_enabled())
+				lru_marie_split_page(lruvec, page, page_tail);
+			else
+				list_add_tail(&page_tail->lru, &page->lru);
+#else
+			list_add_tail(&page_tail->lru, &page->lru);
+#endif
+		}
+	} else if (list) {
 		/* page reclaim is reclaiming a huge page */
 		get_page(page_tail);
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Reclaim-split of a Marie-owned THP: register the tail with
+		 * Marie (TRACKED) just like the on-LRU split above, so it never
+		 * becomes a ¬TRACKED page that a later putback re-stamps PG_lru
+		 * onto -- an escapee whose legacy del underflows mz->lru_zone_size
+		 * and corrupts memory. The tail goes on the reclaim @list off-LRU
+		 * (no PG_lru), exactly like its isolated head; Marie's
+		 * reclaim/putback then accounts it. No-op when @page is untracked.
+		 */
+		if (lru_marie_enabled())
+			lru_marie_split_page_isolated(page, page_tail);
+#endif
 		list_add_tail(&page_tail->lru, list);
 	} else {
 		struct list_head *list_head;

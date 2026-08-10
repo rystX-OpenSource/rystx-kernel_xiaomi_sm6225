@@ -19,6 +19,8 @@
 #include <linux/page-flags-layout.h>
 #include <linux/atomic.h>
 #include <linux/android_kabi.h>
+#include <linux/sizes.h>
+#include <linux/kfifo_types.h>
 #include <asm/page.h>
 
 /* Free memory management - zoned buddy allocator.  */
@@ -28,6 +30,22 @@
 #define MAX_ORDER CONFIG_FORCE_MAX_ZONEORDER
 #endif
 #define MAX_ORDER_NR_PAGES (1 << (MAX_ORDER - 1))
+
+/*
+ * NR_PAGE_ORDERS -- the number of distinct allocation orders the buddy
+ * allocator maintains free lists for, i.e. the bound of a `for (order = 0;
+ * order < NR_PAGE_ORDERS; order++)` walk.  From Linux 6.19.8
+ * include/linux/mmzone.h:38 (upstream commit fd37721803c6 "mm, treewide:
+ * introduce NR_PAGE_ORDERS").
+ *
+ * Upstream defines it as MAX_PAGE_ORDER + 1 because its MAX_PAGE_ORDER is the
+ * largest *valid* order (inclusive).  This tree's MAX_ORDER is the older,
+ * exclusive spelling -- one past the largest valid order, which is why
+ * MAX_ORDER_NR_PAGES above subtracts 1 -- so the count is MAX_ORDER itself,
+ * with no +1.  (Upstream renamed MAX_ORDER to MAX_PAGE_ORDER in commit
+ * 5e0a760b4441 precisely to end this off-by-one confusion.)
+ */
+#define NR_PAGE_ORDERS (MAX_ORDER)
 
 /*
  * PAGE_ALLOC_COSTLY_ORDER is the order at which allocations are deemed
@@ -232,6 +250,26 @@ static inline int is_active_lru(enum lru_list lru)
 {
 	return (lru == LRU_ACTIVE_ANON || lru == LRU_ACTIVE_FILE);
 }
+
+/*
+ * Anon/file type indices and their count.  Hard-copied from 6.19.8
+ * include/linux/mmzone.h:347 (introduced with the multi-gen LRU, which is
+ * where the "there are exactly two evictable types" constant first got a
+ * name); placed at the same point in the file, right after is_active_lru().
+ *
+ * ANON_AND_FILE is the only one of the three with in-tree callers here --
+ * Marie sizes its per-type arrays (marie_type_locks[], marie_head_gen[],
+ * marie_aging_epoch[]) and bounds its per-type loops with it.  WORKINGSET_ANON
+ * / WORKINGSET_FILE are carried along so the block stays the upstream block
+ * rather than a one-line excerpt of it; upstream uses them to index the
+ * WORKINGSET_{REFAULT,ACTIVATE,RESTORE}_{ANON,FILE} counter pairs, which this
+ * tree does not have (see the WORKINGSET_REFAULT_FILE note in
+ * mm/lru_marie/state_compat.h for why the unsplit 4.19 counter is an exact
+ * stand-in for the FILE half).
+ */
+#define WORKINGSET_ANON 0
+#define WORKINGSET_FILE 1
+#define ANON_AND_FILE 2
 
 struct zone_reclaim_stat {
 	/*
@@ -696,6 +734,20 @@ typedef struct pglist_data {
 	enum zone_type kswapd_classzone_idx;
 
 	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
+
+#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+/*
+ * kfifo backing storage capacity (in page* slots). The sysfs knob
+ * vm_kcompressd sets the effective queue length in [-100, +100]; this
+ * matches the upper bound. ~800 bytes per pgdat regardless of the
+ * currently configured depth.
+ */
+#define KCOMPRESSD_FIFO_SIZE 100
+	wait_queue_head_t kcompressd_wait;
+	struct task_struct *kcompressd;
+	struct kfifo kcompressd_fifo;
+	spinlock_t kcompressd_fifo_lock;
+#endif
 
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;

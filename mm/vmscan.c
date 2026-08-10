@@ -43,6 +43,10 @@
 #include <linux/kthread.h>
 #include <linux/freezer.h>
 #include <linux/memcontrol.h>
+#include <linux/lru_marie.h>
+#include <linux/kfifo.h>		/* kfifo_alloc()/kfifo_free(): kcompressd.
+				   mmzone.h only pulls <linux/kfifo_types.h>,
+				   which carries the struct but not the ops. */
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
 #include <linux/oom.h>
@@ -132,6 +136,43 @@ struct scan_control {
 		unsigned int taken;
 	} nr;
 };
+
+/*
+ * Accessors for out-of-tree reclaim readers (mm/lru_marie). Declared
+ * in mm/internal.h with the struct kept private here. Trivial
+ * field reads + one helper for the "target reached" comparison and
+ * one for the reclaimed-count update. EXPORT_SYMBOL_GPL is
+ * unnecessary -- Marie is built into vmlinux when CONFIG_LRU_MARIE
+ * is on, never a module.
+ *
+ * priority and reclaim_idx are s8 in this tree (they widened to int
+ * later); the accessors keep upstream's int return, which is a
+ * lossless widening.
+ */
+int sc_priority(const struct scan_control *sc)
+{
+	return sc->priority;
+}
+
+int sc_reclaim_idx(const struct scan_control *sc)
+{
+	return sc->reclaim_idx;
+}
+
+bool sc_reclaim_target_reached(const struct scan_control *sc)
+{
+	return sc->nr_reclaimed >= sc->nr_to_reclaim;
+}
+
+void sc_add_reclaimed(struct scan_control *sc, unsigned long nr)
+{
+	sc->nr_reclaimed += nr;
+}
+
+gfp_t sc_gfp_mask(const struct scan_control *sc)
+{
+	return sc->gfp_mask;
+}
 
 /*
  * Number of active kswapd threads
@@ -371,11 +412,17 @@ unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru, int zone
 		if (!managed_zone(zone))
 			continue;
 
-		if (!mem_cgroup_disabled())
+		if (!mem_cgroup_disabled()) {
+			/*
+			 * mz->lru_zone_size accounts Marie-tracked pages too
+			 * (marie_update_lru_size credits/debits mz like legacy
+			 * update_lru_size), so no Marie-specific summing here.
+			 */
 			size = mem_cgroup_get_zone_lru_size(lruvec, lru, zid);
-		else
+		} else {
 			size = zone_page_state(&lruvec_pgdat(lruvec)->node_zones[zid],
 				       NR_ZONE_LRU_BASE + lru);
+		}
 		lru_size -= min(size, lru_size);
 	}
 
@@ -766,6 +813,133 @@ void drop_slab(void)
 		drop_slab_node(nid);
 }
 
+#ifdef CONFIG_LRU_MARIE
+/*
+ * reclaimer_offset(), cgroup_reclaim() and can_reclaim_anon_pages() are
+ * plain in-tree statics upstream, so the patch only adds the vmscan_*
+ * wrappers below. This tree predates all three, so they are synthesized
+ * here -- but only for Marie, which is their sole caller: keeping them
+ * inside the same guard leaves a CONFIG_LRU_MARIE=n build byte-identical
+ * to stock rather than adding three unused statics to it.
+ */
+
+/*
+ * Upstream reclaim-counter offset helper. This tree enumerates only
+ * PGSTEAL_KSWAPD and PGSTEAL_DIRECT (PGSTEAL_KHUGEPAGED arrived with
+ * khugepaged collapse accounting, PGSTEAL_PROACTIVE with proactive
+ * reclaim), and scan_control has no ->proactive member, so the
+ * kswapd/direct split is the whole of it here. Kept as a function
+ * with upstream's name and shape so Marie's counter bumps read the
+ * same on both trees.
+ */
+static int reclaimer_offset(struct scan_control *sc)
+{
+	BUILD_BUG_ON(PGSTEAL_DIRECT - PGSTEAL_KSWAPD !=
+		     PGSCAN_DIRECT - PGSCAN_KSWAPD);
+
+	if (current_is_kswapd())
+		return 0;
+	return PGSTEAL_DIRECT - PGSTEAL_KSWAPD;
+}
+
+/*
+ * cgroup_reclaim() is the modern spelling of this tree's
+ * !global_reclaim(). global_reclaim() is defined under #ifdef CONFIG_MEMCG
+ * further up with a constant-true stub for the !MEMCG build, so this
+ * wrapper inherits the right behaviour either way.
+ */
+static bool cgroup_reclaim(struct scan_control *sc)
+{
+	return !global_reclaim(sc);
+}
+
+/*
+ * can_reclaim_anon_pages() postdates this tree; it was factored out of
+ * get_scan_count() when demotion gave anon a second way to be
+ * reclaimable.
+ *
+ * Two deltas from the 6.19.8 original (mm/vmscan.c:386):
+ *
+ *  - the may_swap arm is folded in at the top. Upstream splits the test
+ *    across two sites -- get_scan_count() checks sc->may_swap separately
+ *    and the helper does not repeat it -- while this tree asks both in
+ *    one condition (see the "If we have no swap space" branch below).
+ *    Marie calls the helper with no separate may_swap check of its own,
+ *    so the arm has to live here or it is lost.
+ *
+ *  - the can_demote() tail becomes a plain false: 4.19 has no
+ *    tiered-memory demotion, which is exactly what can_demote() returns
+ *    on a single-tier node upstream.
+ *
+ * The memcg == NULL arm is kept verbatim rather than collapsed into an
+ * unconditional mem_cgroup_get_nr_swap_pages(): lruvec_memcg() returns
+ * NULL whenever memcg is disabled, and that callee walks memcg->swap.max
+ * without a NULL check.
+ */
+static bool can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
+				   struct scan_control *sc)
+{
+	if (sc && !sc->may_swap)
+		return false;
+
+	if (memcg == NULL) {
+		/*
+		 * For non-memcg reclaim, is there
+		 * space in any swap device?
+		 */
+		if (get_nr_swap_pages() > 0)
+			return true;
+	} else {
+		/* Is the memcg below its swap limit? */
+		if (mem_cgroup_get_nr_swap_pages(memcg) > 0)
+			return true;
+	}
+
+	/*
+	 * The page can not be swapped, and this tree has no demotion
+	 * target to fall back on, so it cannot be reclaimed at all.
+	 */
+	return false;
+}
+
+/*
+ * Wrapper used by mm/lru_marie, which sees @sc but not the static
+ * reclaimer_offset() above. This tree does not use @sc for the offset; we
+ * accept it for source compatibility with the 6.18 caller.
+ */
+int vmscan_reclaimer_offset(struct scan_control *sc)
+{
+	return reclaimer_offset(sc);
+}
+
+/*
+ * cgroup_reclaim() is static above and struct scan_control is private
+ * to vmscan.c. Marie needs the same predicate to gate its PGSCAN_* /
+ * PGSTEAL_* event accounting (cgroup-scoped reclaim must not bump the
+ * global vm events). Expose it as an sc_* accessor matching the
+ * pattern already used for sc_priority / sc_reclaim_idx etc.
+ */
+bool sc_cgroup_reclaim(const struct scan_control *sc)
+{
+	return cgroup_reclaim((struct scan_control *)sc);
+}
+
+/*
+ * can_reclaim_anon_pages() is static above. Marie's pick driver needs
+ * the same predicate: when anon cannot be reclaimed at all (no free
+ * swap slots, cgroup swap limit hit, no demotion target) the
+ * swappiness/bias controller is meaningless -- every ANON pick
+ * reclaims nothing -- so Marie must force FILE reclaim, mirroring
+ * get_scan_count()'s "!can_reclaim_anon_pages -> SCAN_FILE" forcing.
+ * Expose it as a vmscan_* wrapper; struct scan_control stays private.
+ */
+bool vmscan_can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
+				   struct scan_control *sc)
+{
+	return can_reclaim_anon_pages(memcg, nid, sc);
+}
+#endif
+
 static inline int is_page_cache_freeable(struct page *page)
 {
 	/*
@@ -1051,6 +1225,39 @@ static enum page_references page_check_references(struct page *page,
 	if (vm_flags & VM_LOCKED)
 		return PAGEREF_RECLAIM;
 
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Upstream anchors this block after the "rmap lock contention:
+	 * rotate" early-out (referenced_ptes == -1). page_referenced() in
+	 * this tree has no such return -- the contention convention came
+	 * with the folio-era rmap rework -- so the block lands directly
+	 * after the VM_LOCKED check instead, which is the same position
+	 * relative to the referenced_ptes tests below.
+	 */
+	if (lru_marie_enabled()) {
+		unsigned int tier = page_marie_get_tier(page);
+		int hot_votes;
+
+		hot_votes = (tier > 0) + (referenced_ptes > 0) + !!referenced_page;
+
+		if (hot_votes >= 2 || referenced_ptes > 1)
+			return PAGEREF_ACTIVATE;
+
+		if (referenced_ptes > 0 && (vm_flags & VM_EXEC) &&
+		    page_is_file_cache(page))
+			return PAGEREF_ACTIVATE;
+
+		if (hot_votes == 1 && referenced_page &&
+		    page_is_file_cache(page))
+			return PAGEREF_RECLAIM_CLEAN;
+
+		if (hot_votes >= 1)
+			return PAGEREF_KEEP;
+
+		return PAGEREF_RECLAIM;
+	}
+#endif
+
 	if (referenced_ptes) {
 		if (PageSwapBacked(page))
 			return PAGEREF_ACTIVATE;
@@ -1120,9 +1327,13 @@ static void page_check_dirty_writeback(struct page *page,
 }
 
 /*
- * shrink_page_list() returns the number of reclaimed pages
+ * shrink_page_list() returns the number of reclaimed pages.
+ *
+ * Exposed via mm/internal.h so that mm/lru_marie can drive its own
+ * isolate->shrink->putback loop without duplicating the per-page
+ * reclaim machinery.
  */
-static unsigned long shrink_page_list(struct list_head *page_list,
+unsigned long shrink_page_list(struct list_head *page_list,
 				      struct pglist_data *pgdat,
 				      struct scan_control *sc,
 				      enum ttu_flags ttu_flags,
@@ -1873,7 +2084,29 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
 
 		SetPageLRU(page);
 		lru = page_lru(page);
-		add_page_to_lru_list(page, lruvec, lru);
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Legacy reclaim putback. Under Marie this is reached for the
+		 * untracked orphans that legacy shrink_{in,}active_list isolates
+		 * off legacy lists (e.g. workingset-refault activations routed
+		 * through activate_page). Routing their re-add through
+		 * add_page_to_lru_list() -> lru_marie_add_page() would ADOPT them
+		 * into Marie -- the exact adopt asymmetry fixed for swap.c's
+		 * move_fns. Mirror that fix here: a tracked page must never
+		 * have been on a legacy list (WARN; hand it back to Marie, whose
+		 * install early-out re-asserts ownership), and an untracked
+		 * orphan gets a pure non-adopting legacy add.
+		 */
+		if (lru_marie_enabled()) {
+			if (unlikely(lru_marie_test_tracked(page))) {
+				VM_WARN_ON_ONCE_PAGE(1, page);
+				add_page_to_lru_list(page, lruvec, lru);
+			} else {
+				lru_marie_orphan_add(lruvec, page, false);
+			}
+		} else
+#endif
+			add_page_to_lru_list(page, lruvec, lru);
 
 		if (is_active_lru(lru)) {
 			int file = is_file_lru(lru);
@@ -2574,8 +2807,51 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	struct blk_plug plug;
 	bool scan_adjusted;
+#ifdef CONFIG_LRU_MARIE
+	unsigned int marie_drain_mask = MARIE_DRAIN_ANON | MARIE_DRAIN_FILE;
+
+	if (lru_marie_enabled()) {
+		marie_drain_mask = lru_marie_shrink_lruvec(lruvec, sc);
+		/*
+		 * Fall through to the legacy reclaim path below to drain orphan
+		 * pages (failed Marie install, drain/reparent handoffs) that
+		 * landed on lruvec->lists. The drain is constrained by
+		 * marie_drain_mask below so it touches only the type(s) Marie
+		 * scanned. Common case: the lists are empty and this is a cheap
+		 * no-op.
+		 *
+		 * Upstream chains an "else if (lru_gen_enabled() ...)" here to
+		 * hand non-root reclaim to MGLRU; this tree has no MGLRU, so
+		 * that arm has no analogue and the chain collapses to this
+		 * single branch.
+		 */
+	}
+#endif
 
 	get_scan_count(lruvec, memcg, sc, nr, lru_pages);
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Constrain the legacy orphan drain to the type(s) Marie's pick driver
+	 * actually scanned this call (marie_drain_mask). Stock get_scan_count's
+	 * policy (SCAN_EQUAL at sc->priority==0, SCAN_ANON on file_is_tiny)
+	 * ignores Marie's swappiness / clean_min_ratio / ANON_STRICT decisions
+	 * and would otherwise cut the protected type behind the driver's back
+	 * (e.g. evicting file at vm.swappiness=200, or swapping at swappiness=0).
+	 * Zero the nr[] of any type Marie did not scan. Marie-only; the
+	 * legacy nr[] is left byte-identical.
+	 */
+	if (lru_marie_enabled()) {
+		if (!(marie_drain_mask & MARIE_DRAIN_FILE)) {
+			nr[LRU_ACTIVE_FILE] = 0;
+			nr[LRU_INACTIVE_FILE] = 0;
+		}
+		if (!(marie_drain_mask & MARIE_DRAIN_ANON)) {
+			nr[LRU_ACTIVE_ANON] = 0;
+			nr[LRU_INACTIVE_ANON] = 0;
+		}
+	}
+#endif
 
 	/* Record the original scan target for proportional adjustments later */
 	memcpy(targets, nr, sizeof(nr));
@@ -2774,6 +3050,15 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	unsigned long nr_reclaimed, nr_scanned;
 	bool reclaimable = false;
 
+	/*
+	 * Upstream gates MGLRU's root-reclaim shortcut here on
+	 * !lru_marie_enabled(), because that shortcut bypasses
+	 * shrink_node_memcgs -- and therefore shrink_lruvec, where Marie is
+	 * invoked -- leaving kswapd walking empty MGLRU gens under Marie.
+	 * This tree has no MGLRU and hence no shortcut to gate: reclaim
+	 * always descends through the memcg loop below into
+	 * shrink_node_memcg, so the hunk collapses to nothing.
+	 */
 	do {
 		struct mem_cgroup *root = sc->target_mem_cgroup;
 		struct mem_cgroup_reclaim_cookie reclaim = {
@@ -3083,6 +3368,18 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 static void snapshot_refaults(struct mem_cgroup *root_memcg, pg_data_t *pgdat)
 {
 	struct mem_cgroup *memcg;
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Marie has no equivalent of legacy refault tracking yet, and the
+	 * legacy WORKINGSET_* counters don't reflect Marie state — skip the
+	 * snapshot to avoid feeding legacy-tuned heuristics with stale data.
+	 * (Upstream also early-returns for lru_gen_enabled() here; this tree
+	 * has no MGLRU, so only the Marie arm remains.)
+	 */
+	if (lru_marie_enabled())
+		return;
+#endif
 
 	memcg = mem_cgroup_iter(root_memcg, NULL, NULL);
 	do {
@@ -3470,6 +3767,26 @@ static void age_active_anon(struct pglist_data *pgdat,
 				struct scan_control *sc)
 {
 	struct mem_cgroup *memcg;
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Marie: drive proactive aging from kswapd's pre-reclaim hook so the
+	 * gen ring has accurate hot/cold ordering by the time direct reclaim
+	 * picks the tail.  lru_marie_age_node() walks running tasks' PTEs
+	 * (rate-limited internally) and skips the legacy active-list
+	 * deactivation below — legacy lists only hold mempool-failure orphans
+	 * under Marie and aging them is not worthwhile.
+	 *
+	 * Placed ahead of the !total_swap_pages early-out: Marie's aging walk
+	 * is not anon-specific (it refreshes file hotness too), whereas the
+	 * legacy deactivation below only ever targets LRU_ACTIVE_ANON, which
+	 * is why that early-out guards it.
+	 */
+	if (lru_marie_enabled()) {
+		lru_marie_age_node(pgdat, sc);
+		return;
+	}
+#endif
 
 	if (!total_swap_pages)
 		return;
@@ -4230,6 +4547,9 @@ int kswapd_run(int nid)
 	pg_data_t *pgdat = NODE_DATA(nid);
 	int ret = 0;
 	int hid, nr_threads;
+#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+	int kc_ret;
+#endif
 
 	if (pgdat->kswapd[0])
 		return 0;
@@ -4248,6 +4568,40 @@ int kswapd_run(int nid)
 		}
 	}
 	kswapd_threads_current = nr_threads;
+#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+	/*
+	 * Upstream places this inside the "if (!pgdat->kswapd)" arm and skips
+	 * out via a goto to a shared unlock. This tree's kswapd_run has no
+	 * pgdat_kswapd_lock (it early-returns on pgdat->kswapd[0] instead) and
+	 * spawns an array of kswapd threads, so the kcompressd setup lands
+	 * after that loop -- same once-per-node placement, no label needed.
+	 * kswapd's own spawn failure is BUG_ON at boot / recorded in @ret
+	 * otherwise, and kcompressd is independent of it: a kcompressd failure
+	 * only disables the off-load, leaving swap_writepage to compress
+	 * inline, so it must not overwrite @ret.
+	 */
+	kc_ret = kfifo_alloc(&pgdat->kcompressd_fifo,
+			KCOMPRESSD_FIFO_SIZE * sizeof(struct page *),
+			GFP_KERNEL);
+	if (kc_ret) {
+		pr_err("%s: fail to kfifo_alloc\n", __func__);
+		return ret;
+	}
+
+	pr_info("kcompressd (forked from kcompressd-unofficial by Masahito Suzuki, originally Kcompressd by Qun-Wei Lin from MediaTek)\n");
+	init_waitqueue_head(&pgdat->kcompressd_wait);
+	spin_lock_init(&pgdat->kcompressd_fifo_lock);
+	pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
+			"kcompressd%d", nid);
+	if (IS_ERR(pgdat->kcompressd)) {
+		pr_err("Failed to start kcompressd on node %d, ret=%ld\n",
+				nid, PTR_ERR(pgdat->kcompressd));
+		pgdat->kcompressd = NULL;
+		kfifo_free(&pgdat->kcompressd_fifo);
+	} else {
+		wake_up_process(pgdat->kcompressd);
+	}
+#endif
 	return ret;
 }
 
@@ -4268,6 +4622,13 @@ void kswapd_stop(int nid)
 			NODE_DATA(nid)->kswapd[hid] = NULL;
 		}
 	}
+#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+	if (NODE_DATA(nid)->kcompressd) {
+		kthread_stop(NODE_DATA(nid)->kcompressd);
+		NODE_DATA(nid)->kcompressd = NULL;
+		kfifo_free(&NODE_DATA(nid)->kcompressd_fifo);
+	}
+#endif
 }
 
 static int __init kswapd_init(void)

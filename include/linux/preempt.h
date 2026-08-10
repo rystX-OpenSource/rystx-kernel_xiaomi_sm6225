@@ -99,6 +99,12 @@
  *       should not be used in new code.
  */
 #define in_irq()		(hardirq_count())
+/*
+ * in_hardirq() -- the modern spelling of in_irq(), from Linux 6.19.8
+ * include/linux/preempt.h (upstream commit 72c33ce62b21 renamed the users and
+ * kept both names; in_irq() was later removed).  Identical expansion.
+ */
+#define in_hardirq()		(hardirq_count())
 #define in_softirq()		(softirq_count())
 #define in_interrupt()		(irq_count())
 #define in_serving_softirq()	(softirq_count() & SOFTIRQ_OFFSET)

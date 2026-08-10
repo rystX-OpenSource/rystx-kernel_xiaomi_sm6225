@@ -1312,6 +1312,47 @@ static inline long long atomic64_dec_if_positive(atomic64_t *v)
 #define atomic64_cond_read_relaxed(v, c)	smp_cond_load_relaxed(&(v)->counter, (c))
 #define atomic64_cond_read_acquire(v, c)	smp_cond_load_acquire(&(v)->counter, (c))
 
+/*
+ * try_cmpxchg() -- backported from Linux 6.19.8
+ * (include/linux/atomic/atomic-arch-fallback.h, upstream commit 29f006fdefe6
+ * "asm-generic/atomic: Add try_cmpxchg() fallbacks").
+ *
+ * Unlike cmpxchg(), which returns the old value and leaves the caller to
+ * compare it, try_cmpxchg() reports success as a boolean and writes the
+ * observed value back through @_oldp on failure.  That makes the usual
+ * load/modify/retry loop both cheaper (on x86 it folds to a single
+ * CMPXCHG + JNE, with no redundant compare) and harder to get wrong,
+ * since the reload is part of the primitive.
+ *
+ * 4.19 has the atomic_t-typed atomic{,64}_try_cmpxchg() but not this
+ * plain-memory form, so only the generic fallback is provided here: it is
+ * expressed on top of this tree's cmpxchg() and therefore inherits its
+ * full ordering and its per-arch size support (arm64 and x86 both cover
+ * 1/2/4/8 bytes).  No arch_try_cmpxchg() plumbing is backported; an arch
+ * that grows a native one can override this by defining try_cmpxchg.
+ */
+#ifndef try_cmpxchg
+#define try_cmpxchg(_ptr, _oldp, _new) \
+({ \
+	typeof(*(_ptr)) *___op = (_oldp), ___o = *___op, ___r; \
+	___r = cmpxchg((_ptr), ___o, (_new)); \
+	if (unlikely(___r != ___o)) \
+		*___op = ___r; \
+	likely(___r == ___o); \
+})
+#endif
+
+#ifndef try_cmpxchg_relaxed
+#define try_cmpxchg_relaxed(_ptr, _oldp, _new) \
+({ \
+	typeof(*(_ptr)) *___op = (_oldp), ___o = *___op, ___r; \
+	___r = cmpxchg_relaxed((_ptr), ___o, (_new)); \
+	if (unlikely(___r != ___o)) \
+		*___op = ___r; \
+	likely(___r == ___o); \
+})
+#endif
+
 #include <asm-generic/atomic-long.h>
 
 #endif /* _LINUX_ATOMIC_H */

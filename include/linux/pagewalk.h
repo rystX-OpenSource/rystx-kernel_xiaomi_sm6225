@@ -6,6 +6,30 @@
 
 struct mm_walk;
 
+/*
+ * enum page_walk_lock -- hard-copied from 6.19.8 include/linux/pagewalk.h:10-19
+ * (upstream commit 49b0638502da "mm: enable page walking API to lock vmas
+ * during the walk"), kept at the same position, above struct mm_walk_ops.
+ *
+ * Only PGWALK_RDLOCK is reachable on this tree, but the full enum is carried so
+ * the values keep their upstream numbering and a walker written against 6.x
+ * compiles here unchanged.  The three vma-locking modes exist upstream to
+ * drive per-VMA locking (CONFIG_PER_VMA_LOCK), which this tree predates
+ * entirely -- there is no vma->vm_lock, so process_vma_walk_lock() below has
+ * nothing to assert and upstream compiles it out in exactly the same way when
+ * CONFIG_PER_VMA_LOCK=n.
+ */
+enum page_walk_lock {
+	/* mmap_lock should be locked for read to stabilize the vma tree */
+	PGWALK_RDLOCK = 0,
+	/* vma will be write-locked during the walk */
+	PGWALK_WRLOCK = 1,
+	/* vma is expected to be already write-locked during the walk */
+	PGWALK_WRLOCK_VERIFY = 2,
+	/* vma is expected to be already read-locked during the walk */
+	PGWALK_VMA_RDLOCK_VERIFY = 3,
+};
+
 /**
  * mm_walk_ops - callbacks for walk_page_range
  * @pud_entry:		if set, called for each non-empty PUD (2nd-level) entry
@@ -24,6 +48,9 @@ struct mm_walk;
  *			"do page table walk over the current vma", returning
  *			a negative value means "abort current page table walk
  *			right now" and returning 1 means "skip the current vma"
+ * @walk_lock:		mmap_lock / vma locking mode the walk expects; asserted
+ *			by walk_page_range() and walk_page_vma() before the
+ *			walk begins (6.19.8 pagewalk.h:93).
  */
 struct mm_walk_ops {
 	int (*pud_entry)(pud_t *pud, unsigned long addr,
@@ -39,6 +66,7 @@ struct mm_walk_ops {
 			     struct mm_walk *walk);
 	int (*test_walk)(unsigned long addr, unsigned long next,
 			struct mm_walk *walk);
+	enum page_walk_lock walk_lock;
 };
 
 /**

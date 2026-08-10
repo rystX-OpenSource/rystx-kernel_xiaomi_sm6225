@@ -44,6 +44,10 @@
 #include <linux/memory_hotplug.h>
 #include <linux/show_mem_notifier.h>
 #include <linux/cred.h>
+#include <linux/vmstat.h>
+#include <linux/psi.h>
+#include <linux/math64.h>
+#include <linux/lru_marie.h>	/* lru_marie_enabled(): gate the fast watchdog */
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -1226,3 +1230,324 @@ void add_to_oom_reaper(struct task_struct *p)
 
 	put_task_struct(p);
 }
+
+#ifdef CONFIG_VM_EVENT_COUNTERS
+/*
+ * Thrash-livelock watchdog.
+ *
+ * With RAM-backed swap (zram/zswap) a machine whose active working set
+ * exceeds RAM settles into a stable treadmill: reclaim keeps "succeeding"
+ * (there is always apparently-free swap and something evictable), but
+ * everything it evicts is faulted straight back, both CPUs end up in
+ * try_to_unmap()/compression/decompression, and every userspace touch of a
+ * cold page waits many seconds behind the storm. Allocations still succeed
+ * eventually, so neither the no-progress OOM path nor the watermark OOM
+ * path ever fires — the box is user-dead for hours with oom_kill=0. This
+ * was reproduced against both lru_marie and stock MGLRU (browser-like
+ * working set + `tail /dev/zero`, 8G RAM, zram-only swap): interaction
+ * latency scaled to 30+ seconds while the kernel considered itself making
+ * progress throughout.
+ *
+ * Detect the treadmill directly from its defining ratio: pages stolen by
+ * reclaim at storm volume AND workingset refaults running at >= half the
+ * steal rate, sustained over consecutive windows. Genuine one-off refault
+ * bursts (app switch, service restart) don't sustain the ratio for
+ * THRASH_WD_WINDOWS consecutive windows at storm volume; healthy cold-page
+ * reclaim has near-zero refaults. When the condition holds the working set
+ * provably does not fit in RAM and no LRU policy can fix that — the only
+ * useful action is the same one swap-exhaustion would eventually take:
+ * kill the top badness task. Fires via the same path as sysrq-f, then
+ * backs off before re-arming so one kill gets a chance to drain the storm.
+ */
+#define THRASH_WD_INTERVAL	(2 * HZ)
+#define THRASH_WD_WINDOWS	8	/* 16s: refault-ratio path (PSI off) */
+#define THRASH_WD_BACKOFF	30	/* 60s hold-off after firing */
+#define THRASH_WD_SCORE		8	/* mode 1: severity-weighted fire threshold */
+
+/*
+ * Counter substitutions for this tree, applied identically in all three
+ * detector paths below:
+ *
+ *  - WORKINGSET_REFAULT is still unsplit here; the ANON/FILE split landed in
+ *    5.9 (commit 170b04b7ae49), so the upstream ANON+FILE sum is read as the
+ *    single node stat.  Exact in aggregate, since the two split counters sum
+ *    to the unsplit one.
+ *  - PGSTEAL_KHUGEPAGED does not exist here, so the steal sum is
+ *    PGSTEAL_KSWAPD + PGSTEAL_DIRECT.  Also exact: nothing in this tree
+ *    accounts khugepaged steals.
+ *  - PGSTEAL_* are enum vm_event_item (include/linux/vm_event_item.h) in this
+ *    tree exactly as they are upstream — not enum node_stat_item — so they are
+ *    read via all_vm_events(), including in the Marie fast path where the patch
+ *    spells it global_node_page_state().  That spelling indexes an unrelated
+ *    node stat (NR_VM_NODE_STAT_ITEMS is 33 here, below PGSTEAL_KSWAPD's
+ *    value), and the patch's own PSI-off fallback already uses all_vm_events(),
+ *    so this keeps all three paths reading the counters they name.
+ */
+
+#ifdef CONFIG_PSI
+/*
+ * Direct-signal path, used when PSI is runtime-enabled. The treadmill's
+ * defining symptom is that userspace constantly stalls on memory; PSI measures
+ * that directly. Fire when the box spends >= THRASH_WD_PSI_PCT of wall-clock
+ * with at least one task stalled on memory ("some") over THRASH_WD_PSI_WINDOWS
+ * windows. "some" rather than "full": on a many-core box some cores keep doing
+ * non-memory work even while the desktop is unusable, so "full" (every task
+ * stalled) under-reads. Two independent confirmations (this AND free <= 2*high)
+ * let the window be shorter than a PSI-only killer's (systemd-oomd 30s /
+ * facebook oomd 15s), which have no free-headroom cross-check.
+ */
+#define THRASH_WD_PSI_WINDOWS	5			/* 10s sustained */
+#define THRASH_WD_PSI_PCT	80
+#define THRASH_WD_WINDOW_NS	((u64)(THRASH_WD_INTERVAL / HZ) * NSEC_PER_SEC)
+#endif
+
+static void thrash_wd_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(thrash_wd_work, thrash_wd_fn);
+
+/*
+ * Memory-pressure gate for the treadmill detector.
+ *
+ * The livelock this watchdog exists for is defined by reclaim being unable to
+ * build any free headroom: free memory stays pinned near the watermarks while
+ * both CPUs churn compression/decompression and every userspace touch waits
+ * behind the storm. The steal+refault ratio alone does not distinguish that
+ * from a merely busy large-RAM box, where a heavy but healthy workload (game
+ * download, build, browser) streams page cache -- and, under lru_marie/MGLRU
+ * proactive reclaim, racks up high steal+refault counts -- while gigabytes
+ * stay free. Firing there is a false positive: with free far above the high
+ * watermark no allocation is anywhere near the OOM path, so killing a task is
+ * pure collateral damage.
+ *
+ * Only arm the detector when the system genuinely cannot keep free above its
+ * high watermark. In a real treadmill free oscillates between min and high
+ * (kswapd stops reclaiming at high, allocations immediately eat back down), so
+ * free never climbs to a multiple of high; requiring free <= 2 * high keeps
+ * the original 8G zram repro firing while suppressing the large-RAM churn case
+ * (free measured >= ~4x high in every false-positive dump). Summed globally to
+ * match the global steal/refault counters above.
+ */
+static bool thrash_wd_mem_pressured(void)
+{
+	struct zone *zone;
+	unsigned long free = 0, high = 0;
+
+	for_each_populated_zone(zone) {
+		if (!managed_zone(zone))
+			continue;
+		free += zone_page_state(zone, NR_FREE_PAGES);
+		high += high_wmark_pages(zone);
+	}
+
+	return free <= high * 2;
+}
+
+static void thrash_wd_fn(struct work_struct *work)
+{
+	static unsigned long last_refaults, last_steals;
+	static unsigned long last_free, last_wd_jiffies;	/* mode 1 baseline */
+	static unsigned int hot_windows, backoff;
+#ifdef CONFIG_PSI
+	static u64 psi_ring[THRASH_WD_PSI_WINDOWS];
+	static unsigned int psi_cursor, psi_filled;
+#endif
+	bool fire = false;
+	char reason[80];
+
+	if (backoff) {
+		backoff--;
+		goto resched;
+	}
+
+	if (lru_marie_enabled()) {
+		/*
+		 * Fast net-progress path -- Marie-scoped (lru_marie_enabled()).
+		 * MGLRU/legacy fall through to the classic PSI/refault detector
+		 * below, so non-Marie OOM behaviour is left untouched. Same
+		 * treadmill ingredients as that fallback -- storm volume, >= half
+		 * refault, real memory
+		 * pressure -- but no PSI ring (warm-up is one window, not five)
+		 * and a severity-WEIGHTED accumulator rather than a flat window
+		 * count: each treadmill window adds w in [1..THRASH_WD_SCORE]
+		 * scaled by how badly the box is losing, so a severe treadmill
+		 * (near-zero NET progress AND free in the reserves) reaches the
+		 * threshold in a single ~2s window, while a marginal one still
+		 * needs the full THRASH_WD_SCORE windows (== the classic 16s: no
+		 * regression at the mild end). Honest net-progress: any window
+		 * where reclaim actually lifted free (real headroom) resets the
+		 * score, so the OOM only follows sustained no-headroom churn. A
+		 * >2-interval gap (boot, post-backoff) reseeds instead of acting
+		 * on a stale multi-window delta.
+		 *
+		 * ev[] is on-stack here as it is in the fallback path; the two
+		 * blocks are mutually exclusive arms of this if/else chain, so
+		 * their lifetimes are disjoint and the slot is shared.
+		 */
+		unsigned long ev[NR_VM_EVENT_ITEMS];
+		unsigned long now = jiffies, refaults, steals, dr, ds;
+		unsigned long free = 0, high = 0, min = 0;
+		struct zone *zone;
+		unsigned int w;
+
+		all_vm_events(ev);
+		steals = ev[PGSTEAL_KSWAPD] + ev[PGSTEAL_DIRECT];
+		refaults = global_node_page_state(WORKINGSET_REFAULT);
+		for_each_populated_zone(zone) {
+			if (!managed_zone(zone))
+				continue;
+			free += zone_page_state(zone, NR_FREE_PAGES);
+			high += high_wmark_pages(zone);
+			min  += min_wmark_pages(zone);
+		}
+
+		if (time_after(now, last_wd_jiffies + THRASH_WD_INTERVAL * 2)) {
+			/* Initial / post-backoff gap: reseed the baseline only. */
+			last_refaults = refaults;
+			last_steals = steals;
+			hot_windows = 0;
+		} else {
+			dr = refaults - last_refaults;
+			ds = steals - last_steals;
+			last_refaults = refaults;
+			last_steals = steals;
+
+			if (ds < totalram_pages() / 512 || dr * 2 < ds ||
+			    free > high || free > last_free + (ds >> 2)) {
+				/*
+				 * No treadmill, or reclaim is winning. free > high
+				 * means kswapd rebuilt headroom back above the high
+				 * watermark, so no allocation is anywhere near the OOM
+				 * path -- a busy (heavily paging) but healthy
+				 * over-committed box, not a livelock; firing here is
+				 * pure collateral damage. A genuine treadmill is
+				 * defined by free pinned in [min, high] (reclaim cannot
+				 * reach high); free climbing past high is progress.
+				 *
+				 * (Was free > high*2. The 2x band is narrow on small-
+				 * RAM systems -- e.g. 67MB..135MB on a 3G box -- so a
+				 * healthy workload sitting just above high with dr~=ds
+				 * steady-state paging fell inside it and false-fired.
+				 * Tightening to high leaves the free<=high detection
+				 * below byte-identical; it only drops the mild-tier
+				 * firing in (high, 2*high], which is the false region.)
+				 */
+				hot_windows = 0;
+			} else {
+				/* free <= high is guaranteed by the escape above
+				 * (base 2 folds in the old "below high wmark" +1). */
+				w = 2;
+				if (dr >= ds)		w += 3;	/* ~zero net progress */
+				if (free <= min * 2)	w += 3;	/* into the reserves */
+				hot_windows += w;
+				if (hot_windows >= THRASH_WD_SCORE) {
+					scnprintf(reason, sizeof(reason),
+						  "net-progress %lu refault / %lu steal, free %lu",
+						  dr, ds, free);
+					fire = true;
+				}
+			}
+		}
+		last_free = free;
+		last_wd_jiffies = now;
+	} else
+#ifdef CONFIG_PSI
+	if (!static_branch_likely(&psi_disabled)) {
+		/*
+		 * Direct path: PSI memory-"some" is the ns of wall-clock during
+		 * which at least one task was stalled on memory (reclaim /
+		 * refault / swapin). Compare the stall accumulated over the last
+		 * THRASH_WD_PSI_WINDOWS windows against that span: a ring of the
+		 * per-window totals makes this robust to the ~2s PSI aggregation
+		 * cadence drifting against our timer. Still gated on real memory
+		 * pressure so an abundant-free box is never touched.
+		 */
+		u64 some = psi_system.total[PSI_AVGS][PSI_MEM_SOME];
+		u64 oldest = psi_ring[psi_cursor];
+
+		psi_ring[psi_cursor] = some;
+		psi_cursor = (psi_cursor + 1) % THRASH_WD_PSI_WINDOWS;
+
+		if (psi_filled < THRASH_WD_PSI_WINDOWS) {
+			psi_filled++;		/* warming the ring */
+		} else if (thrash_wd_mem_pressured() &&
+			   some - oldest >= THRASH_WD_WINDOW_NS *
+					    THRASH_WD_PSI_WINDOWS *
+					    THRASH_WD_PSI_PCT / 100) {
+			unsigned long stall_ms = div_u64(some - oldest,
+							 NSEC_PER_MSEC);
+
+			scnprintf(reason, sizeof(reason),
+				  "PSI mem-some stalled %lums/%ums",
+				  stall_ms, (unsigned int)(THRASH_WD_PSI_WINDOWS *
+				  (THRASH_WD_INTERVAL / HZ) * 1000));
+			fire = true;
+		}
+	} else
+#endif
+	{
+		/*
+		 * Fallback (PSI compiled out or runtime-disabled): infer the
+		 * treadmill from vm counters. Storm volume: reclaim moving >=
+		 * totalram/512 pages per window (~8MB/s per 8G RAM). Treadmill
+		 * ratio: at least half of it faults straight back as recently-
+		 * evicted working set. Gate on real memory pressure (free pinned
+		 * near the watermarks) so a busy-but-healthy large-RAM box
+		 * streaming page cache with gigabytes free is not mistaken for a
+		 * livelock -- see thrash_wd_mem_pressured().
+		 */
+		unsigned long ev[NR_VM_EVENT_ITEMS];
+		unsigned long refaults, steals, dr, ds;
+
+		all_vm_events(ev);
+		steals = ev[PGSTEAL_KSWAPD] + ev[PGSTEAL_DIRECT];
+		refaults = global_node_page_state(WORKINGSET_REFAULT);
+
+		dr = refaults - last_refaults;
+		ds = steals - last_steals;
+		last_refaults = refaults;
+		last_steals = steals;
+
+		if (ds >= totalram_pages() / 512 && dr * 2 >= ds &&
+		    thrash_wd_mem_pressured())
+			hot_windows++;
+		else
+			hot_windows = 0;
+
+		if (hot_windows >= THRASH_WD_WINDOWS) {
+			scnprintf(reason, sizeof(reason),
+				  "refault %lu vs %lu steals, %us sustained",
+				  dr, ds, (unsigned int)(THRASH_WD_WINDOWS *
+				  (THRASH_WD_INTERVAL / HZ)));
+			fire = true;
+		}
+	}
+
+	if (fire) {
+		struct oom_control oc = {
+			.zonelist = node_zonelist(first_memory_node, GFP_KERNEL),
+			.gfp_mask = GFP_KERNEL,	/* !__GFP_FS shortcuts out_of_memory */
+			.order = -1,
+		};
+
+		pr_warn("thrash livelock: %s, invoking OOM\n", reason);
+		if (mutex_trylock(&oom_lock)) {
+			out_of_memory(&oc);
+			mutex_unlock(&oom_lock);
+		}
+		hot_windows = 0;
+		backoff = THRASH_WD_BACKOFF;
+#ifdef CONFIG_PSI
+		psi_filled = 0;		/* re-warm after the backoff gap */
+#endif
+	}
+
+resched:
+	schedule_delayed_work(&thrash_wd_work, THRASH_WD_INTERVAL);
+}
+
+static int __init thrash_wd_init(void)
+{
+	schedule_delayed_work(&thrash_wd_work, THRASH_WD_INTERVAL);
+	return 0;
+}
+late_initcall(thrash_wd_init);
+#endif /* CONFIG_VM_EVENT_COUNTERS */

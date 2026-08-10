@@ -1203,6 +1203,16 @@ const char * const vmstat_text[] = {
 	"pgscan_kswapd",
 	"pgscan_direct",
 	"pgscan_direct_throttle",
+	/*
+	 * Positional array: these four must sit exactly where PGSCAN_ANON ..
+	 * PGSTEAL_FILE sit in enum vm_event_item (include/linux/vm_event_item.h),
+	 * i.e. right after pgscan_direct_throttle and before the CONFIG_NUMA
+	 * zone_reclaim_failed entry.
+	 */
+	"pgscan_anon",
+	"pgscan_file",
+	"pgsteal_anon",
+	"pgsteal_file",
 
 #ifdef CONFIG_NUMA
 	"zone_reclaim_failed",

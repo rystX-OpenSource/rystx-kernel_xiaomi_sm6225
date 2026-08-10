@@ -23,6 +23,7 @@
 #include <linux/freezer.h>
 #include <linux/page_owner.h>
 #include <linux/psi.h>
+#include <linux/lru_marie.h>
 #include "internal.h"
 
 #ifdef CONFIG_COMPACTION
@@ -2541,6 +2542,23 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 							cc.classzone_idx);
 	count_compact_event(KCOMPACTD_WAKE);
 
+#ifdef CONFIG_LRU_MARIE_DEFRAG
+	/*
+	 * lru_marie/defrag=1: Marie defrag REPLACES stock demand compaction.
+	 * Demand is urgent (a high-order allocation is blocked), so Marie runs
+	 * with may_drop=true -- MOVE + DROP cold-dead clean file, its cheapest
+	 * and highest-value rung (the clean_min_ratio floor still bounds DROP).
+	 * Skip the stock two-scanner sweep entirely and mark the request
+	 * satisfied. defrag=0 / CONFIG off: the stock sweep below runs.
+	 */
+	if (lru_marie_defrag_active()) {
+		lru_marie_defrag_pgdat(pgdat, true);
+		pgdat->kcompactd_max_order = 0;
+		pgdat->kcompactd_classzone_idx = pgdat->nr_zones - 1;
+		return;
+	}
+#endif
+
 	for (zoneid = 0; zoneid <= cc.classzone_idx; zoneid++) {
 		int status;
 
@@ -2656,6 +2674,16 @@ static int kcompactd(void *p)
 		psi_memstall_leave(&pflags);
 	}
 
+	/*
+	 * The patch's second kcompactd hunk -- which swaps stock proactive
+	 * compaction for lru_marie_defrag_pgdat(pgdat, false) (MOVE-only) --
+	 * has no counterpart here: proactive compaction, together with
+	 * fragmentation_score_node() and the vm.compaction_proactiveness knob,
+	 * only arrived in 5.9 (commit facdaa917c4d).  This tree's kcompactd is
+	 * purely demand-driven, so Marie defrag replaces stock compaction on
+	 * the one path that exists (kcompactd_do_work above) and the MOVE-only
+	 * rung is simply never entered.
+	 */
 	return 0;
 }
 

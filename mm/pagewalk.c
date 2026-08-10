@@ -263,6 +263,29 @@ static int __walk_page_range(unsigned long start, unsigned long end,
 	return err;
 }
 
+/*
+ * process_mm_walk_lock() -- hard-copied from 6.19.8 mm/pagewalk.c:418-425
+ * (upstream commit 49b0638502da).  Replaces the open-coded
+ * VM_BUG_ON_MM(!rwsem_is_locked(...)) that stood at both call sites: the
+ * mmap_lock case is the identical assertion, and the walk_lock field now says
+ * which lock the caller promised to hold rather than assuming read.
+ *
+ * The companion process_vma_walk_lock() is not brought along: its whole body
+ * is under CONFIG_PER_VMA_LOCK, which this tree predates (no vma->vm_lock, no
+ * vma_start_write()), so on 6.19.8 with that option off it is already an empty
+ * function.  Omitting it is therefore behaviour-identical here, and the three
+ * vma-locking enum values remain accepted-but-inert exactly as they are in an
+ * upstream CONFIG_PER_VMA_LOCK=n build.
+ */
+static inline void process_mm_walk_lock(struct mm_struct *mm,
+					enum page_walk_lock walk_lock)
+{
+	if (walk_lock == PGWALK_RDLOCK)
+		mmap_assert_locked(mm);
+	else if (walk_lock != PGWALK_VMA_RDLOCK_VERIFY)
+		mmap_assert_write_locked(mm);
+}
+
 /**
  * walk_page_range - walk page table with caller specific callbacks
  * @mm:		mm_struct representing the target process of page table walk
@@ -317,7 +340,7 @@ int walk_page_range(struct mm_struct *mm, unsigned long start,
 	if (!walk.mm)
 		return -EINVAL;
 
-	VM_BUG_ON_MM(!rwsem_is_locked(&walk.mm->mmap_lock), walk.mm);
+	process_mm_walk_lock(walk.mm, ops->walk_lock);
 
 	vma = find_vma(walk.mm, start);
 	do {
@@ -367,7 +390,7 @@ int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
 	if (!walk.mm)
 		return -EINVAL;
 
-	VM_BUG_ON(!rwsem_is_locked(&vma->vm_mm->mmap_lock));
+	process_mm_walk_lock(walk.mm, ops->walk_lock);
 
 	err = walk_page_test(vma->vm_start, vma->vm_end, &walk);
 	if (err > 0)

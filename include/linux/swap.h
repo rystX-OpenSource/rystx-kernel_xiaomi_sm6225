@@ -353,6 +353,35 @@ extern unsigned long zone_reclaimable_pages(struct zone *zone);
 extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 					gfp_t gfp_mask, nodemask_t *mask);
 extern int __isolate_lru_page(struct page *page, isolate_mode_t mode);
+/*
+ * Swappiness bounds.  Hard-copied from 6.19.8 include/linux/swap.h:379-383,
+ * same position in the file (between try_to_free_pages() and
+ * try_to_free_mem_cgroup_pages()); the neighbouring MEMCG_RECLAIM_* flags are
+ * deliberately not brought along, as this tree still spells that argument
+ * "bool may_swap" rather than a flags word.
+ *
+ * The 0..200 scale is not new here, only newly named: this tree's
+ * get_scan_count() already computes the file weight as "200 - anon_prio"
+ * (mm/vmscan.c:2698), i.e. exactly MAX_SWAPPINESS - swappiness, so Marie's
+ * bias math lands on the identical scale as the legacy reclaim it replaces.
+ *
+ * What differs from 6.19.8 is the reachable input range, and that is left
+ * alone on purpose -- upstream widened the sysctl clamp to SYSCTL_TWO_HUNDRED
+ * (cachy mm/vmscan.c:7666) and the memcg writer to MAX_SWAPPINESS (cachy
+ * mm/memcontrol-v1.c:1955), but the Marie patch touches neither bound, so this
+ * tree keeps its 0..100 caps (kernel/sysctl.c:1880 .extra2 = &one_hundred,
+ * mm/memcontrol.c:3562 "if (val > 100)").  Consequence: the
+ * "swappiness >= MAX_SWAPPINESS" anon-only arm in marie_swap_bias() is
+ * unreachable via /proc/sys on this tree.  It is kept because it is upstream's
+ * code and because raising the two clamps is a one-line change if wanted
+ * later; the 0..100 half of the scale behaves identically either way.
+ */
+#define MIN_SWAPPINESS 0
+#define MAX_SWAPPINESS 200
+
+/* Just reclaim from anon pages in proactive memory reclaim */
+#define SWAPPINESS_ANON_ONLY (MAX_SWAPPINESS + 1)
+
 extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 						  unsigned long nr_pages,
 						  gfp_t gfp_mask,
@@ -394,6 +423,15 @@ extern void end_swap_bio_write(struct bio *bio);
 extern int __swap_writepage(struct page *page, struct writeback_control *wbc,
 	bio_end_io_t end_write_func);
 extern int swap_set_page_dirty(struct page *page);
+#ifdef CONFIG_LRU_MARIE
+/*
+ * CONFIG_SWAP is implied here (this is inside swap.h's CONFIG_SWAP gate).
+ * Upstream declares this in mm/swap.h, which was only created in 5.19
+ * (commit 014bb1de4fc1); in this tree page_io.c's interface still lives in
+ * <linux/swap.h>.
+ */
+int kcompressd(void *p);
+#endif
 
 int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block);
@@ -436,6 +474,24 @@ extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;
 extern atomic_t nr_rotate_swap;
 extern bool has_usable_swap(void);
+
+#ifdef CONFIG_LRU_MARIE
+/*
+ * linux/mm/page_io.c: monotonic counter incremented on every failed swap-out
+ * bio completion (bio->bi_status != 0). The early-OOM gate in
+ * mm/page_alloc.c:should_reclaim_retry consults the delta from
+ * alloc_context.initial_swap_write_failed to detect "swap backend has free
+ * entries but cannot actually write" — primarily ZRAM/zswap zs_malloc
+ * failures under combined RAM + swap pressure, but also disk swap I/O
+ * errors. Sustained delta > MAX_SWAP_WRITE_FAIL_RETRIES skips the standard
+ * MAX_RECLAIM_RETRIES wait and triggers OOM directly.
+ *
+ * Marie-only: only the Marie-gated path in should_reclaim_retry consumes
+ * this counter, so it is omitted entirely under CONFIG_LRU_MARIE=n to
+ * keep vanilla Legacy builds byte-identical.
+ */
+extern atomic_long_t nr_swap_write_failed;
+#endif
 
 /* Swap 50% full? Release swapcache more aggressively.. */
 static inline bool vm_swap_full(void)

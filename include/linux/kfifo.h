@@ -54,59 +54,12 @@
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 #include <linux/scatterlist.h>
-
-struct __kfifo {
-	unsigned int	in;
-	unsigned int	out;
-	unsigned int	mask;
-	unsigned int	esize;
-	void		*data;
-};
-
-#define __STRUCT_KFIFO_COMMON(datatype, recsize, ptrtype) \
-	union { \
-		struct __kfifo	kfifo; \
-		datatype	*type; \
-		const datatype	*const_type; \
-		char		(*rectype)[recsize]; \
-		ptrtype		*ptr; \
-		ptrtype const	*ptr_const; \
-	}
-
-#define __STRUCT_KFIFO(type, size, recsize, ptrtype) \
-{ \
-	__STRUCT_KFIFO_COMMON(type, recsize, ptrtype); \
-	type		buf[((size < 2) || (size & (size - 1))) ? -1 : size]; \
-}
-
-#define STRUCT_KFIFO(type, size) \
-	struct __STRUCT_KFIFO(type, size, 0, type)
-
-#define __STRUCT_KFIFO_PTR(type, recsize, ptrtype) \
-{ \
-	__STRUCT_KFIFO_COMMON(type, recsize, ptrtype); \
-	type		buf[0]; \
-}
-
-#define STRUCT_KFIFO_PTR(type) \
-	struct __STRUCT_KFIFO_PTR(type, 0, type)
-
 /*
- * define compatibility "struct kfifo" for dynamic allocated fifos
+ * struct __kfifo, struct kfifo and the STRUCT_KFIFO* helpers live in their own
+ * header so that <linux/mmzone.h> can obtain them without dragging in
+ * scatterlist.h (and hence mm.h).  See the comment in <linux/kfifo_types.h>.
  */
-struct kfifo __STRUCT_KFIFO_PTR(unsigned char, 0, void);
-
-#define STRUCT_KFIFO_REC_1(size) \
-	struct __STRUCT_KFIFO(unsigned char, size, 1, void)
-
-#define STRUCT_KFIFO_REC_2(size) \
-	struct __STRUCT_KFIFO(unsigned char, size, 2, void)
-
-/*
- * define kfifo_rec types
- */
-struct kfifo_rec_ptr_1 __STRUCT_KFIFO_PTR(unsigned char, 1, void);
-struct kfifo_rec_ptr_2 __STRUCT_KFIFO_PTR(unsigned char, 2, void);
+#include <linux/kfifo_types.h>
 
 /*
  * helper macro to distinguish between real in place fifo where the fifo

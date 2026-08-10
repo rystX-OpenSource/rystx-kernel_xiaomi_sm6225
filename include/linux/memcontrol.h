@@ -512,14 +512,38 @@ unsigned long mem_cgroup_get_lru_size(struct lruvec *lruvec, enum lru_list lru)
 	return nr_pages;
 }
 
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Out-of-line (lru_marie_enabled()'s static key lives in lru_marie.h, which
+ * memcontrol.h must not pull in). Implements the single-source SWITCH for the
+ * reader:
+ *   - Marie enabled + evictable lru -> the Marie/global size (the node
+ *     NR_ZONE_LRU_BASE vmstat total) is the SOLE truth (contract: every
+ *     evictable page is Marie-tracked, so stock holds nothing for these
+ *     buckets).
+ *   - otherwise (Marie disabled, or LRU_UNEVICTABLE which Marie never tracks)
+ *     -> the @stock value passed in.
+ * NOT a sum: summing made stock a second, drift-prone source whose boundary
+ * leaks underflowed mem_cgroup_update_lru_size. @stock is passed so the
+ * common !CONFIG / disabled path keeps the plain stock read.
+ */
+unsigned long lru_marie_zone_size_read(struct lruvec *lruvec, enum lru_list lru,
+				       int zone_idx, unsigned long stock);
+#endif
+
 static inline
 unsigned long mem_cgroup_get_zone_lru_size(struct lruvec *lruvec,
 		enum lru_list lru, int zone_idx)
 {
 	struct mem_cgroup_per_node *mz;
+	unsigned long size;
 
 	mz = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
-	return mz->lru_zone_size[zone_idx][lru];
+	size = mz->lru_zone_size[zone_idx][lru];
+#ifdef CONFIG_LRU_MARIE
+	size = lru_marie_zone_size_read(lruvec, lru, zone_idx, size);
+#endif
+	return size;
 }
 
 void mem_cgroup_handle_over_high(void);
@@ -1118,6 +1142,88 @@ void count_memcg_event_mm(struct mm_struct *mm, enum vm_event_item idx)
 {
 }
 #endif /* CONFIG_MEMCG */
+
+/*
+ * LRU-lock helpers, backported from Linux 6.19.8 include/linux/memcontrol.h
+ * (unlock_page_lruvec* :1468-1482, folio_matches_lruvec :1485,
+ * folio_lruvec_lock_irqsave :1253, folio_lruvec_relock_irqsave :1507) and
+ * expressed in this tree's struct page terms.
+ *
+ * One structural difference: the LRU lock only moved from the node into the
+ * lruvec in 5.11 (upstream commit 6168d0da2b47 "mm/lru: replace pgdat
+ * lru_lock with lruvec lock"), so every &lruvec->lru_lock upstream becomes
+ * &lruvec_pgdat(lruvec)->lru_lock here -- the same lock this tree's own
+ * zone_lru_lock() hands out.  No lock is added to struct lruvec: doing so
+ * would mint a second LRU lock that vmscan, swap and compaction never take.
+ *
+ * These are placed outside the CONFIG_MEMCG branches deliberately -- both
+ * branches already supply mem_cgroup_page_lruvec() and lruvec_memcg(), and
+ * page_memcg() comes from <linux/mm.h> (which this header includes), where
+ * this tree defines it for both configurations.  So a single definition here
+ * serves both.
+ */
+static inline void unlock_page_lruvec(struct lruvec *lruvec)
+{
+	spin_unlock(&lruvec_pgdat(lruvec)->lru_lock);
+}
+
+static inline void unlock_page_lruvec_irq(struct lruvec *lruvec)
+{
+	spin_unlock_irq(&lruvec_pgdat(lruvec)->lru_lock);
+}
+
+static inline void unlock_page_lruvec_irqrestore(struct lruvec *lruvec,
+		unsigned long flags)
+{
+	spin_unlock_irqrestore(&lruvec_pgdat(lruvec)->lru_lock, flags);
+}
+
+/**
+ * page_lruvec - Get the lruvec @page belongs to.
+ * @page: Pointer to the page.
+ *
+ * From 6.19.8 folio_lruvec() (:739).  This tree spells the lookup
+ * mem_cgroup_page_lruvec(page, pgdat) -- same lookup, arguments the other way
+ * round, with the memcg deref folded inside; the !CONFIG_MEMCG build resolves
+ * to &pgdat->lruvec just as upstream's stub at :1172 does.
+ *
+ * Relies on page->mem_cgroup being stable.
+ */
+static inline struct lruvec *page_lruvec(struct page *page)
+{
+	return mem_cgroup_page_lruvec(page, page_pgdat(page));
+}
+
+static inline struct lruvec *page_lruvec_lock_irqsave(struct page *page,
+		unsigned long *flagsp)
+{
+	struct lruvec *lruvec = page_lruvec(page);
+
+	spin_lock_irqsave(&lruvec_pgdat(lruvec)->lru_lock, *flagsp);
+	return lruvec;
+}
+
+/* Test requires a stable page->mem_cgroup binding, see page_memcg() */
+static inline bool page_matches_lruvec(struct page *page,
+		struct lruvec *lruvec)
+{
+	return lruvec_pgdat(lruvec) == page_pgdat(page) &&
+	       lruvec_memcg(lruvec) == page_memcg(page);
+}
+
+/* Don't lock again iff page's lruvec locked */
+static inline void page_lruvec_relock_irqsave(struct page *page,
+		struct lruvec **lruvecp, unsigned long *flags)
+{
+	if (*lruvecp) {
+		if (page_matches_lruvec(page, *lruvecp))
+			return;
+
+		unlock_page_lruvec_irqrestore(*lruvecp, *flags);
+	}
+
+	*lruvecp = page_lruvec_lock_irqsave(page, flags);
+}
 
 /* idx can be of type enum memcg_stat_item or node_stat_item */
 static inline void __inc_memcg_state(struct mem_cgroup *memcg,
