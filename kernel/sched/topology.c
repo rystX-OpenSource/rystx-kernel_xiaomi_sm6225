@@ -341,14 +341,7 @@ static bool build_perf_domains(const struct cpumask *cpu_map)
 	if (!sysctl_sched_energy_aware)
 		goto free;
 
-	/*
-	 * EAS gets disabled when there are no asymmetric capacity
-	 * CPUs in the system. For example, all big CPUs are
-	 * hotplugged out on a b.L system. We want EAS enabled
-	 * all the time to get both power and perf benefits. Apply
-	 * this policy when WALT is enabled.
-	 */
-#ifndef CONFIG_SCHED_WALT
+	/* EAS is enabled for asymmetric CPU capacity topologies. */
 	if (!per_cpu(sd_asym_cpucapacity, cpu)) {
 		if (sched_debug()) {
 			pr_info("rd %*pbl: CPUs do not have asymmetric capacities\n",
@@ -356,7 +349,7 @@ static bool build_perf_domains(const struct cpumask *cpu_map)
 		}
 		goto free;
 	}
-#endif
+
 	for_each_cpu(i, cpu_map) {
 		unsigned long scale_cpu = arch_scale_cpu_capacity(i);
 
@@ -508,10 +501,6 @@ static int init_rootdomain(struct root_domain *rd)
 	if (cpupri_init(&rd->cpupri) != 0)
 		goto free_cpudl;
 
-#ifdef CONFIG_SCHED_WALT
-	rd->max_cap_orig_cpu = rd->min_cap_orig_cpu = -1;
-	rd->mid_cap_orig_cpu = -1;
-#endif
 	init_max_cpu_capacity(&rd->max_cpu_capacity);
 
 	return 0;
