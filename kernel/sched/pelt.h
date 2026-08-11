@@ -6,6 +6,7 @@ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se
 int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq);
 int update_rt_rq_load_avg(u64 now, struct rq *rq, int running);
 int update_dl_rq_load_avg(u64 now, struct rq *rq, int running);
+unsigned long approximate_util_avg(unsigned long util, u64 delta);
 
 #ifdef CONFIG_SCHED_THERMAL_PRESSURE
 int update_thermal_load_avg(u64 now, struct rq *rq, u64 capacity);
@@ -231,5 +232,3 @@ update_idle_rq_clock_pelt(struct rq *rq) { }
 
 static inline void update_idle_cfs_rq_clock_pelt(struct cfs_rq *cfs_rq) { }
 #endif
-
-
