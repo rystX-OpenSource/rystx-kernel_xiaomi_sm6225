@@ -104,6 +104,45 @@
 #define SCHED_FEAT_LB_MIN 0
 #define SCHED_FEAT_ATTACH_AGE_LOAD 1
 
+/*
+ * Advance detach_tasks()' scan window by rotating the examined block to the
+ * head of cfs_tasks, instead of moving each rejected task there one by one.
+ *
+ * Both schemes give the same coverage -- a later balance pass resumes where
+ * the previous one stopped -- but the per-reject move costs one list
+ * operation per rejected task under rq_lock, where a block rotation costs
+ * one per scan.  It also keeps the list order independent of migration
+ * outcome, which the per-reject move does not.
+ *
+ * Turn off to get the upstream per-reject list_move() behaviour.
+ */
+#define SCHED_FEAT_LB_ROTATE_BLOCK 1
+
+/*
+ * Compare a migration candidate's cost against the remaining imbalance budget
+ * directly, instead of relaxing the comparison by sd->nr_balance_failed.
+ *
+ * The upstream relaxation halves the candidate's apparent cost once per
+ * recorded balance failure, so a task larger than the budget is eventually
+ * let through.  nr_balance_failed is reset on *any* successful migration at
+ * that domain, so a steady supply of cheap-to-move tasks keeps resetting it
+ * and the relaxation never reaches the expensive ones: they are considered
+ * only once nothing cheaper is left.
+ *
+ * That relaxation is also the only way an over-budget task ever moves under
+ * migrate_load/migrate_util, since imbalanced_active_balance() escalates for
+ * migrate_task only.  So dropping it alone would leave a task larger than the
+ * imbalance permanently unmovable; detach_tasks() replaces the guarantee with
+ * an explicit one -- a scan that admits nothing concedes to the smallest
+ * overshoot it saw.  That asks the candidates actually present instead of a
+ * domain counter, so no other task's success can defer it, and it acts on the
+ * first scan that admits nothing rather than once enough failures have been
+ * recorded.
+ *
+ * Turn off to get the upstream shr_bound() relaxation.
+ */
+#define SCHED_FEAT_LB_STRICT_BUDGET 1
+
 #define SCHED_FEAT_WA_IDLE 1
 #define SCHED_FEAT_WA_WEIGHT 1
 #define SCHED_FEAT_WA_BIAS 1
