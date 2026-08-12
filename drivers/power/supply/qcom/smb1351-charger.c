@@ -19,6 +19,8 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 
 
 /* Mask/Bit helpers */
@@ -408,6 +410,7 @@ enum reason {
 	THERMAL = BIT(1),
 	CURRENT = BIT(2),
 	SOC	= BIT(3),
+	BYPASS	= BIT(4),
 };
 
 enum quick_charge_type {
@@ -540,6 +543,15 @@ struct smb1351_charger {
 	enum power_supply_type	charger_type;
 	bool			otg_enable;
 	int cc_orientation;
+
+	/*
+	 * Kernel-level charging controls exported through
+	 * /sys/kernel/smb1351_charger.  mod_lock serialises writers only;
+	 * see the comment above smb1351_mod_get_chip() for the locking rules.
+	 */
+	struct mutex		mod_lock;
+	struct kobject		*mod_kobj;
+	bool			bypass_charging;
 };
 
 struct smb_irq_info {
@@ -1453,6 +1465,209 @@ static int smb1351_get_prop_batt_health(struct smb1351_charger *chip)
 	return ret.intval;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Kernel-level charging controls -- /sys/kernel/smb1351_charger
+ *
+ * This is a critical driver: a careless register write can stop charging
+ * outright or drive the pack outside its safe envelope.  Every knob exported
+ * below therefore goes through the same three guards, and none of them ever
+ * writes a raw value straight to the charger:
+ *
+ *   1. smb1351_mod_get_chip() decides whether it is legal to touch the
+ *      charger at all right now.
+ *   2. Per-feature validation rejects out-of-range input with -EINVAL and
+ *      leaves the hardware untouched.  Nonsense input is never silently
+ *      coerced into "some" register value.
+ *   3. A single apply path per feature -- the reason bitmask for enable/
+ *      disable, one ICL programming helper for currents -- so two features
+ *      can never race each other into a half-applied state.
+ *
+ * Locking: mod_lock serialises *writers* (sysfs stores, and the charger
+ * insert/remove hooks).  It is always the innermost lock: the paths that take
+ * it never acquire chip->irq_complete, while the threaded IRQ handler takes
+ * irq_complete first and mod_lock second, so the order can never invert.
+ * Helpers that run on the register-programming path itself must stay lock
+ * free, because they are reached with mod_lock already held.
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * Returns the main charger only when it is safe to program it.  Refuses:
+ * the parallel slave (no APSD/ICL state of its own), a chip that has not
+ * finished resuming (i2c transfers would fail), and autonomous mode, where
+ * the charger runs itself and the driver must not fight the hardware.
+ */
+static struct smb1351_charger *smb1351_mod_get_chip(void)
+{
+	struct smb1351_charger *chip = READ_ONCE(chip_host);
+
+	if (!chip || !chip->client)
+		return NULL;
+	if (chip->parallel_charger)
+		return NULL;
+	if (chip->chg_autonomous_mode)
+		return NULL;
+	if (!chip->resume_completed)
+		return NULL;
+
+	return chip;
+}
+
+/*
+ * "Bypass charging": run the system from USBIN while the battery charge FET
+ * stays off, so the pack is neither charged nor discharged.
+ *
+ * SMB1351 has no dedicated power-path/bypass register, but disabling battery
+ * charging while USBIN is *not* suspended produces exactly that behaviour --
+ * SYS keeps being fed from the input and the battery sits idle.  It is
+ * expressed through the driver's existing reason bitmask under a private
+ * BYPASS reason, so it composes with, instead of stomping on, the USER / SOC
+ * requests made by the rest of the driver and by userspace.
+ *
+ * Caller must hold mod_lock.
+ */
+static int smb1351_mod_set_bypass(struct smb1351_charger *chip, bool enable)
+{
+	int rc;
+
+	if (enable) {
+		/*
+		 * With no input, or with the input suspended, there is nothing
+		 * to bypass *to* -- the system would simply run down the
+		 * battery with charging disabled.  Refuse loudly rather than
+		 * leave the pack draining behind a node that reads back "1".
+		 */
+		if (!chip->chg_present) {
+			pr_err("bypass: refused, no charger present\n");
+			return -ENODEV;
+		}
+		if (chip->usb_suspended_status) {
+			pr_err("bypass: refused, USB input suspended (0x%x)\n",
+					chip->usb_suspended_status);
+			return -EBUSY;
+		}
+	}
+
+	if (chip->bypass_charging == enable)
+		return 0;
+
+	rc = smb1351_battchg_disable(chip, BYPASS, enable);
+	if (rc) {
+		pr_err("bypass: couldn't %s battery charging rc=%d\n",
+				enable ? "disable" : "enable", rc);
+		return rc;
+	}
+
+	chip->bypass_charging = enable;
+	pr_info("bypass charging %s\n", enable ? "enabled" : "disabled");
+
+	if (chip->batt_psy)
+		power_supply_changed(chip->batt_psy);
+
+	return 0;
+}
+
+/*
+ * Charger unplugged.  Drop bypass so the pack is not left with charging
+ * disabled for the next insertion -- a latched BYPASS reason would otherwise
+ * look exactly like broken charging.
+ *
+ * Runs from the APSD handler, i.e. threaded IRQ / workqueue context with
+ * irq_complete held, so sleeping on mod_lock here is both legal and the
+ * correct order.
+ */
+static void smb1351_mod_charger_removed(struct smb1351_charger *chip)
+{
+	mutex_lock(&chip->mod_lock);
+
+	if (chip->bypass_charging) {
+		pr_info("charger removed, clearing bypass charging\n");
+		if (smb1351_battchg_disable(chip, BYPASS, false))
+			pr_err("bypass: couldn't re-enable charging on removal\n");
+		chip->bypass_charging = false;
+	}
+
+	mutex_unlock(&chip->mod_lock);
+}
+
+static ssize_t bypass_charging_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", chip->bypass_charging ? 1 : 0);
+}
+
+static ssize_t bypass_charging_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	bool enable;
+	int rc;
+
+	if (!chip)
+		return -ENODEV;
+
+	rc = kstrtobool(buf, &enable);
+	if (rc)
+		return rc;
+
+	mutex_lock(&chip->mod_lock);
+	rc = smb1351_mod_set_bypass(chip, enable);
+	mutex_unlock(&chip->mod_lock);
+
+	return rc ? rc : count;
+}
+
+static struct kobj_attribute bypass_charging_attr =
+	__ATTR(bypass_charging, 0644, bypass_charging_show,
+			bypass_charging_store);
+
+static struct attribute *smb1351_mod_attrs[] = {
+	&bypass_charging_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group smb1351_mod_attr_group = {
+	.attrs = smb1351_mod_attrs,
+};
+
+static int smb1351_mod_sysfs_init(struct smb1351_charger *chip)
+{
+	int rc;
+
+	chip->mod_kobj = kobject_create_and_add("smb1351_charger", kernel_kobj);
+	if (!chip->mod_kobj) {
+		pr_err("Couldn't create smb1351_charger kobject\n");
+		return -ENOMEM;
+	}
+
+	rc = sysfs_create_group(chip->mod_kobj, &smb1351_mod_attr_group);
+	if (rc) {
+		pr_err("Couldn't create smb1351_charger attributes rc=%d\n", rc);
+		kobject_put(chip->mod_kobj);
+		chip->mod_kobj = NULL;
+		return rc;
+	}
+
+	return 0;
+}
+
+static void smb1351_mod_sysfs_exit(struct smb1351_charger *chip)
+{
+	if (!chip->mod_kobj)
+		return;
+
+	sysfs_remove_group(chip->mod_kobj, &smb1351_mod_attr_group);
+	kobject_put(chip->mod_kobj);
+	chip->mod_kobj = NULL;
+}
+
 static int smb1351_set_usb_chg_current(struct smb1351_charger *chip,
 							int current_ma)
 {
@@ -2306,6 +2521,7 @@ static int smb1351_apsd_complete_handler(struct smb1351_charger *chip,
 		/* Handle Charger removal */
 		chip->chg_present = 0;
 		chip->charger_type = POWER_SUPPLY_TYPE_UNKNOWN;
+		smb1351_mod_charger_removed(chip);
 		val.intval = false;
 		extcon_set_property(chip->extcon, EXTCON_USB,
 						EXTCON_PROP_USB_SS, val);
@@ -3238,6 +3454,11 @@ static int smb1351_main_charger_probe(struct i2c_client *client,
 
 	chip->resume_completed = true;
 	mutex_init(&chip->irq_complete);
+	/*
+	 * Must be live before the IRQ is requested below: the APSD handler
+	 * reaches the charging-control hooks, which take this lock.
+	 */
+	mutex_init(&chip->mod_lock);
 
 	batt_psy_cfg.drv_data = chip;
 	batt_psy_cfg.supplied_to = pm_batt_supplied_to;
@@ -3288,7 +3509,16 @@ static int smb1351_main_charger_probe(struct i2c_client *client,
 
 	dump_regs(chip);
 
+	/*
+	 * Publish the chip pointer before the sysfs nodes appear: the show/
+	 * store handlers resolve the chip through chip_host, so the nodes must
+	 * not become visible while it is still NULL.
+	 */
 	chip_host = chip;
+
+	rc = smb1351_mod_sysfs_init(chip);
+	if (rc)
+		pr_err("Couldn't create charging control nodes rc=%d\n", rc);
 
 	pr_info("smb1351 successfully probed. charger=%d, batt=%d version=%s\n",
 			chip->chg_present,
@@ -3395,8 +3625,17 @@ static int smb1351_charger_remove(struct i2c_client *client)
 {
 	struct smb1351_charger *chip = i2c_get_clientdata(client);
 
+	/*
+	 * Tear the nodes down first, then clear chip_host, so no handler can
+	 * still be looking at this chip once it is freed.
+	 */
+	smb1351_mod_sysfs_exit(chip);
+	if (READ_ONCE(chip_host) == chip)
+		WRITE_ONCE(chip_host, NULL);
+
 	cancel_delayed_work_sync(&chip->chg_remove_work);
 
+	mutex_destroy(&chip->mod_lock);
 	mutex_destroy(&chip->irq_complete);
 	debugfs_remove_recursive(chip->debug_root);
 	return 0;
