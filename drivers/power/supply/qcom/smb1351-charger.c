@@ -552,6 +552,7 @@ struct smb1351_charger {
 	struct mutex		mod_lock;
 	struct kobject		*mod_kobj;
 	bool			bypass_charging;
+	int			fixed_current_limit;
 };
 
 struct smb_irq_info {
@@ -1514,6 +1515,122 @@ static struct smb1351_charger *smb1351_mod_get_chip(void)
 	return chip;
 }
 
+static int smb1351_set_usb_chg_current(struct smb1351_charger *chip,
+							int current_ma);
+
+/*
+ * Bounds for the fixed current limiter.  The floor is USB2_MIN_CURRENT_MA:
+ * anything lower is either meaningless to the input stage or lands in the
+ * suspend range, and suspending the input is what POWER_SUPPLY_PROP_
+ * INPUT_SUSPEND is for -- not a side effect a current limit should have.
+ * The ceiling is the largest entry in usb_chg_current[]; the hardware cannot
+ * express more, so accepting more would be a lie.
+ */
+#define SMB1351_MOD_ICL_MIN_MA			USB2_MIN_CURRENT_MA
+#define SMB1351_MOD_ICL_MAX_MA			3000
+
+/*
+ * Ceiling applied to every input-current request before it reaches the
+ * charger.  This runs on the register-programming path -- reached from the
+ * threaded IRQ handler, and from writers that already hold mod_lock -- so it
+ * must stay lock free.  The config value is a plain int read with READ_ONCE();
+ * a racing update is re-applied by that writer immediately afterwards, so the
+ * worst case is a decision that is stale by microseconds.
+ */
+static int smb1351_mod_clamp_icl(struct smb1351_charger *chip, int current_ma)
+{
+	int limit = READ_ONCE(chip->fixed_current_limit);
+
+	/*
+	 * Pass deliberate suspend requests straight through, so a configured
+	 * limit can never keep the input alive when something asked for it to
+	 * be shut off.
+	 */
+	if (current_ma <= SUSPEND_CURRENT_MA)
+		return current_ma;
+
+	if (limit > 0 && current_ma > limit) {
+		pr_debug("ICL request %dmA capped to fixed limit %dmA\n",
+				current_ma, limit);
+		current_ma = limit;
+	}
+
+	return current_ma;
+}
+
+/*
+ * Re-program the input current limit from the negotiated base value.
+ * chip->usb_psy_ma always holds what APSD or userspace asked for, never the
+ * capped result, so a limit can be raised again later without re-running
+ * APSD.  Caller must hold mod_lock.
+ */
+static int smb1351_mod_reapply_icl(struct smb1351_charger *chip)
+{
+	int rc;
+
+	if (!chip->chg_present) {
+		pr_debug("no charger present, limit applies on insertion\n");
+		return 0;
+	}
+
+	/*
+	 * Defensive: never feed a base of 0 into the setter, which would read
+	 * as a suspend request and cut the input entirely.
+	 */
+	if (chip->usb_psy_ma <= SUSPEND_CURRENT_MA) {
+		pr_debug("no negotiated input current yet (%dmA), skipping\n",
+				chip->usb_psy_ma);
+		return 0;
+	}
+
+	rc = smb1351_enable_volatile_writes(chip);
+	if (rc) {
+		pr_err("Couldn't enable volatile writes rc=%d\n", rc);
+		return rc;
+	}
+
+	return smb1351_set_usb_chg_current(chip, chip->usb_psy_ma);
+}
+
+/*
+ * Read back what the input stage is actually limited to, so a configured
+ * limit can be verified against the hardware instead of trusted.  The charger
+ * only implements the discrete steps in usb_chg_current[] plus the fixed
+ * USB2/USB3 modes, so the applied value can legitimately be lower than the
+ * requested one -- it is always rounded down, never up.
+ */
+static int smb1351_mod_get_applied_icl(struct smb1351_charger *chip)
+{
+	int rc;
+	u8 cmd = 0, cfg = 0;
+
+	rc = smb1351_read_reg(chip, CMD_INPUT_LIMIT_REG, &cmd);
+	if (rc)
+		return rc;
+
+	if (cmd & CMD_SUSPEND_MODE_BIT)
+		return 0;
+
+	if ((cmd & CMD_USB_1_5_AC_CTRL_MASK) == CMD_USB_AC_MODE) {
+		rc = smb1351_read_reg(chip, CHG_CURRENT_CTRL_REG, &cfg);
+		if (rc)
+			return rc;
+
+		cfg &= AC_INPUT_CURRENT_LIMIT_MASK;
+		if (cfg >= ARRAY_SIZE(usb_chg_current))
+			return -ERANGE;
+
+		return usb_chg_current[cfg];
+	}
+
+	if (cmd & CMD_USB_2_3_SEL_BIT)
+		return (cmd & CMD_USB_500_MODE) ? USB3_MAX_CURRENT_MA
+						: USB3_MIN_CURRENT_MA;
+
+	return (cmd & CMD_USB_500_MODE) ? USB2_MAX_CURRENT_MA
+					: USB2_MIN_CURRENT_MA;
+}
+
 /*
  * "Bypass charging": run the system from USBIN while the battery charge FET
  * stays off, so the pack is neither charged nor discharged.
@@ -1628,8 +1745,94 @@ static struct kobj_attribute bypass_charging_attr =
 	__ATTR(bypass_charging, 0644, bypass_charging_show,
 			bypass_charging_store);
 
+static ssize_t fixed_current_limit_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", chip->fixed_current_limit);
+}
+
+static ssize_t fixed_current_limit_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	int limit, rc;
+
+	if (!chip)
+		return -ENODEV;
+
+	rc = kstrtoint(buf, 0, &limit);
+	if (rc)
+		return rc;
+
+	/*
+	 * Reject out-of-range input instead of clamping it.  A caller asking
+	 * for 9000 or -1 has a broken assumption, and quietly substituting a
+	 * different number would hide that while still changing how the pack
+	 * is charged.  0 disables the limiter.
+	 */
+	if (limit != 0 && (limit < SMB1351_MOD_ICL_MIN_MA ||
+				limit > SMB1351_MOD_ICL_MAX_MA)) {
+		pr_err("fixed_current_limit: %dmA out of range (0, or %d-%d)\n",
+				limit, SMB1351_MOD_ICL_MIN_MA,
+				SMB1351_MOD_ICL_MAX_MA);
+		return -EINVAL;
+	}
+
+	mutex_lock(&chip->mod_lock);
+	chip->fixed_current_limit = limit;
+	/*
+	 * On a failed apply the setting is deliberately kept: it still bounds
+	 * every later programming attempt.  The error only reports that the
+	 * immediate re-program did not reach the charger.
+	 */
+	rc = smb1351_mod_reapply_icl(chip);
+	mutex_unlock(&chip->mod_lock);
+
+	if (rc) {
+		pr_err("fixed_current_limit: stored %dmA but apply failed rc=%d\n",
+				limit, rc);
+		return rc;
+	}
+
+	pr_info("fixed input current limit %s (%dmA)\n",
+			limit ? "set" : "disabled", limit);
+
+	return count;
+}
+
+static struct kobj_attribute fixed_current_limit_attr =
+	__ATTR(fixed_current_limit, 0644, fixed_current_limit_show,
+			fixed_current_limit_store);
+
+static ssize_t applied_current_limit_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	int applied;
+
+	if (!chip)
+		return -ENODEV;
+
+	applied = smb1351_mod_get_applied_icl(chip);
+	if (applied < 0)
+		return applied;
+
+	return sysfs_emit(buf, "%d\n", applied);
+}
+
+static struct kobj_attribute applied_current_limit_attr =
+	__ATTR(applied_current_limit, 0444, applied_current_limit_show, NULL);
+
 static struct attribute *smb1351_mod_attrs[] = {
 	&bypass_charging_attr.attr,
+	&fixed_current_limit_attr.attr,
+	&applied_current_limit_attr.attr,
 	NULL,
 };
 
@@ -1680,6 +1883,13 @@ static int smb1351_set_usb_chg_current(struct smb1351_charger *chip,
 		pr_err("Charger in autonomous mode\n");
 		return 0;
 	}
+
+	/*
+	 * Apply the kernel-level ceiling before anything is programmed, so
+	 * every path that reaches this function -- APSD, HVDCP detection,
+	 * userspace CURRENT_MAX -- is bounded by it.
+	 */
+	current_ma = smb1351_mod_clamp_icl(chip, current_ma);
 
 	/* set suspend bit when urrent_ma <= 2 */
 	if (current_ma <= SUSPEND_CURRENT_MA) {
