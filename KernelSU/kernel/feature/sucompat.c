@@ -1,4 +1,4 @@
-#ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
+#if defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE) || defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
 #define SUCOMPAT_HOOK_TYPE static __always_inline int
 #else
 #define SUCOMPAT_HOOK_TYPE int
@@ -78,6 +78,11 @@ static inline void ksu_sucompat_enable_branch() { } // no-op
 static inline void ksu_sucompat_disable_branch() { } // no-op
 #endif
 
+static noinline bool __ksu_is_allow_uid_copy(uid_t uid)
+{
+	return __ksu_is_allow_uid(uid);
+}
+
 static __always_inline bool is_su_allowed(const void **ptr_to_check)
 {
 #ifndef CONFIG_KSU_TAMPER_SYSCALL_TABLE
@@ -91,7 +96,8 @@ static __always_inline bool is_su_allowed(const void **ptr_to_check)
 #endif // KSU_CAN_USE_JUMP_LABEL
 #endif
 
-	if (test_thread_flag(TIF_SECCOMP))
+	// put ret hot on insn pipeline
+	if (likely(ksu_is_seccomp_enabled()))
 		return false;
 
 	// see seccomp check above
@@ -105,14 +111,18 @@ static __always_inline bool is_su_allowed(const void **ptr_to_check)
 		return false;
 	goto check_ptr;
 
-	// NOTE: shell has its seccomp disabled, so we only need to check for this thing
-	// short-circuit if not shell! as we allow apps on setuid lsm by disabling seccomp
 uid_check:
+#ifndef CONFIG_KSU_ENABLE_FULL_UID_CHECKS
+// NOTE: shell has its seccomp disabled, so we only need to check for this thing
+// short-circuit if not shell! as we allow apps on setuid lsm by disabling seccomp
 	if (likely(uid != 2000))
 		goto check_ptr;
-
-	// use internal function, not the macro
-	if (!__ksu_is_allow_uid(uid))
+#endif
+	// use our noinline copy.
+	// only shell falls through this. 
+	// nbd that it opens up a stack frame
+	// having small code around here is worth
+	if (!__ksu_is_allow_uid_copy(uid))
 		return false;
 
 check_ptr:
@@ -127,10 +137,7 @@ check_ptr:
 	return true;
 }
 
-static __always_inline void ksu_sucompat_user_common(const char __user **filename_user,
-				const char *syscall_name,
-				const bool escalate,
-				const uint8_t sym)
+static __always_inline void ksu_sucompat_user_common(const char __user **filename_user, const char *syscall_name)
 {
 	uintptr_t buf;
 	const char su[16] = SU_PATH;
@@ -138,6 +145,9 @@ static __always_inline void ksu_sucompat_user_common(const char __user **filenam
 	// sugar prep
 	uintptr_t *su_p = (uintptr_t *)su;
 	uintptr_t __user *fn_p = (uintptr_t __user *)untagged_addr(*(char **)filename_user);
+
+	// cheaper than prefaulting (fault_in_readable, fault_in_pages_readable)
+	__builtin_prefetch(fn_p);
 
 	// assert /system/bin/su\0 = 15 bytes.
 	BUILD_BUG_ON(sizeof(SU_PATH) + 1 != 16);
@@ -188,9 +198,15 @@ static __always_inline void ksu_sucompat_user_common(const char __user **filenam
 	if (unlikely(buf != su_p[0]))
 		return;
 
-	write_sulog(sym);
+	if (!__builtin_strcmp(syscall_name, "faccessat"))
+		write_sulog('a');
+	if (!__builtin_strcmp(syscall_name, "newfstatat"))
+		write_sulog('s');
+	if (!__builtin_strcmp(syscall_name, "sys_execve"))
+		write_sulog('x');
 
-	if (!escalate)
+	// escalate if execve
+	if (!!__builtin_strcmp(syscall_name, "sys_execve"))
 		goto no_escalate;
 
 #ifdef CONFIG_KSU_FEATURE_SULOG
@@ -223,7 +239,7 @@ SUCOMPAT_HOOK_TYPE ksu_handle_faccessat(int *dfd, const char __user **filename_u
 	if (!is_su_allowed((const void **)filename_user))
 		return 0;
 
-	ksu_sucompat_user_common(filename_user, "faccessat", false, 'a');
+	ksu_sucompat_user_common(filename_user, "faccessat");
 	return 0;
 }
 
@@ -233,7 +249,7 @@ SUCOMPAT_HOOK_TYPE ksu_handle_stat(int *dfd, const char __user **filename_user, 
 	if (!is_su_allowed((const void **)filename_user))
 		return 0;
 
-	ksu_sucompat_user_common(filename_user, "newfstatat", false, 's');
+	ksu_sucompat_user_common(filename_user, "newfstatat");
 	return 0;
 }
 
@@ -248,11 +264,10 @@ SUCOMPAT_HOOK_TYPE ksu_handle_execve(const char __user **filename_user, void *ar
 	if (!is_su_allowed((const void **)filename_user))
 		return 0;
 
-	ksu_sucompat_user_common(filename_user, "sys_execve", true, 'x');
+	ksu_sucompat_user_common(filename_user, "sys_execve");
 	return 0;
 }
 
-#ifndef CONFIG_KSU_TAMPER_SYSCALL_TABLE
 static __always_inline void ksu_sucompat_kernel_common(void **restrict filename_ptr, void *restrict argv, void *restrict envp, const char *function_name)
 {
 
@@ -314,7 +329,7 @@ no_ksud:
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 // take note: struct filename **filename, for do_execveat_common / do_execve_common on >= 3.14
-int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
+SUCOMPAT_HOOK_TYPE ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
 {
 	struct filename *filename = *filename_ptr;
 	if (IS_ERR(filename)) // see getname_flags
@@ -325,20 +340,19 @@ int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, voi
 }
 #else
 // take note: char **filename, for do_execve_common on < 3.14
-int ksu_legacy_execve_sucompat(const char **filename_ptr, void *argv, void *envp)
+SUCOMPAT_HOOK_TYPE ksu_legacy_execve_sucompat(const char **filename_ptr, void *argv, void *envp)
 {
 	ksu_sucompat_kernel_common((void **)filename_ptr, argv, envp, "do_execve_common");
 	return 0;
 }
 #endif
-#endif // CONFIG_KSU_TAMPER_SYSCALL_TABLE
 
 #ifdef CONFIG_KSU_TAMPER_SYSCALL_TABLE
 static void syscall_table_sucompat_enable();
 static void syscall_table_sucompat_disable();
 #else
-static inline void syscall_table_sucompat_enable() { } // no-op
-static inline void syscall_table_sucompat_disable() { } // no-op
+#define syscall_table_sucompat_enable() do { } while (0)
+#define syscall_table_sucompat_disable() do { } while (0)
 #endif
 
 static void ksu_sucompat_enable()
