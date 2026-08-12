@@ -553,6 +553,14 @@ struct smb1351_charger {
 	struct kobject		*mod_kobj;
 	bool			bypass_charging;
 	int			fixed_current_limit;
+	bool			thermal_throttle_enabled;
+	int			throttle_temp_start;
+	int			throttle_temp_max;
+	int			throttle_min_current;
+	int			throttle_icl_cap;
+	int			throttle_last_temp;
+	int			throttle_fail_count;
+	struct delayed_work	thermal_throttle_work;
 };
 
 struct smb_irq_info {
@@ -1540,6 +1548,7 @@ static int smb1351_set_usb_chg_current(struct smb1351_charger *chip,
 static int smb1351_mod_clamp_icl(struct smb1351_charger *chip, int current_ma)
 {
 	int limit = READ_ONCE(chip->fixed_current_limit);
+	int cap = READ_ONCE(chip->throttle_icl_cap);
 
 	/*
 	 * Pass deliberate suspend requests straight through, so a configured
@@ -1553,6 +1562,16 @@ static int smb1351_mod_clamp_icl(struct smb1351_charger *chip, int current_ma)
 		pr_debug("ICL request %dmA capped to fixed limit %dmA\n",
 				current_ma, limit);
 		current_ma = limit;
+	}
+
+	/*
+	 * Thermal cap second: it is derived from the fixed limit, so it is
+	 * already the tighter of the two whenever the throttle is active.
+	 */
+	if (cap > 0 && current_ma > cap) {
+		pr_debug("ICL request %dmA capped to thermal cap %dmA\n",
+				current_ma, cap);
+		current_ma = cap;
 	}
 
 	return current_ma;
@@ -1632,6 +1651,244 @@ static int smb1351_mod_get_applied_icl(struct smb1351_charger *chip)
 }
 
 /*
+ * Temperature-based charging throttle.
+ *
+ * Battery temperature is reported in decidegrees C, so 400 is 40.0 degC.
+ * Defaults derate from 40.0 degC and reach the floor at 55.0 degC, which sits
+ * below the charger's own soft/hard JEITA limits: this is a comfort/longevity
+ * throttle layered on top of the hardware protection, never a replacement for
+ * it.  THERM_MONITOR and the hot/hard limit IRQs stay exactly as configured.
+ */
+#define SMB1351_THROTTLE_POLL_MS		10000
+#define SMB1351_THROTTLE_TEMP_START_DEF		400
+#define SMB1351_THROTTLE_TEMP_MAX_DEF		550
+#define SMB1351_THROTTLE_MIN_CURRENT_DEF	500
+
+/* Bounds a threshold may be configured to, in decidegrees C. */
+#define SMB1351_THROTTLE_TEMP_FLOOR		200
+#define SMB1351_THROTTLE_TEMP_CEIL		700
+
+/*
+ * Minimum start..max separation.  A shorter span makes the ramp so steep that
+ * a degree of sensor noise swings the current by hundreds of mA, and a zero
+ * span would divide by zero outright.
+ */
+#define SMB1351_THROTTLE_SPAN_MIN		50
+
+/* Only relax the cap once the pack has actually cooled by this much. */
+#define SMB1351_THROTTLE_HYST			20
+
+/*
+ * A reading outside this window means the thermistor or the BMS is lying;
+ * acting on it would be exactly the "random value" this must never program.
+ */
+#define SMB1351_THROTTLE_TEMP_SANE_LO		(-400)
+#define SMB1351_THROTTLE_TEMP_SANE_HI		1000
+
+/* Consecutive bad readings tolerated before the throttle gives up. */
+#define SMB1351_THROTTLE_MAX_FAILS		3
+
+/*
+ * The ceiling the ramp derates *from*: the negotiated input current, further
+ * bounded by the fixed limiter when one is set.  Deriving the base from the
+ * requested values rather than from the currently applied one is what keeps
+ * the ramp from feeding back on itself and walking the current to the floor.
+ *
+ * Caller must hold mod_lock.
+ */
+static int smb1351_mod_thermal_base(struct smb1351_charger *chip)
+{
+	int base = chip->usb_psy_ma;
+	int limit = chip->fixed_current_limit;
+
+	if (limit > 0 && (base <= 0 || limit < base))
+		base = limit;
+
+	return base;
+}
+
+/*
+ * Linear derate between the two thresholds:
+ *
+ *   temp <= start       -> base   (no throttling)
+ *   start < temp < max  -> straight line from base down to floor
+ *   temp >= max         -> floor
+ *
+ * The result is clamped into [floor, base] afterwards, so no combination of
+ * configuration and rounding can hand back a value outside the range the
+ * store handlers validated.
+ *
+ * Caller must hold mod_lock.
+ */
+static int smb1351_mod_calc_thermal_cap(struct smb1351_charger *chip,
+					int temp, int base)
+{
+	int start = chip->throttle_temp_start;
+	int max = chip->throttle_temp_max;
+	int floor = chip->throttle_min_current;
+	int span, cap;
+
+	if (base <= 0)
+		return 0;
+
+	/*
+	 * Validated on store and re-checked here, because a degenerate span
+	 * reaching the division below would be a divide-by-zero in softirq
+	 * context.  Fail open: run unthrottled rather than guess.
+	 */
+	span = max - start;
+	if (span < SMB1351_THROTTLE_SPAN_MIN) {
+		pr_err("throttle: bad span (start=%d max=%d), not throttling\n",
+				start, max);
+		return base;
+	}
+
+	/* A floor above the base would *raise* the current; never allow that. */
+	if (floor > base)
+		floor = base;
+
+	if (temp <= start)
+		return base;
+	if (temp >= max)
+		return floor;
+
+	cap = base - DIV_ROUND_CLOSEST((base - floor) * (temp - start), span);
+
+	if (cap < floor)
+		cap = floor;
+	if (cap > base)
+		cap = base;
+
+	return cap;
+}
+
+/*
+ * Drop the thermal cap and re-program the input from the uncapped base.
+ * Caller must hold mod_lock.
+ */
+static void smb1351_mod_thermal_clear(struct smb1351_charger *chip)
+{
+	if (!chip->throttle_icl_cap)
+		return;
+
+	chip->throttle_icl_cap = 0;
+	chip->throttle_last_temp = 0;
+
+	if (smb1351_mod_reapply_icl(chip))
+		pr_err("throttle: couldn't restore input current\n");
+}
+
+static void smb1351_thermal_throttle_work(struct work_struct *work)
+{
+	struct smb1351_charger *chip = container_of(work,
+			struct smb1351_charger, thermal_throttle_work.work);
+	int temp, base, cap, rc;
+	bool bad_reading;
+
+	/* Toggled off while this run was queued. */
+	if (!READ_ONCE(chip->thermal_throttle_enabled))
+		return;
+
+	/* i2c is unusable until the chip has resumed; try again later. */
+	if (!chip->resume_completed)
+		goto reschedule;
+
+	/*
+	 * No input to throttle.  Stop polling entirely instead of burning a
+	 * wakeup every 10s on battery; the insertion hook restarts us.
+	 */
+	if (!chip->chg_present)
+		return;
+
+	/*
+	 * A missing BMS makes smb1351_get_prop_batt_temp() hand back the
+	 * DEFAULT_BATT_TEMP placeholder, which would read as a comfortable
+	 * 25.0 degC and silently disable throttling.  Treat it as a failed
+	 * reading, not as data.
+	 */
+	smb1351_check_bms_psy(chip);
+	bad_reading = !chip->bms_psy;
+
+	temp = smb1351_get_prop_batt_temp(chip);
+	if (!bad_reading && (temp < SMB1351_THROTTLE_TEMP_SANE_LO ||
+				temp > SMB1351_THROTTLE_TEMP_SANE_HI)) {
+		pr_err("throttle: implausible temperature %d, ignoring\n", temp);
+		bad_reading = true;
+	}
+
+	mutex_lock(&chip->mod_lock);
+
+	if (bad_reading) {
+		/*
+		 * Never derate on a bad reading.  Give the sensor a few polls,
+		 * then disable the throttle and hand the pack back to the
+		 * charger's own thermal protection rather than sit on a cap
+		 * derived from nothing -- or worse, keep guessing.
+		 */
+		if (++chip->throttle_fail_count >= SMB1351_THROTTLE_MAX_FAILS) {
+			pr_err("throttle: %d bad readings, disabling throttle\n",
+					chip->throttle_fail_count);
+			WRITE_ONCE(chip->thermal_throttle_enabled, false);
+			chip->throttle_fail_count = 0;
+			smb1351_mod_thermal_clear(chip);
+			mutex_unlock(&chip->mod_lock);
+			return;
+		}
+		mutex_unlock(&chip->mod_lock);
+		goto reschedule;
+	}
+
+	chip->throttle_fail_count = 0;
+
+	base = smb1351_mod_thermal_base(chip);
+	cap = smb1351_mod_calc_thermal_cap(chip, temp, base);
+
+	if (cap <= 0 || cap == chip->throttle_icl_cap)
+		goto out;
+
+	/*
+	 * Relaxing the cap needs the pack to have measurably cooled, so a
+	 * temperature hovering on a threshold does not re-program the charger
+	 * on every single poll.  Tightening is applied immediately.
+	 */
+	if (cap > chip->throttle_icl_cap && chip->throttle_icl_cap > 0 &&
+			temp > chip->throttle_last_temp - SMB1351_THROTTLE_HYST)
+		goto out;
+
+	pr_info("throttle: temp=%d.%d degC base=%dmA cap=%dmA\n",
+			temp / 10, abs(temp % 10), base, cap);
+
+	chip->throttle_icl_cap = cap;
+	chip->throttle_last_temp = temp;
+
+	rc = smb1351_mod_reapply_icl(chip);
+	if (rc)
+		pr_err("throttle: couldn't apply cap %dmA rc=%d\n", cap, rc);
+
+out:
+	mutex_unlock(&chip->mod_lock);
+
+reschedule:
+	if (READ_ONCE(chip->thermal_throttle_enabled))
+		schedule_delayed_work(&chip->thermal_throttle_work,
+				msecs_to_jiffies(SMB1351_THROTTLE_POLL_MS));
+}
+
+/*
+ * Charger plugged in.  Restart the poll loop that the removal path stopped.
+ * Runs from the APSD handler with irq_complete held; mod_lock is the inner
+ * lock, so taking it here keeps the established order.
+ */
+static void smb1351_mod_charger_inserted(struct smb1351_charger *chip)
+{
+	if (!READ_ONCE(chip->thermal_throttle_enabled))
+		return;
+
+	/* Evaluate against the freshly negotiated current straight away. */
+	mod_delayed_work(system_wq, &chip->thermal_throttle_work, 0);
+}
+
+/*
  * "Bypass charging": run the system from USBIN while the battery charge FET
  * stays off, so the pack is neither charged nor discharged.
  *
@@ -1705,7 +1962,26 @@ static void smb1351_mod_charger_removed(struct smb1351_charger *chip)
 		chip->bypass_charging = false;
 	}
 
+	/*
+	 * Drop the thermal cap so the next insertion starts from the newly
+	 * negotiated current rather than from a stale derate, and reset the
+	 * failure counter so a cable swap gets a fresh set of retries.
+	 * The cap is cleared directly: with no charger present there is
+	 * nothing to re-program.
+	 */
+	chip->throttle_icl_cap = 0;
+	chip->throttle_last_temp = 0;
+	chip->throttle_fail_count = 0;
+
 	mutex_unlock(&chip->mod_lock);
+
+	/*
+	 * Stop the poll loop.  Asynchronous cancel on purpose: the worker
+	 * takes mod_lock, so waiting for it while holding that lock would
+	 * deadlock.  The worker also re-checks chg_present, so a run already
+	 * in flight is harmless.
+	 */
+	cancel_delayed_work(&chip->thermal_throttle_work);
 }
 
 static ssize_t bypass_charging_show(struct kobject *kobj,
@@ -1829,10 +2105,301 @@ static ssize_t applied_current_limit_show(struct kobject *kobj,
 static struct kobj_attribute applied_current_limit_attr =
 	__ATTR(applied_current_limit, 0444, applied_current_limit_show, NULL);
 
+/*
+ * Validate a whole candidate configuration rather than one field in
+ * isolation, so the thresholds can never be left in a combination the ramp
+ * would have to guess its way out of.  Callers build the candidate from the
+ * live values plus the one field being changed.
+ */
+static int smb1351_mod_validate_throttle_cfg(int start, int max, int floor)
+{
+	if (start < SMB1351_THROTTLE_TEMP_FLOOR ||
+			start > SMB1351_THROTTLE_TEMP_CEIL)
+		return -EINVAL;
+
+	if (max < SMB1351_THROTTLE_TEMP_FLOOR ||
+			max > SMB1351_THROTTLE_TEMP_CEIL)
+		return -EINVAL;
+
+	if (max - start < SMB1351_THROTTLE_SPAN_MIN)
+		return -EINVAL;
+
+	if (floor < SMB1351_MOD_ICL_MIN_MA || floor > SMB1351_MOD_ICL_MAX_MA)
+		return -EINVAL;
+
+	return 0;
+}
+
+static ssize_t thermal_throttle_enabled_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", chip->thermal_throttle_enabled ? 1 : 0);
+}
+
+static ssize_t thermal_throttle_enabled_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	bool enable;
+	int rc;
+
+	if (!chip)
+		return -ENODEV;
+
+	rc = kstrtobool(buf, &enable);
+	if (rc)
+		return rc;
+
+	mutex_lock(&chip->mod_lock);
+
+	if (chip->thermal_throttle_enabled == enable) {
+		mutex_unlock(&chip->mod_lock);
+		return count;
+	}
+
+	if (enable) {
+		/*
+		 * Re-check the thresholds at arming time, so the throttle can
+		 * never start running against a configuration that would make
+		 * the ramp degenerate.
+		 */
+		rc = smb1351_mod_validate_throttle_cfg(chip->throttle_temp_start,
+				chip->throttle_temp_max,
+				chip->throttle_min_current);
+		if (rc) {
+			mutex_unlock(&chip->mod_lock);
+			pr_err("throttle: refusing to enable, bad config (start=%d max=%d floor=%d)\n",
+					chip->throttle_temp_start,
+					chip->throttle_temp_max,
+					chip->throttle_min_current);
+			return rc;
+		}
+
+		chip->throttle_fail_count = 0;
+		WRITE_ONCE(chip->thermal_throttle_enabled, true);
+	} else {
+		WRITE_ONCE(chip->thermal_throttle_enabled, false);
+		/* Give the input current back before letting go of the lock. */
+		smb1351_mod_thermal_clear(chip);
+	}
+
+	mutex_unlock(&chip->mod_lock);
+
+	/*
+	 * Queue outside the lock: the worker takes mod_lock, so cancelling
+	 * synchronously from under it would deadlock.
+	 */
+	if (enable)
+		mod_delayed_work(system_wq, &chip->thermal_throttle_work, 0);
+	else
+		cancel_delayed_work(&chip->thermal_throttle_work);
+
+	pr_info("thermal charging throttle %s\n",
+			enable ? "enabled" : "disabled");
+
+	return count;
+}
+
+static struct kobj_attribute thermal_throttle_enabled_attr =
+	__ATTR(thermal_throttle_enabled, 0644, thermal_throttle_enabled_show,
+			thermal_throttle_enabled_store);
+
+static ssize_t thermal_throttle_temp_start_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", chip->throttle_temp_start);
+}
+
+static ssize_t thermal_throttle_temp_start_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	int val, rc;
+
+	if (!chip)
+		return -ENODEV;
+
+	rc = kstrtoint(buf, 0, &val);
+	if (rc)
+		return rc;
+
+	mutex_lock(&chip->mod_lock);
+	rc = smb1351_mod_validate_throttle_cfg(val, chip->throttle_temp_max,
+			chip->throttle_min_current);
+	if (rc) {
+		mutex_unlock(&chip->mod_lock);
+		pr_err("throttle: start=%d rejected (allowed %d-%d, and at least %d below max=%d)\n",
+				val, SMB1351_THROTTLE_TEMP_FLOOR,
+				SMB1351_THROTTLE_TEMP_CEIL,
+				SMB1351_THROTTLE_SPAN_MIN,
+				chip->throttle_temp_max);
+		return rc;
+	}
+	chip->throttle_temp_start = val;
+	mutex_unlock(&chip->mod_lock);
+
+	if (READ_ONCE(chip->thermal_throttle_enabled))
+		mod_delayed_work(system_wq, &chip->thermal_throttle_work, 0);
+
+	return count;
+}
+
+static struct kobj_attribute thermal_throttle_temp_start_attr =
+	__ATTR(thermal_throttle_temp_start, 0644,
+			thermal_throttle_temp_start_show,
+			thermal_throttle_temp_start_store);
+
+static ssize_t thermal_throttle_temp_max_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", chip->throttle_temp_max);
+}
+
+static ssize_t thermal_throttle_temp_max_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	int val, rc;
+
+	if (!chip)
+		return -ENODEV;
+
+	rc = kstrtoint(buf, 0, &val);
+	if (rc)
+		return rc;
+
+	mutex_lock(&chip->mod_lock);
+	rc = smb1351_mod_validate_throttle_cfg(chip->throttle_temp_start, val,
+			chip->throttle_min_current);
+	if (rc) {
+		mutex_unlock(&chip->mod_lock);
+		pr_err("throttle: max=%d rejected (allowed %d-%d, and at least %d above start=%d)\n",
+				val, SMB1351_THROTTLE_TEMP_FLOOR,
+				SMB1351_THROTTLE_TEMP_CEIL,
+				SMB1351_THROTTLE_SPAN_MIN,
+				chip->throttle_temp_start);
+		return rc;
+	}
+	chip->throttle_temp_max = val;
+	mutex_unlock(&chip->mod_lock);
+
+	if (READ_ONCE(chip->thermal_throttle_enabled))
+		mod_delayed_work(system_wq, &chip->thermal_throttle_work, 0);
+
+	return count;
+}
+
+static struct kobj_attribute thermal_throttle_temp_max_attr =
+	__ATTR(thermal_throttle_temp_max, 0644,
+			thermal_throttle_temp_max_show,
+			thermal_throttle_temp_max_store);
+
+static ssize_t thermal_throttle_min_current_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%d\n", chip->throttle_min_current);
+}
+
+static ssize_t thermal_throttle_min_current_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	int val, rc;
+
+	if (!chip)
+		return -ENODEV;
+
+	rc = kstrtoint(buf, 0, &val);
+	if (rc)
+		return rc;
+
+	mutex_lock(&chip->mod_lock);
+	rc = smb1351_mod_validate_throttle_cfg(chip->throttle_temp_start,
+			chip->throttle_temp_max, val);
+	if (rc) {
+		mutex_unlock(&chip->mod_lock);
+		pr_err("throttle: floor=%dmA rejected (allowed %d-%d)\n",
+				val, SMB1351_MOD_ICL_MIN_MA,
+				SMB1351_MOD_ICL_MAX_MA);
+		return rc;
+	}
+	chip->throttle_min_current = val;
+	mutex_unlock(&chip->mod_lock);
+
+	if (READ_ONCE(chip->thermal_throttle_enabled))
+		mod_delayed_work(system_wq, &chip->thermal_throttle_work, 0);
+
+	return count;
+}
+
+static struct kobj_attribute thermal_throttle_min_current_attr =
+	__ATTR(thermal_throttle_min_current, 0644,
+			thermal_throttle_min_current_show,
+			thermal_throttle_min_current_store);
+
+/*
+ * Everything the ramp is currently deciding from, so a derate can be
+ * explained without instrumenting the driver.  cap=0 means no derate active.
+ */
+static ssize_t thermal_throttle_state_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct smb1351_charger *chip = smb1351_mod_get_chip();
+	int base, cap, last_temp, fails;
+	bool enabled;
+
+	if (!chip)
+		return -ENODEV;
+
+	mutex_lock(&chip->mod_lock);
+	enabled = chip->thermal_throttle_enabled;
+	base = smb1351_mod_thermal_base(chip);
+	cap = chip->throttle_icl_cap;
+	last_temp = chip->throttle_last_temp;
+	fails = chip->throttle_fail_count;
+	mutex_unlock(&chip->mod_lock);
+
+	return sysfs_emit(buf,
+			"enabled=%d temp=%d base=%d cap=%d bad_readings=%d\n",
+			enabled ? 1 : 0, last_temp, base, cap, fails);
+}
+
+static struct kobj_attribute thermal_throttle_state_attr =
+	__ATTR(thermal_throttle_state, 0444, thermal_throttle_state_show, NULL);
+
 static struct attribute *smb1351_mod_attrs[] = {
 	&bypass_charging_attr.attr,
 	&fixed_current_limit_attr.attr,
 	&applied_current_limit_attr.attr,
+	&thermal_throttle_enabled_attr.attr,
+	&thermal_throttle_temp_start_attr.attr,
+	&thermal_throttle_temp_max_attr.attr,
+	&thermal_throttle_min_current_attr.attr,
+	&thermal_throttle_state_attr.attr,
 	NULL,
 };
 
@@ -2727,6 +3294,9 @@ static int smb1351_apsd_complete_handler(struct smb1351_charger *chip,
 		if (rc < 0)
 			pr_err("Failed to set USB current rc=%d\n", rc);
 
+		/* Re-arm the thermal poll against the negotiated current. */
+		smb1351_mod_charger_inserted(chip);
+
 	} else if (!chip->apsd_rerun) {
 		/* Handle Charger removal */
 		chip->chg_present = 0;
@@ -3568,6 +4138,16 @@ static int smb1351_main_charger_probe(struct i2c_client *client,
 	chip->dev = &client->dev;
 	chip->fake_battery_soc = -EINVAL;
 
+	/*
+	 * Throttle defaults: derate from 40.0 degC, floor at 55.0 degC.  Both
+	 * sit below the charger's own soft/hard JEITA trip points, so this
+	 * layers on top of the hardware protection instead of replacing it.
+	 * Disabled until userspace asks for it.
+	 */
+	chip->throttle_temp_start = SMB1351_THROTTLE_TEMP_START_DEF;
+	chip->throttle_temp_max = SMB1351_THROTTLE_TEMP_MAX_DEF;
+	chip->throttle_min_current = SMB1351_THROTTLE_MIN_CURRENT_DEF;
+
 	chip->extcon = devm_extcon_dev_allocate(chip->dev,
 					smb1351_extcon_cable);
 	if (IS_ERR(chip->extcon)) {
@@ -3635,6 +4215,8 @@ static int smb1351_main_charger_probe(struct i2c_client *client,
 
 	INIT_DELAYED_WORK(&chip->chg_remove_work, smb1351_chg_remove_work);
 	INIT_DELAYED_WORK(&chip->hvdcp_det_work, smb1351_hvdcp_det_work);
+	INIT_DELAYED_WORK(&chip->thermal_throttle_work,
+					smb1351_thermal_throttle_work);
 	device_init_wakeup(chip->dev, true);
 	/* probe the device to check if its actually connected */
 	rc = smb1351_read_reg(chip, CHG_REVISION_REG, &reg);
@@ -3836,16 +4418,28 @@ static int smb1351_charger_remove(struct i2c_client *client)
 	struct smb1351_charger *chip = i2c_get_clientdata(client);
 
 	/*
-	 * Tear the nodes down first, then clear chip_host, so no handler can
-	 * still be looking at this chip once it is freed.
+	 * Main-charger only: the parallel slave never registers these, and
+	 * mod_lock is not initialised on that path.
 	 */
-	smb1351_mod_sysfs_exit(chip);
-	if (READ_ONCE(chip_host) == chip)
-		WRITE_ONCE(chip_host, NULL);
+	if (!chip->parallel_charger) {
+		/*
+		 * Tear the nodes down first, then clear chip_host, so no
+		 * handler can still be looking at this chip once it is freed.
+		 */
+		smb1351_mod_sysfs_exit(chip);
+		if (READ_ONCE(chip_host) == chip)
+			WRITE_ONCE(chip_host, NULL);
+
+		/*
+		 * Safe to wait here: the nodes are gone, so nothing can be
+		 * holding mod_lock against the worker any more.
+		 */
+		cancel_delayed_work_sync(&chip->thermal_throttle_work);
+		mutex_destroy(&chip->mod_lock);
+	}
 
 	cancel_delayed_work_sync(&chip->chg_remove_work);
 
-	mutex_destroy(&chip->mod_lock);
 	mutex_destroy(&chip->irq_complete);
 	debugfs_remove_recursive(chip->debug_root);
 	return 0;
