@@ -1711,6 +1711,9 @@ static struct ctl_table kern_table[] = {
 	{ }
 };
 
+int vm_kcompressd = 24;
+static int SYSCTL_KCOMPRESS_FIFO_SIZE = KCOMPRESS_FIFO_SIZE;
+
 static struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
@@ -1889,6 +1892,15 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= hugetlb_overcommit_handler,
 	},
 #endif
+	{
+		.procname	= "kcompressd",
+		.data		= &vm_kcompressd,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &SYSCTL_KCOMPRESS_FIFO_SIZE,
+	},
 	{
 		.procname	= "lowmem_reserve_ratio",
 		.data		= &sysctl_lowmem_reserve_ratio,
