@@ -204,12 +204,14 @@
 
 /*
  * Let the machine's own wakeup latency widen the two bands the classifier
- * compares against, once a second and by at most a tenth of the way to the
- * target per step. Loading a system does not make its interactive tasks less
- * interactive, but it does stretch the run they get between sleeps, so bands
- * fixed at their base values classify more and more of them as CPU-bound
- * exactly when that costs the most. Widening the bands keeps them where they
- * were meant to sit relative to how the machine is actually behaving.
+ * compares against, once a second and by at most a tenth of full scale per
+ * step, which is a fifth of the widening ever permitted, so the bands travel
+ * over several seconds rather than in one jump. Loading a system does not make
+ * its interactive tasks less interactive, but it does stretch the run they get
+ * between sleeps, so bands fixed at their base values classify more and more of
+ * them as CPU-bound exactly when that costs the most. Widening the bands keeps
+ * them where they were meant to sit relative to how the machine is actually
+ * behaving.
  *
  * Turning this off leaves the bands at their base values for good, and leaves
  * the latency gauge running, so /proc/sched_eevdf_mlfq_stats still reports what
