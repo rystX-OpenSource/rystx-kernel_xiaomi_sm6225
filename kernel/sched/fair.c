@@ -25,7 +25,7 @@
 
 #include <trace/events/sched.h>
 
-#include "mlfq_sched.h"
+#include "mlfq.h"
 
 #ifdef CONFIG_SMP
 static inline bool task_fits_max(struct task_struct *p, int cpu);	
@@ -1191,7 +1191,7 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
  *
  * With sched_feat(MLFQ) a task's request comes from the queue its
  * classification put it in, so an interactive task asks for less and a
- * CPU-bound one asks for more; see kernel/sched/mlfq_sched.h. Group entities
+ * CPU-bound one asks for more; see kernel/sched/mlfq.h. Group entities
  * keep taking the base slice here, because their request is overwritten with
  * the min_slice of the entities below them in enqueue_task_fair() anyway.
  *

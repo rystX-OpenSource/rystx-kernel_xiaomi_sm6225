@@ -30,9 +30,22 @@
  *
  * Everything below the classifier is unchanged EEVDF: placement, lag,
  * the tree, throttling, group scheduling and load balancing.
+ *
+ * The port is split to mirror the upstream sources, so a change made
+ * upstream lands in the file here that corresponds to it:
+ *
+ *	mlfq.h		 <- src/bpf/intf.h	 constants, state, the math
+ *	mlfq_classify.c	 <- src/bpf/classify.bpf.c
+ *					 the classification state machines
+ *	mlfq_adapt.c	 <- src/bpf/main.bpf.c	 system gauges, band tuning
+ *	mlfq_stats.c	 <- src/stats.rs, src/webui.rs, ui/index.html
+ *					 the /proc dashboard
+ *
+ * The hooks themselves stay in fair.c, because they have to sit inside the
+ * EEVDF paths they observe; each is a single call whose policy lives here.
  */
-#ifndef _KERNEL_SCHED_MLFQ_SCHED_H
-#define _KERNEL_SCHED_MLFQ_SCHED_H
+#ifndef _KERNEL_SCHED_MLFQ_H
+#define _KERNEL_SCHED_MLFQ_H
 
 #include <linux/limits.h>
 #include <linux/math64.h>
@@ -379,10 +392,10 @@ static inline void mlfq_reset_classification(struct mlfq_ctx *ctx)
 }
 
 /*
- * Classification entry points, out of line in kernel/sched/mlfq_sched.c.
+ * Classification entry points, out of line in kernel/sched/mlfq_classify.c.
  * @now is the rq clock the caller already holds.
  */
 void mlfq_classify_enqueue(struct task_struct *p, u64 now, bool wakeup);
 void mlfq_classify_runout(struct task_struct *p, u64 now);
 
-#endif /* _KERNEL_SCHED_MLFQ_SCHED_H */
+#endif /* _KERNEL_SCHED_MLFQ_H */

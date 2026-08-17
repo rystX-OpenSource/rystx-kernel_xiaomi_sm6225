@@ -5,7 +5,7 @@
  * Ported from scx_mlfq, a sched_ext scheduler by galpt:
  *   https://github.com/galpt/scx_mlfq
  *
- * The gauge in mlfq_sched.h is a continuous measure of how interactive a task
+ * The gauge in mlfq.h is a continuous measure of how interactive a task
  * is; this file maps it onto the three queues. A level change requires
  * crossing a band rather than a threshold, so the two entry points here drive
  * the consecutive-event counters that implement the hysteresis, and the
@@ -22,7 +22,7 @@
  * states scx_mlfq classified in, and no other path changes a task's level.
  */
 #include "sched.h"
-#include "mlfq_sched.h"
+#include "mlfq.h"
 
 /*
  * A task asking for a minimum utilization is telling the scheduler it is

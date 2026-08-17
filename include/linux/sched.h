@@ -750,7 +750,7 @@ struct wake_q_node {
  * interactive, Q2 the ones the classifier cannot place yet, and Q3 the
  * CPU-bound ones. A lower level means a shorter EEVDF request, hence an
  * earlier virtual deadline and lower wakeup latency; see
- * kernel/sched/mlfq_sched.h for the request sizes and the classifier.
+ * kernel/sched/mlfq.h for the request sizes and the classifier.
  */
 #define MLFQ_Q_INTERACTIVE	1
 #define MLFQ_Q_DEFAULT		2
@@ -774,7 +774,7 @@ struct wake_q_node {
  * @wake_cnt:		consecutive short sleeps at the current level.
  *
  * The gauge and the counters together decide the queue, and the queue in turn
- * selects the EEVDF request size for the task. See kernel/sched/mlfq_sched.h.
+ * selects the EEVDF request size for the task. See kernel/sched/mlfq.h.
  */
 struct mlfq_ctx {
 	u64		ema;

@@ -198,6 +198,6 @@
  * share each task receives still follows its weight, and eligibility still
  * bounds how long any of them waits.
  *
- * See kernel/sched/mlfq_sched.h.
+ * See kernel/sched/mlfq.h.
  */
 #define SCHED_FEAT_MLFQ 1
