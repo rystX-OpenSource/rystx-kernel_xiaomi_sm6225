@@ -1247,6 +1247,63 @@ static inline void mlfq_account_running(struct cfs_rq *cfs_rq,
 }
 
 /*
+ * Wakeup preemption, from the tail of place_entity().
+ *
+ * scx_mlfq decides this in ops.enqueue(), where it looks at the task running on
+ * the CPU the wakeup is heading for and, if the wakeup is owed the CPU, gives
+ * it a short slice grant and asks sched_ext to preempt. The fair class has no
+ * equivalent of that grant: what a task is given is a request, and the request
+ * is what the virtual deadline is derived from, so here the two are the same
+ * act. Capping the request to the burst puts the wakeup's deadline ahead of the
+ * running task's, which is what makes the pick prefer it, and bounds the run it
+ * gets once it has the CPU, which is what made the grant a burst.
+ *
+ * That leaves the preemption itself to the machinery already in
+ * check_preempt_wakeup(), which is reached right after the enqueue this is part
+ * of: a request shorter than the running task's is exactly what
+ * sched_feat(PREEMPT_SHORT) reschedules for. So the decision is made here,
+ * once, on the only path where the request may still be changed, and nothing is
+ * ever preempted on a rule other than EEVDF's own.
+ *
+ * The comparison is only made against a running task in the same cfs_rq. Two
+ * entities in different groups have no common virtual time to compare deadlines
+ * in, which is why the tree does not compare them either; when they differ the
+ * wakeup keeps its level's request and takes its chances in the tree, as it
+ * would have without any of this.
+ */
+static void mlfq_preempt_burst(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+
+	if (!sched_feat(MLFQ) || se->custom_slice || !entity_is_task(se))
+		return;
+
+	/*
+	 * Only a wakeup. A task placed by load balancing or by a requeue is not
+	 * arriving with work to do that something else is waiting on, and one
+	 * placed as cfs_rq->curr is not arriving at all.
+	 */
+	if (!mlfq_wakeup_pending(&task_of(se)->mlfq))
+		return;
+
+	if (!curr || curr == se || !curr->on_rq || !entity_is_task(curr))
+		return;
+
+	if (!mlfq_preempt_owed(task_of(se), task_of(curr),
+			       entity_before(se, curr)))
+		return;
+
+	/*
+	 * se->deadline is recomputed rather than adjusted because this runs
+	 * before __enqueue_entity(), so neither the tree's ordering nor the
+	 * min_slice and max_slice it carries have observed either field yet.
+	 */
+	se->slice = min_t(u64, se->slice, MLFQ_PREEMPT_SLICE_NS);
+	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
+	mlfq_stat_inc(MLFQ_STAT_PREEMPTION_KICKS);
+}
+
+/*
  * XXX: strictly: vd_i += N*r_i/w_i such that: vd_i > ve_i
  * this is probably good enough.
  */
@@ -5103,6 +5160,8 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * EEVDF: vd_i = ve_i + r_i/w_i
 	 */
 	se->deadline = se->vruntime + vslice;
+
+	mlfq_preempt_burst(cfs_rq, se);
 }
 
 static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
@@ -8722,13 +8781,12 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	 * If @p has a shorter slice than current and @p is eligible, override
 	 * current's slice protection in order to allow preemption.
 	 *
-	 * Under sched_feat(MLFQ) this is also the cross-queue wakeup
-	 * preemption of scx_mlfq, which let a wakeup displace the running task
-	 * when it belonged to a higher queue and never when it belonged to the
-	 * same one: a lower queue is precisely a shorter request, so the
-	 * strict comparison here says the same thing. The wakee's request has
-	 * already been sized from its new queue, by the place_entity() reached
-	 * from the enqueue that preceded this.
+	 * Under sched_feat(MLFQ) this is the door every wakeup preemption of
+	 * scx_mlfq comes through. Which wakeups are owed one is decided at
+	 * placement, by mlfq_preempt_burst(), and expressed by capping the
+	 * wakeup's request to the burst: that is shorter than the request of
+	 * whatever is running, so the comparison here holds, and it is the
+	 * earlier virtual deadline, so the pick below returns @p.
 	 */
 	if (sched_feat(PREEMPT_SHORT) && (pse->slice < se->slice)) {
 		preempt_action = PREEMPT_WAKEUP_SHORT;

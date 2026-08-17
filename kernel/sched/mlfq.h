@@ -126,6 +126,22 @@
 #define MLFQ_DEMOTE_REENQS		8
 
 /*
+ * The request a wakeup gets when it is owed a preemption, in place of the
+ * request its level would have given it. It is a bounded burst: the wakeup
+ * displaces what is running, does the small piece of work it woke up to do,
+ * and hands the CPU back at the end of the burst rather than holding it for a
+ * full level's request. Its level's request governs the continuation, from
+ * the next request that update_deadline() issues.
+ *
+ * scx_mlfq also rate limits the same-level case behind a minimum run of the
+ * task being displaced, MLFQ_SAMEQ_PREEMPT_MIN_RUN_NS. That is not carried
+ * over: upstream fixes it at zero and never derives anything else from it, so
+ * the guard cannot block a preemption there, and a constant zero here would
+ * only add a comparison that no value can fail. See mlfq_preempt_owed().
+ */
+#define MLFQ_PREEMPT_SLICE_NS		150000ULL
+
+/*
  * The classification thresholds above are the *base* edges. What the
  * classifier actually compares against is an effective edge that a slow
  * controller widens when the machine's wakeup latency runs above target; see
@@ -699,6 +715,59 @@ static inline bool mlfq_demote_on_runout(struct mlfq_ctx *ctx, u64 t_h)
 	ctx->reenq_cnt = 0;
 
 	return true;
+}
+
+/**
+ * mlfq_wakeup_pending - is this enqueue the one a wakeup arrived on
+ * @ctx: the task's classification state
+ *
+ * The marker scx_mlfq keeps as MLFQ_TF_ENQ_WAKEUP, which it sets in
+ * ops.enqueue() when sched_ext hands it a wakeup and clears once the task
+ * reaches a CPU. Here the timestamp doubles as the mark, so this is one read of
+ * the field mlfq_wakeup_episode_begin() stamped.
+ *
+ * It is asked rather than the caller's enqueue flags because the flags do not
+ * survive every path into placement: requeue_delayed_entity() places a task
+ * that woke up, with no flags at all. The mark is set once per wakeup, on the
+ * way in, so it is true wherever that wakeup ends up being placed.
+ */
+static inline bool mlfq_wakeup_pending(const struct mlfq_ctx *ctx)
+{
+	return ctx->wake_enq_at != 0;
+}
+
+/**
+ * mlfq_preempt_owed - may this wakeup displace what is running
+ * @p: the waking task
+ * @running: the task it would displace
+ * @earlier: @p's virtual deadline is ahead of @running's
+ *
+ * scx_mlfq asks this in ops.enqueue(), of the task running on the CPU the
+ * wakeup is heading for, and answers it in two parts.
+ *
+ * A wakeup from a lower-numbered level preempts unconditionally. That is the
+ * whole point of the levels: a queue that is drained first is one whose tasks
+ * do not wait behind a task from a queue that is drained later.
+ *
+ * Within one level there is no such ordering to appeal to, so the levels
+ * defer to virtual time, and the answer is the one a dispatch pass over the
+ * level would have given: the wakeup preempts when its deadline is the earlier
+ * of the two. The interactive level is the exception, and preempts a peer
+ * unconditionally -- everything there has been classified as doing short pieces
+ * of work between sleeps, so whichever of them runs next will hand the CPU back
+ * shortly either way, and taking the wakeup first is what the level exists for.
+ *
+ * A wakeup from a higher-numbered level never preempts.
+ *
+ * Returns %true if the preemption is owed.
+ */
+static inline bool mlfq_preempt_owed(struct task_struct *p,
+				     struct task_struct *running, bool earlier)
+{
+	if (p->mlfq.queue != running->mlfq.queue)
+		return p->mlfq.queue < running->mlfq.queue;
+
+	return p->mlfq.queue == MLFQ_Q_INTERACTIVE || earlier;
 }
 
 /**
