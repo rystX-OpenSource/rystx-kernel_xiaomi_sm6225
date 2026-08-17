@@ -90,6 +90,7 @@ static void mlfq_age_stay(struct mlfq_ctx *ctx, u64 now)
 	ctx->queue = MLFQ_Q_INTERACTIVE;
 	ctx->queued_at = 0;
 	ctx->reenq_cnt = 0;
+	mlfq_stat_inc(MLFQ_STAT_AGING_BOOSTS);
 }
 
 /*
@@ -123,9 +124,11 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 	    mlfq_boost_pending(ctx, sleep_ns, p->in_iowait, now)) {
 		ctx->queue = MLFQ_Q_INTERACTIVE;
 		ctx->last_boost_at = now;
+		mlfq_stat_inc(MLFQ_STAT_SHORT_SLEEP_BOOSTS);
 	}
 
-	mlfq_promote_on_wakeup(ctx, sleep_ns);
+	if (mlfq_promote_on_wakeup(ctx, sleep_ns))
+		mlfq_stat_inc(MLFQ_STAT_PROMOTIONS);
 
 	/*
 	 * A sleep this long has decayed the gauge to near nothing, so whatever
@@ -135,8 +138,10 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 	 */
 	if (sleep_ns > MLFQ_LONG_SLEEP_NS) {
 		base_queue = mlfq_queue_from_ema(ctx->ema);
-		if (base_queue < ctx->queue)
+		if (base_queue < ctx->queue) {
 			ctx->queue = base_queue;
+			mlfq_stat_inc(MLFQ_STAT_PROMOTIONS);
+		}
 	}
 }
 
@@ -221,8 +226,8 @@ void mlfq_classify_runout(struct task_struct *p, u64 now)
 
 	ctx->wake_cnt = 0;
 
-	if (!mlfq_demotion_blocked(p))
-		mlfq_demote_on_runout(ctx);
+	if (!mlfq_demotion_blocked(p) && mlfq_demote_on_runout(ctx))
+		mlfq_stat_inc(MLFQ_STAT_DEMOTIONS);
 
 	if (mlfq_apply_idle_policy(p, ctx)) {
 		ctx->queued_at = 0;

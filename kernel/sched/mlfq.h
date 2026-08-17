@@ -37,7 +37,7 @@
  *	mlfq.h		 <- src/bpf/intf.h	 constants, state, the math
  *	mlfq_classify.c	 <- src/bpf/classify.bpf.c
  *					 the classification state machines
- *	mlfq_adapt.c	 <- src/bpf/main.bpf.c	 system gauges, band tuning
+ *	mlfq_adapt.c	 <- src/bpf/main.bpf.c	 system-wide state and gauges
  *	mlfq_stats.c	 <- src/stats.rs, src/webui.rs, ui/index.html
  *					 the /proc dashboard
  *
@@ -49,6 +49,7 @@
 
 #include <linux/limits.h>
 #include <linux/math64.h>
+#include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/types.h>
 
@@ -379,6 +380,10 @@ static inline bool mlfq_demote_on_runout(struct mlfq_ctx *ctx)
  *
  * A task with no history lands in the default queue with an empty gauge, so
  * its first few stretches of running time decide where it belongs.
+ *
+ * @last_qid is deliberately not touched: it is not classification state but a
+ * record of a decrement still owed to a runqueue counter, and one caller,
+ * switched_to_fair(), can run with the task already queued and counted.
  */
 static inline void mlfq_reset_classification(struct mlfq_ctx *ctx)
 {
@@ -397,5 +402,128 @@ static inline void mlfq_reset_classification(struct mlfq_ctx *ctx)
  */
 void mlfq_classify_enqueue(struct task_struct *p, u64 now, bool wakeup);
 void mlfq_classify_runout(struct task_struct *p, u64 now);
+
+/**
+ * enum mlfq_stat_item - the events the classifier counts
+ *
+ * The port of scx_mlfq's struct mlfq_stats, restricted to the events that
+ * exist here. The counters scx_mlfq keeps for its dispatch queues, its BPF
+ * enqueue early-returns, its callback latency histogram and its realtime
+ * takeover hook have no counterpart in the fair class and are not carried
+ * over; kernel/sched/mlfq_stats.c says so where a reader would look for them.
+ */
+enum mlfq_stat_item {
+	MLFQ_STAT_ON_CPU,		/* tasks given a CPU */
+	MLFQ_STAT_TOTAL_RUNTIME,	/* nanoseconds of service, summed */
+	MLFQ_STAT_Q1_PLACEMENTS,
+	MLFQ_STAT_Q2_PLACEMENTS,
+	MLFQ_STAT_Q3_PLACEMENTS,
+	MLFQ_STAT_PROMOTIONS,
+	MLFQ_STAT_DEMOTIONS,
+	MLFQ_STAT_AGING_BOOSTS,
+	MLFQ_STAT_SHORT_SLEEP_BOOSTS,
+	MLFQ_STAT_PREEMPTION_KICKS,
+	MLFQ_NR_STATS,
+};
+
+/**
+ * struct mlfq_pcpu - per-CPU classifier state
+ * @stat:	counters, summed over CPUs by the reader. Accumulated on the
+ *		CPU that runs the event, so no counter is ever a shared line.
+ * @q_runnable:	tasks of each level currently queued on this CPU's runqueue,
+ *		indexed by level, so slot 0 is unused. Written only under this
+ *		runqueue's lock, by the enqueue and dequeue hooks.
+ *
+ * scx_mlfq keeps the same split: one per-CPU array for the counters, and its
+ * runnable occupancy derived from per-task ownership records rather than from
+ * a shared total.
+ */
+struct mlfq_pcpu {
+	u64	stat[MLFQ_NR_STATS];
+	u32	q_runnable[MLFQ_NR_QUEUES + 1];
+};
+
+DECLARE_PER_CPU(struct mlfq_pcpu, mlfq_pcpu);
+
+/*
+ * Both of these are called from the scheduling paths with a runqueue lock
+ * held, so preemption is already off and the cheaper form is the correct one.
+ * The count lands on the CPU that ran the event, which is not necessarily the
+ * CPU whose runqueue the event was about; that only matters to a reader, and
+ * the reader sums over every CPU.
+ */
+static inline void mlfq_stat_add(enum mlfq_stat_item item, u64 val)
+{
+	__this_cpu_add(mlfq_pcpu.stat[item], val);
+}
+
+static inline void mlfq_stat_inc(enum mlfq_stat_item item)
+{
+	mlfq_stat_add(item, 1);
+}
+
+/* Placement counter for a level, in the order of enum mlfq_stat_item. */
+static inline enum mlfq_stat_item mlfq_placement_stat(u8 queue)
+{
+	if (queue == MLFQ_Q_INTERACTIVE)
+		return MLFQ_STAT_Q1_PLACEMENTS;
+	if (queue == MLFQ_Q_BATCH)
+		return MLFQ_STAT_Q3_PLACEMENTS;
+
+	return MLFQ_STAT_Q2_PLACEMENTS;
+}
+
+/**
+ * mlfq_runnable_enter - count a task into its level on a runqueue
+ * @cpu: the runqueue the task is being queued on
+ * @ctx: the task's classification state, already reclassified
+ *
+ * Records which level was counted in @ctx->last_qid, so the matching exit
+ * decrements the same slot even if the task is reclassified while it waits.
+ * That makes the occupancy the level the task was *placed* at, which is what
+ * scx_mlfq's runnable gauges report and what the request sizes were chosen
+ * from. A task can only be dequeued from the runqueue it was queued on, so
+ * the paired exit always runs on this same @cpu.
+ *
+ * Also the placement counter: one placement per enqueue, at the level the
+ * classifier just picked.
+ */
+static inline void mlfq_runnable_enter(int cpu, struct mlfq_ctx *ctx)
+{
+	struct mlfq_pcpu *pc = &per_cpu(mlfq_pcpu, cpu);
+	u8 queue = ctx->queue;
+
+	if (!queue || queue > MLFQ_NR_QUEUES)
+		return;
+
+	mlfq_stat_inc(mlfq_placement_stat(queue));
+
+	/* Already counted: a hook was missed, so do not double count. */
+	if (ctx->last_qid)
+		return;
+
+	pc->q_runnable[queue]++;
+	ctx->last_qid = queue;
+}
+
+/**
+ * mlfq_runnable_exit - take a task back out of its level on a runqueue
+ * @cpu: the runqueue the task is leaving
+ * @ctx: the task's classification state
+ *
+ * The counterpart of mlfq_runnable_enter(). A no-op for a task that was never
+ * counted, so the pair is self-correcting rather than able to underflow.
+ */
+static inline void mlfq_runnable_exit(int cpu, struct mlfq_ctx *ctx)
+{
+	struct mlfq_pcpu *pc = &per_cpu(mlfq_pcpu, cpu);
+
+	if (!ctx->last_qid || ctx->last_qid > MLFQ_NR_QUEUES)
+		return;
+
+	if (pc->q_runnable[ctx->last_qid])
+		pc->q_runnable[ctx->last_qid]--;
+	ctx->last_qid = 0;
+}
 
 #endif /* _KERNEL_SCHED_MLFQ_H */

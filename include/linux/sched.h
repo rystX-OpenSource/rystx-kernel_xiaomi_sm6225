@@ -772,6 +772,11 @@ struct wake_q_node {
  *			1 is the interactive queue and 3 the batch queue.
  * @reenq_cnt:		consecutive request exhaustions at the current level.
  * @wake_cnt:		consecutive short sleeps at the current level.
+ * @last_qid:		the level this task was counted into on the runqueue it
+ *			is queued on, or 0 when it is not counted. Owned by
+ *			mlfq_runnable_enter() and mlfq_runnable_exit() alone, so
+ *			that a task reclassified while it waits is taken back out
+ *			of the level it was actually placed in.
  *
  * The gauge and the counters together decide the queue, and the queue in turn
  * selects the EEVDF request size for the task. See kernel/sched/mlfq.h.
@@ -784,6 +789,7 @@ struct mlfq_ctx {
 	u8		queue;
 	u8		reenq_cnt;
 	u8		wake_cnt;
+	u8		last_qid;
 };
 
 struct task_struct {
