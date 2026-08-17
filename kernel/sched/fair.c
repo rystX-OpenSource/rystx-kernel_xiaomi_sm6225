@@ -1230,13 +1230,20 @@ static inline void mlfq_account_runtime(struct sched_entity *se, u64 delta_exec)
  * that from set_next_task_fair() merely re-establishing cfs_rq->curr after a
  * policy or cgroup change. Group entities are walked through here too, so the
  * task check is what keeps this one count per switch-in.
+ *
+ * This is also where a wakeup stops waiting, so it is where the wait that the
+ * system latency gauge averages is measured, exactly as scx_mlfq measures it in
+ * the same callback.
  */
-static inline void mlfq_account_running(struct sched_entity *se, bool first)
+static inline void mlfq_account_running(struct cfs_rq *cfs_rq,
+					struct sched_entity *se, bool first)
 {
 	if (!sched_feat(MLFQ) || !first || !entity_is_task(se))
 		return;
 
 	mlfq_stat_inc(MLFQ_STAT_ON_CPU);
+	mlfq_wakeup_episode_end(&task_of(se)->mlfq,
+				rq_clock_task(rq_of(cfs_rq)));
 }
 
 /*
@@ -5356,7 +5363,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, bool first)
 	}
 
 	se->prev_sum_exec_runtime = se->sum_exec_runtime;
-	mlfq_account_running(se, first);
+	mlfq_account_running(cfs_rq, se, first);
 }
 
 static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags);
@@ -12829,6 +12836,16 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		cfs_rq = cfs_rq_of(se);
 		entity_tick(cfs_rq, se, queued);
 	}
+
+	/*
+	 * The tick is this port's carrier for the machine-wide controller step,
+	 * which rate limits itself to once a second and picks a single winner
+	 * among the CPUs that reach it; see mlfq_adapt_step(). It is not this
+	 * task's state, so it does not belong in the walk above, and it runs
+	 * before the @queued early return so that an hrtick carries it too.
+	 */
+	if (sched_feat(MLFQ))
+		mlfq_adapt_step();
 
 	if (queued)
 		return;

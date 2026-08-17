@@ -20,6 +20,12 @@
  *
  * so there is one entry point for each. Together they cover the same task
  * states scx_mlfq classified in, and no other path changes a task's level.
+ *
+ * The two edges the gauge is compared against are not constants: the
+ * controller in mlfq_adapt.c widens them as the machine's own wakeup latency
+ * rises, so each entry point takes one consistent pair up front and passes it
+ * down, rather than re-reading state that can move underneath a single
+ * classification.
  */
 #include "sched.h"
 #include "mlfq.h"
@@ -102,13 +108,14 @@ static void mlfq_age_stay(struct mlfq_ctx *ctx, u64 now)
  * was long enough to make the task's history meaningless.
  */
 static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
-				 u64 now)
+				 u64 now, struct mlfq_bands bands)
 {
 	u64 sleep_ns = mlfq_elapsed(now, ctx->last_sleep_at);
 	u8 base_queue;
 
 	if (sleep_ns)
-		ctx->ema = mlfq_ema_decay(ctx->ema, sleep_ns);
+		ctx->ema = mlfq_ema_decay(ctx->ema, sleep_ns,
+					  MLFQ_EMA_HALF_LIFE_NS);
 
 	ctx->last_sleep_at = 0;
 	ctx->reenq_cnt = 0;
@@ -127,7 +134,7 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 		mlfq_stat_inc(MLFQ_STAT_SHORT_SLEEP_BOOSTS);
 	}
 
-	if (mlfq_promote_on_wakeup(ctx, sleep_ns))
+	if (mlfq_promote_on_wakeup(ctx, sleep_ns, bands.t_l, bands.t_h))
 		mlfq_stat_inc(MLFQ_STAT_PROMOTIONS);
 
 	/*
@@ -137,7 +144,8 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 	 * been idle for a tenth of a second should not be demoted for it.
 	 */
 	if (sleep_ns > MLFQ_LONG_SLEEP_NS) {
-		base_queue = mlfq_queue_from_ema(ctx->ema);
+		base_queue = mlfq_queue_from_ema(ctx->ema, bands.t_l,
+						 bands.t_h);
 		if (base_queue < ctx->queue) {
 			ctx->queue = base_queue;
 			mlfq_stat_inc(MLFQ_STAT_PROMOTIONS);
@@ -170,11 +178,16 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
  */
 void mlfq_classify_enqueue(struct task_struct *p, u64 now, bool wakeup)
 {
+	struct mlfq_bands bands = mlfq_read_bands();
 	struct mlfq_ctx *ctx = &p->mlfq;
 	u8 old_queue = ctx->queue;
 
-	if (wakeup)
-		mlfq_classify_wakeup(p, ctx, now);
+	if (wakeup) {
+		mlfq_wakeup_episode_begin(ctx, now);
+		mlfq_classify_wakeup(p, ctx, now, bands);
+	} else {
+		mlfq_wakeup_episode_drop(ctx);
+	}
 
 	if (mlfq_apply_idle_policy(p, ctx)) {
 		ctx->queued_at = 0;
@@ -222,11 +235,12 @@ void mlfq_classify_enqueue(struct task_struct *p, u64 now, bool wakeup)
  */
 void mlfq_classify_runout(struct task_struct *p, u64 now)
 {
+	struct mlfq_bands bands = mlfq_read_bands();
 	struct mlfq_ctx *ctx = &p->mlfq;
 
 	ctx->wake_cnt = 0;
 
-	if (!mlfq_demotion_blocked(p) && mlfq_demote_on_runout(ctx))
+	if (!mlfq_demotion_blocked(p) && mlfq_demote_on_runout(ctx, bands.t_h))
 		mlfq_stat_inc(MLFQ_STAT_DEMOTIONS);
 
 	if (mlfq_apply_idle_policy(p, ctx)) {
