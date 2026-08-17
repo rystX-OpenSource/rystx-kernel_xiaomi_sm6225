@@ -23,10 +23,13 @@
  * deadline and is picked sooner and more often, for shorter turns. That is
  * precisely the latency ordering the dispatch quota produced, and it comes
  * with two properties the quota did not have: the service each task
- * receives still follows its weight rather than its queue, and the
- * eligibility criterion bounds how long any task waits. Eligibility is
- * therefore the starvation bound that the guaranteed batch-queue share of
- * each dispatch batch provided in scx_mlfq, so no quota is carried over.
+ * receives still follows its weight rather than its queue, and the deadline
+ * order itself bounds how long any task waits. A task that runs advances its
+ * deadline by r_i/w_i at the end of every request, while a task that waits
+ * keeps the deadline it was given, so the tasks running ahead of it push their
+ * own deadlines past its, and it is picked. That is the starvation bound the
+ * guaranteed batch-queue share of each dispatch batch provided in scx_mlfq, so
+ * no quota is carried over.
  *
  * Everything below the classifier is unchanged EEVDF: placement, lag,
  * the tree, throttling, group scheduling and load balancing.
@@ -115,8 +118,8 @@
 
 /*
  * A stay of this long in Q2 or Q3 elevates the task to Q1. EEVDF already
- * bounds the wait through eligibility, so this only catches a task whose
- * classification has gone stale.
+ * bounds the wait through the deadline order, so this only catches a task
+ * whose classification has gone stale.
  */
 #define MLFQ_AGING_PERIOD_NS		1000000000ULL
 

@@ -195,8 +195,8 @@
  * classifier finds interactive gets a shorter request, hence an earlier
  * virtual deadline, and is picked sooner and more often for shorter turns; a
  * CPU-bound one gets a longer request and runs in fewer, longer turns. The
- * share each task receives still follows its weight, and eligibility still
- * bounds how long any of them waits.
+ * share each task receives still follows its weight, and the virtual deadline
+ * order still bounds how long any of them waits.
  *
  * See kernel/sched/mlfq.h.
  */

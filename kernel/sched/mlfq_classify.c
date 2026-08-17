@@ -81,9 +81,9 @@ static void mlfq_rearm_stay(struct mlfq_ctx *ctx, u64 now)
  * meant a task waiting behind others in its queue, because a waiting task
  * still passed through ops.enqueue() on the requeue paths. Under EEVDF a
  * waiting task passes through no hook at all, so this fires rarely, and it is
- * not what keeps such a task served: eligibility already bounds its wait. It
- * is kept because it still does the one thing eligibility cannot, which is to
- * revisit a classification that has gone stale.
+ * not what keeps such a task served: the deadline order already bounds its
+ * wait. It is kept because it still does the one thing that order cannot,
+ * which is to revisit a classification that has gone stale.
  */
 static void mlfq_age_stay(struct mlfq_ctx *ctx, u64 now)
 {
