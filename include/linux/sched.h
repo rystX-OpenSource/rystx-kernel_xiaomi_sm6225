@@ -759,11 +759,12 @@ struct wake_q_node {
 
 /**
  * struct mlfq_ctx - per-task multi-level feedback queue classification state
- * @ema:		interactivity gauge, in nanoseconds of saturating
- *			exponentially-weighted running time. Climbs while the
- *			task runs and decays while it sleeps.
+ * @g:			burst gauge, in nanoseconds of running time the task has
+ *			not yet slept off. Climbs by every stretch the task runs
+ *			and is refunded a whole request per whole server period
+ *			it sleeps, bounded above at MLFQ_GAUGE_MAX_NS.
  * @last_sleep_at:	rq clock at the last voluntary sleep, used to size the
- *			decay and to recognise a short sleep.
+ *			refund and to recognise a short sleep.
  * @queued_at:		rq clock at which the current stay in a non-interactive
  *			queue began; zero while the task is in Q1.
  * @last_boost_at:	rq clock at the last short-sleep boost, used to
@@ -787,7 +788,7 @@ struct wake_q_node {
  * selects the EEVDF request size for the task. See kernel/sched/mlfq.h.
  */
 struct mlfq_ctx {
-	u64		ema;
+	u64		g;
 	u64		last_sleep_at;
 	u64		queued_at;
 	u64		last_boost_at;

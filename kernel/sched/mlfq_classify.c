@@ -5,11 +5,18 @@
  * Ported from scx_mlfq, a sched_ext scheduler by galpt:
  *   https://github.com/galpt/scx_mlfq
  *
- * The gauge in mlfq.h is a continuous measure of how interactive a task
- * is; this file maps it onto the three queues. A level change requires
- * crossing a band rather than a threshold, so the two entry points here drive
- * the consecutive-event counters that implement the hysteresis, and the
- * classification is only ever consulted for the task's EEVDF request size.
+ * The gauge in mlfq.h is a continuous measure of how long a turn a task takes
+ * before it gives the CPU back; this file maps it onto the three queues. A
+ * level change requires crossing a band rather than a threshold, so the two
+ * entry points here drive the consecutive-event counters that implement the
+ * hysteresis, and the classification is only ever consulted for the task's
+ * EEVDF request size.
+ *
+ * The two directions are not symmetric. Everything a wakeup can do is
+ * promote: the boost and the hysteresis are its only moves, so no single
+ * wakeup can demote a task and step around the demotion hysteresis. Demotions
+ * only ever come from mlfq_classify_runout(), behind a run of exhausted
+ * requests.
  *
  * scx_mlfq reaches all of this from ops.enqueue(), which sched_ext calls both
  * for wakeups and, with no flags at all, for a task that exhausted its slice.
@@ -96,20 +103,36 @@ static void mlfq_age_stay(struct mlfq_ctx *ctx, u64 now)
 /*
  * mlfq_classify_wakeup - reclassify a task that is waking up
  *
- * Applies, in order: the decay over the sleep just ended, the rate-limited
- * boost for a wakeup that looks like it was waiting on something, the
- * band-hysteresis promotion, and finally the base mapping again if the sleep
- * was long enough to make the task's history meaningless.
+ * Applies, in order: the refund for the sleep just ended, the rate-limited
+ * boost for a wakeup that looks like it was waiting on something, and the
+ * band-hysteresis promotion.
+ *
+ * Every one of those is a promotion or nothing. The base gauge-to-level
+ * mapping, which is the only thing that could name a task CPU-bound outright,
+ * is deliberately not applied here in either direction: a task that earns
+ * neither the boost nor the hysteresis keeps the level it had, and the only way
+ * down is a sustained run.
  */
 static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 				 u64 now)
 {
 	u64 sleep_ns = mlfq_elapsed(now, ctx->last_sleep_at);
-	u8 base_queue;
 
+	/*
+	 * The refund is charged against the level the task was last served by,
+	 * so it is read before anything below can promote the task: a level's
+	 * budget and period are what its own tasks are entitled to sleep off,
+	 * and crediting a sleep at the level the task is about to be moved to
+	 * would pay it for service it never had.
+	 *
+	 * A sleep that cannot be measured -- an unset or backwards stamp --
+	 * refunds nothing, which errs towards CPU-bound rather than towards
+	 * interactive, so an unmeasurable sleep cannot promote a task.
+	 */
 	if (sleep_ns)
-		ctx->ema = mlfq_ema_decay(ctx->ema, sleep_ns,
-					  MLFQ_EMA_HALF_LIFE_NS);
+		ctx->g = mlfq_gauge_decay(ctx->g, sleep_ns,
+					  mlfq_queue_slice(ctx->queue),
+					  mlfq_queue_period(ctx->queue));
 
 	ctx->last_sleep_at = 0;
 	ctx->reenq_cnt = 0;
@@ -117,9 +140,10 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 	/*
 	 * The boost stands in for the wakeup fast paths a scheduler would
 	 * otherwise have to recognise one kind at a time, so it deliberately
-	 * does not care what the task was waiting on. SCHED_IDLE tasks are
-	 * forced to Q3 below, so boosting one would only spend its rate-limit
-	 * budget to no effect.
+	 * does not care what the task was waiting on. It is unconditional in
+	 * the gauge, so a task with a saturated gauge still gets it. SCHED_IDLE
+	 * tasks are forced to Q3 below, so boosting one would only spend its
+	 * rate-limit budget to no effect.
 	 */
 	if (!task_has_idle_policy(p) &&
 	    mlfq_boost_pending(ctx, sleep_ns, p->in_iowait, now)) {
@@ -128,24 +152,14 @@ static void mlfq_classify_wakeup(struct task_struct *p, struct mlfq_ctx *ctx,
 		mlfq_stat_inc(MLFQ_STAT_SHORT_SLEEP_BOOSTS);
 	}
 
+	/*
+	 * The boost above has already taken any task it applied to all the way
+	 * to Q1, so the hysteresis only ever fires for the tasks it passed
+	 * over.
+	 */
 	if (mlfq_promote_on_wakeup(ctx, sleep_ns, MLFQ_THRESH_LOW_NS,
 				   MLFQ_THRESH_HIGH_NS))
 		mlfq_stat_inc(MLFQ_STAT_PROMOTIONS);
-
-	/*
-	 * A sleep this long has decayed the gauge to near nothing, so whatever
-	 * put the task in a higher-numbered queue no longer describes it. Let
-	 * the gauge alone speak again, but only to promote: a task that has
-	 * been idle for a tenth of a second should not be demoted for it.
-	 */
-	if (sleep_ns > MLFQ_LONG_SLEEP_NS) {
-		base_queue = mlfq_queue_from_ema(ctx->ema, MLFQ_THRESH_LOW_NS,
-						 MLFQ_THRESH_HIGH_NS);
-		if (base_queue < ctx->queue) {
-			ctx->queue = base_queue;
-			mlfq_stat_inc(MLFQ_STAT_PROMOTIONS);
-		}
-	}
 }
 
 /**

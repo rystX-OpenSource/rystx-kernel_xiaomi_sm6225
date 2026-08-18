@@ -1208,9 +1208,16 @@ static inline u64 mlfq_base_slice(struct sched_entity *se)
 }
 
 /*
- * Account a stretch of running time to the interactivity gauge. Running is
- * the only evidence that pushes a task towards the batch queue, and the gauge
+ * Account a stretch of running time to the burst gauge. Running is the only
+ * evidence that pushes a task towards the batch queue, and the gauge
  * saturates, so a task that never sleeps ends up there and stays.
+ *
+ * scx_mlfq climbs the gauge once per run segment, from ops.stopping(); this is
+ * called per update_curr() delta instead, which is the same running time split
+ * into the pieces the fair class already accounts. The climb is an addition
+ * with a ceiling, so the split makes no difference at all to the result; see
+ * mlfq_gauge_climb(). The refund at the other end is charged once per sleep,
+ * from the wakeup, so it is not split either.
  */
 static inline void mlfq_account_runtime(struct sched_entity *se, u64 delta_exec)
 {
@@ -1220,7 +1227,7 @@ static inline void mlfq_account_runtime(struct sched_entity *se, u64 delta_exec)
 		return;
 
 	p = task_of(se);
-	p->mlfq.ema = mlfq_ema_climb(p->mlfq.ema, delta_exec);
+	p->mlfq.g = mlfq_gauge_climb(p->mlfq.g, delta_exec);
 	mlfq_stat_add(MLFQ_STAT_TOTAL_RUNTIME, delta_exec);
 }
 

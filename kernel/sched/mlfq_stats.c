@@ -47,6 +47,7 @@
  * anything that needs a coherent instant needs a tracepoint, not a file.
  */
 #include <linux/cpufreq.h>
+#include <linux/math64.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/timekeeping.h>
@@ -316,14 +317,14 @@ static void mlfq_show_summary(struct seq_file *m, const struct mlfq_totals *t)
 		seq_puts(m, " Explanation\n  ");
 		seq_printf(m,
 			   "As you can see from the counters, %llu wakeups have produced %llu promotions and %llu demotions. Based on the internal rules of this scheduler, a task is only demoted once it has used %d whole requests in a row without sleeping, so fewer than one demotion per hundred wakeups says that almost everything here sleeps between short pieces of work, and this shows the interactive level holding the tasks that belong in it.",
-			   wakes, ups, demotes, MLFQ_DEMOTE_REENQS);
+			   wakes, ups, demotes, MLFQ_DEMOTE_EXHAUSTIONS);
 	} else if (demotes * 20 > wakes) {
 		seq_puts(m,
 			 "MLFQ is working as expected and is sorting a mixed workload.\n");
 		seq_puts(m, " Explanation\n  ");
 		seq_printf(m,
 			   "As you can see from the counters, %llu of the %llu wakeups seen so far ended in a demotion, against %llu promotions the other way. Based on the internal rules of this scheduler, those two are driven by opposite evidence -- %d consecutive exhausted requests demote, a short sleep or a stay of %llu ms promote -- so both of them running at once is what a machine with real work and real interaction looks like, and this shows the classifier telling the two apart.",
-			   demotes, wakes, ups, MLFQ_DEMOTE_REENQS,
+			   demotes, wakes, ups, MLFQ_DEMOTE_EXHAUSTIONS,
 			   div_u64(MLFQ_AGING_PERIOD_NS, NSEC_PER_MSEC));
 	} else {
 		seq_puts(m,
@@ -460,20 +461,6 @@ static void mlfq_show_absent(struct seq_file *m)
 		 "   reaction to it does not exist because it is not needed.\n");
 
 	seq_puts(m,
-		 " tree gen, tree nodes, tree MAE, tree corr, t_int / t_bnd eff\n"
-		 "   The learned burst-prediction model, and the second band pair it\n"
-		 "   feeds. Fitting it is userspace work in scx_mlfq, published back\n"
-		 "   through a BPF map; there is no daemon here, and the exponential\n"
-		 "   gauge in mlfq.h is the whole of the classifier's model.\n");
-
-	seq_puts(m,
-		 " guard eff\n"
-		 "   The minimum run a task must have had before a same-level wakeup\n"
-		 "   may preempt it. Upstream fixes it at zero and derives nothing\n"
-		 "   else from it, so the port has no such guard to report; see\n"
-		 "   MLFQ_PREEMPT_SLICE_NS in mlfq.h.\n");
-
-	seq_puts(m,
 		 " op lat\n"
 		 "   Time spent inside a BPF scheduler's own callbacks, measured\n"
 		 "   because sched_ext charges them to the scheduler it is hosting.\n"
@@ -487,7 +474,7 @@ static int mlfq_stats_show(struct seq_file *m, void *v)
 	mlfq_read_totals(&t);
 
 	seq_puts(m,
-		 "scx_mlfq on EEVDF: multilevel feedback queues, virtual time, placement\n");
+		 "scx_mlfq on EEVDF: fixed-window burst gauge, three queues, virtual time, placement\n");
 	seq_printf(m, "mlfq: %s\n", sched_feat(MLFQ) ? "on" : "off");
 
 	mlfq_show_per_cpu(m);

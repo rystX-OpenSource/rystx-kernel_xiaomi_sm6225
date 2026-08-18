@@ -8,9 +8,10 @@
  * scx_mlfq keeps three per-CPU dispatch queues, each ordered by virtual
  * time, and serves them with a quota so that the interactive queue is
  * drained first while the batch queue keeps a guaranteed share of every
- * dispatch batch. A task's queue is chosen by an interactivity gauge: a
- * saturating exponentially-weighted average of running time that climbs
- * while the task runs and decays while it sleeps.
+ * dispatch batch. A task's queue is chosen by a burst gauge: running time
+ * accumulated since the task last slept long enough to be refunded for it,
+ * bounded above, which is a direct measure of how long a turn the task takes
+ * before giving the CPU back.
  *
  * The fair class has a single virtual-time ordered tree per runqueue, so
  * the three queues are not reproduced as three trees. Instead the queue
@@ -53,44 +54,46 @@
 #include <linux/compiler.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
-#include <linux/math64.h>
+#include <linux/log2.h>
 #include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/time64.h>
 #include <linux/types.h>
 
-/* Fixed-point shift for the gauge coefficients. */
-#define MLFQ_FP_SHIFT			8
-#define MLFQ_FP_ONE			(1UL << MLFQ_FP_SHIFT)
-
-/* Request size per queue level, in nanoseconds. */
-#define MLFQ_SLICE_Q1_NS		1000000ULL
-#define MLFQ_SLICE_Q2_NS		2000000ULL
-#define MLFQ_SLICE_Q3_NS		4000000ULL
-
 /*
- * Ceiling of the interactivity gauge. A task that runs for this long
- * without sleeping is as CPU-bound as the gauge can express.
+ * Request size per queue level, in nanoseconds. The values are exact powers
+ * of two, nominally 1ms, 2ms and 4ms, so that the gauge decay below divides
+ * by a queue's period with a shift instead of a divide.
  */
-#define MLFQ_BUDGET_MAX_NS		6000000ULL
+#define MLFQ_SLICE_Q1_NS		(1ULL << 20)
+#define MLFQ_SLICE_Q2_NS		(1ULL << 21)
+#define MLFQ_SLICE_Q3_NS		(1ULL << 22)
 
 /*
- * Classification thresholds on the gauge. Below the low threshold a task
- * is interactive, at or above the high threshold it is CPU-bound, and in
+ * Ceiling of the burst gauge. A task that has run for this long without
+ * being refunded for a sleep is as CPU-bound as the gauge can express. It is
+ * four times the CPU-bound edge, so a saturated gauge sits well past it.
+ */
+#define MLFQ_GAUGE_MAX_NS		(1ULL << 23)
+
+/*
+ * Classification thresholds on the gauge. At or below the low threshold a
+ * task is interactive, at or above the high threshold it is CPU-bound, and in
  * between it is left in the default queue.
+ *
+ * The high edge is the batch request size, which is what makes the gauge and
+ * the edges commensurable: a task is CPU-bound once it has accumulated a
+ * whole batch-level request of unrefunded running time.
  */
 #define MLFQ_THRESH_LOW_NS		250000ULL
-#define MLFQ_THRESH_HIGH_NS		2000000ULL
+#define MLFQ_THRESH_HIGH_NS		4000000ULL
 
 /*
- * Climb coefficient. The gauge closes the gap to MLFQ_BUDGET_MAX_NS with a
- * time constant of MLFQ_BUDGET_MAX_NS * MLFQ_FP_ONE / MLFQ_EMA_ALPHA_FP,
- * which is 500us of running time.
+ * Period multiplier for the refund below. A level's server is (Q_i, P_i) with
+ * P_i = MLFQ_CBS_PERIOD_MULT * Q_i, so half of every period is reserved,
+ * and the period is a power of two because the request size is.
  */
-#define MLFQ_EMA_ALPHA_FP		3072UL
-
-/* Half-life of the gauge while the task sleeps. */
-#define MLFQ_EMA_HALF_LIFE_NS		24000000ULL
+#define MLFQ_CBS_PERIOD_MULT		2
 
 /*
  * A sleep shorter than this is taken as a task waiting on something
@@ -111,12 +114,6 @@
 #define MLFQ_HYSTERESIS_SLEEP_NS	4000000ULL
 
 /*
- * A sleep this long makes the task's history stale, so the gauge alone
- * decides the queue again and the hysteresis counters are dropped.
- */
-#define MLFQ_LONG_SLEEP_NS		120000000ULL
-
-/*
  * A stay of this long in Q2 or Q3 elevates the task to Q1. EEVDF already
  * bounds the wait through the deadline order, so this only catches a task
  * whose classification has gone stale.
@@ -126,7 +123,7 @@
 /* Consecutive short sleeps required before promoting a level. */
 #define MLFQ_PROMOTE_WAKES		2
 /* Consecutive request exhaustions required before demoting a level. */
-#define MLFQ_DEMOTE_REENQS		8
+#define MLFQ_DEMOTE_EXHAUSTIONS		8
 
 /*
  * The request a wakeup gets when it is owed a preemption, in place of the
@@ -193,116 +190,116 @@ static inline u64 mlfq_queue_slice(u8 queue)
 }
 
 /**
- * mlfq_ema_climb - advance the gauge over a stretch of running time
- * @ema: current gauge value
+ * mlfq_queue_period - CBS server period for a queue level
+ * @queue: the queue level, 1..3
+ *
+ * Twice the level's request size, so half of every period is reserved. Like
+ * the request size it is an exact power of two, which is what lets
+ * mlfq_gauge_decay() divide by it with a shift.
+ */
+static inline u64 mlfq_queue_period(u8 queue)
+{
+	return mlfq_queue_slice(queue) * MLFQ_CBS_PERIOD_MULT;
+}
+
+/**
+ * mlfq_gauge_climb - add a stretch of running time to the gauge
+ * @g: current gauge value
  * @delta: nanoseconds of running time to account for
  *
- * Saturating exponential climb towards the ceiling:
+ * The gauge is running time, so the climb is an addition, saturating at
+ * MLFQ_GAUGE_MAX_NS. Where the exponential gauge this replaced approached its
+ * ceiling asymptotically and took a divide to advance, this is a bounded add,
+ * and what it measures is directly comparable with the thresholds: both are
+ * durations, and the CPU-bound edge is a batch-level request.
  *
- *	step = (MLFQ_BUDGET_MAX_NS - ema) * delta * alpha / (BUDGET_MAX * FP_ONE)
- *	ema += min(step, MLFQ_BUDGET_MAX_NS - ema)
- *
- * The step is proportional to the remaining gap, so the gauge approaches the
- * ceiling with a time constant of BUDGET_MAX * FP_ONE / alpha and never
- * passes it. @delta is clamped to the ceiling first, which also keeps the
- * product below 2^63.
- *
- * The step is linear in @delta to first order, so accounting one long stretch
- * or the same stretch split across several calls gives the same result to
- * within the rounding of the divide. The fair class can therefore climb the
- * gauge per update_curr() delta rather than per run segment.
+ * Being an addition also makes it exactly indifferent to how the running time
+ * arrives. min(min(g + a, MAX) + b, MAX) is min(g + a + b, MAX) for every g, a
+ * and b, so accounting a run segment in pieces gives the same gauge as
+ * accounting it whole. scx_mlfq climbs once per run segment, from
+ * ops.stopping(); the fair class climbs per update_curr() delta, which sums to
+ * the same segment, and now does so with no error at all rather than to first
+ * order.
  *
  * Returns the updated gauge.
  */
-static inline u64 mlfq_ema_climb(u64 ema, u64 delta)
+static inline u64 mlfq_gauge_climb(u64 g, u64 delta)
 {
-	u64 gap, step;
+	if (g >= MLFQ_GAUGE_MAX_NS || delta > MLFQ_GAUGE_MAX_NS - g)
+		return MLFQ_GAUGE_MAX_NS;
 
-	if (delta > MLFQ_BUDGET_MAX_NS)
-		delta = MLFQ_BUDGET_MAX_NS;
-	if (!delta)
-		return ema;
+	return g + delta;
+}
 
-	gap = MLFQ_BUDGET_MAX_NS - ema;
-	if (!gap)
-		return ema;
+/**
+ * mlfq_gauge_decay - refund the gauge for a sleep
+ * @g: current gauge value
+ * @sleep_ns: nanoseconds slept
+ * @q_i: the level's request size, its CBS budget
+ * @p_i: the level's CBS period, MLFQ_CBS_PERIOD_MULT * @q_i
+ *
+ * Every whole server period spent asleep refunds one whole budget:
+ *
+ *	periods = sleep_ns / p_i
+ *	g -= min(periods * q_i, g)
+ *
+ * The divide is a shift because @p_i is a power of two. The refund is
+ * therefore quantised to multiples of @q_i, so a sleep shorter than one period
+ * refunds nothing, and a sleep of two gauge ceilings refunds the whole gauge
+ * at any level.
+ *
+ * That quantisation is the point rather than a rounding artefact: it is what
+ * makes the gauge a measure of the task's turn length. A task that keeps its
+ * level is refunded exactly what a task of that level is entitled to sleep
+ * off, so only running time it did not sleep off accumulates.
+ *
+ * The budget and the period are passed in because they belong to the level the
+ * task was last served by, which is the caller's business to know; see
+ * mlfq_classify_wakeup(), which reads them before any promotion moves the task.
+ *
+ * Returns the updated gauge.
+ */
+static inline u64 mlfq_gauge_decay(u64 g, u64 sleep_ns, u64 q_i, u64 p_i)
+{
+	u64 periods, refund;
+
+	if (!p_i)
+		return g;
 
 	/*
-	 * gap and delta are both at most MLFQ_BUDGET_MAX_NS, so the product
-	 * with the coefficient stays well inside 64 bits, and the divisor is
-	 * a compile-time constant below 2^32.
+	 * ilog2() of a power of two is its shift count. It is the kernel's own
+	 * spelling of the __builtin_ctzll() scx_mlfq uses here, and lowers to
+	 * the same single instruction on arm64, with no divide and no libcall.
 	 */
-	step = div_u64(gap * delta * MLFQ_EMA_ALPHA_FP,
-		       MLFQ_BUDGET_MAX_NS * MLFQ_FP_ONE);
-	if (step > gap)
-		step = gap;
+	periods = sleep_ns >> ilog2(p_i);
 
-	return ema + step;
-}
-
-/**
- * mlfq_ema_decay - decay a gauge over a stretch of elapsed time
- * @ema: current gauge value
- * @sleep_ns: nanoseconds elapsed
- * @half_life: nanoseconds in which the gauge halves
- *
- * Whole half-lives are applied as a right shift. The remaining fraction x of
- * a half-life uses the second-order expansion of 2^-x,
- *
- *	2^-x ~= 1 - x*ln2 + (x*ln2)^2 / 2
- *
- * evaluated in MLFQ_FP_ONE fixed point, where 177 approximates
- * MLFQ_FP_ONE * ln(2). The relative error stays under 10% over x in [0,1),
- * which is far finer than the gap between the classification thresholds. An
- * elapsed time of 64 half-lives or more zeroes the gauge outright, which also
- * keeps the shift count in range.
- *
- * The half-life stays a parameter, though the only caller passes
- * MLFQ_EMA_HALF_LIFE_NS, because it is what the expansion above is expressed
- * in and reading it from a constant inside would hide that.
- *
- * Returns the updated gauge.
- */
-static inline u64 mlfq_ema_decay(u64 ema, u64 sleep_ns, u64 half_life)
-{
-	u64 periods, decayed, sub, x_fp, a_fp, factor_fp;
-
-	if (!half_life || sleep_ns >= (half_life << 6))
+	/*
+	 * A sleep long enough for the product below to overflow has already
+	 * refunded far more than any gauge can hold, so a period count past
+	 * the ceiling itself empties the gauge without multiplying anything:
+	 * at that count the refund exceeds MLFQ_GAUGE_MAX_NS whatever the
+	 * level, since the smallest budget is larger than one nanosecond.
+	 */
+	if (periods > MLFQ_GAUGE_MAX_NS)
 		return 0;
 
-	periods = div64_u64_rem(sleep_ns, half_life, &sub);
-	decayed = ema >> periods;
+	refund = periods * q_i;
 
-	if (!sub || !decayed)
-		return decayed;
-
-	x_fp = div64_u64(sub * MLFQ_FP_ONE, half_life);
-	a_fp = (x_fp * 177) >> MLFQ_FP_SHIFT;
-	factor_fp = MLFQ_FP_ONE - a_fp + ((a_fp * a_fp) >> (MLFQ_FP_SHIFT + 1));
-
-	return (decayed * factor_fp) >> MLFQ_FP_SHIFT;
+	return g > refund ? g - refund : 0;
 }
 
 /**
- * mlfq_queue_from_ema - the queue the gauge alone asks for
- * @ema: the gauge value
- * @t_l: the interactive edge
- * @t_h: the CPU-bound edge
+ * mlfq_reenq_cnt_step - saturating increment of the exhaustion counter
+ * @cnt: the current consecutive-exhaustion count
  *
- * The base mapping, without any hysteresis: at or below the low edge the task
- * is interactive, at or above the high edge it is CPU-bound, and in between it
- * stays in the default queue. The edges are passed in rather than read here
- * because upstream keeps them in its read-only section, where the front end can
- * override them, and passes them down the same way.
+ * Saturates at MLFQ_DEMOTE_EXHAUSTIONS rather than at the width of the field,
+ * so a task that has nowhere left to be demoted to keeps a count that still
+ * reads as "sustained" instead of wrapping through zero and losing its
+ * history.
  */
-static inline u8 mlfq_queue_from_ema(u64 ema, u64 t_l, u64 t_h)
+static inline u8 mlfq_reenq_cnt_step(u8 cnt)
 {
-	if (ema <= t_l)
-		return MLFQ_Q_INTERACTIVE;
-	if (ema >= t_h)
-		return MLFQ_Q_BATCH;
-
-	return MLFQ_Q_DEFAULT;
+	return cnt < MLFQ_DEMOTE_EXHAUSTIONS ? cnt + 1 : MLFQ_DEMOTE_EXHAUSTIONS;
 }
 
 /**
@@ -345,6 +342,11 @@ static inline bool mlfq_boost_pending(const struct mlfq_ctx *ctx, u64 sleep_ns,
  * row. Requiring the crossing of a band rather than a point is what keeps a
  * task whose gauge sits near an edge from changing level on every wakeup.
  *
+ * The counter saturates where scx_mlfq's increments without a bound. Both
+ * behave the same up to the comparison, which only asks for two, but a task
+ * whose gauge keeps it below the promotion gate can sleep briefly indefinitely,
+ * and an unbounded u8 wraps through zero and throws the run away.
+ *
  * Returns %true if the task moved up a level.
  */
 static inline bool mlfq_promote_on_wakeup(struct mlfq_ctx *ctx, u64 sleep_ns,
@@ -358,10 +360,10 @@ static inline bool mlfq_promote_on_wakeup(struct mlfq_ctx *ctx, u64 sleep_ns,
 		ctx->wake_cnt++;
 
 	if (ctx->wake_cnt >= MLFQ_PROMOTE_WAKES) {
-		if (ctx->queue == MLFQ_Q_DEFAULT && ctx->ema < t_l / 2) {
+		if (ctx->queue == MLFQ_Q_DEFAULT && ctx->g < t_l / 2) {
 			ctx->queue = MLFQ_Q_INTERACTIVE;
 			promoted = true;
-		} else if (ctx->queue == MLFQ_Q_BATCH && ctx->ema < t_h / 2) {
+		} else if (ctx->queue == MLFQ_Q_BATCH && ctx->g < t_h / 2) {
 			ctx->queue = MLFQ_Q_DEFAULT;
 			promoted = true;
 		}
@@ -379,9 +381,9 @@ static inline bool mlfq_promote_on_wakeup(struct mlfq_ctx *ctx, u64 sleep_ns,
  * @t_h: effective high edge
  *
  * Demotion needs a sustained run rather than a single exhausted request:
- * MLFQ_DEMOTE_REENQS exhaustions in a row, roughly 8ms at the interactive
- * request size, while the gauge stays above the CPU-bound edge. A task that
- * sleeps in between is boosted at its wakeup, which clears the counter, so
+ * MLFQ_DEMOTE_EXHAUSTIONS exhaustions in a row, roughly 8ms at the interactive
+ * request size, while the gauge stays at or above the CPU-bound edge. A task
+ * that sleeps in between is boosted at its wakeup, which clears the counter, so
  * something bursty like a decoder keeps its level for the whole burst, while a
  * task that simply never sleeps accumulates the counter and is demoted.
  *
@@ -389,12 +391,11 @@ static inline bool mlfq_promote_on_wakeup(struct mlfq_ctx *ctx, u64 sleep_ns,
  */
 static inline bool mlfq_demote_on_runout(struct mlfq_ctx *ctx, u64 t_h)
 {
-	if (ctx->reenq_cnt < U8_MAX)
-		ctx->reenq_cnt++;
+	ctx->reenq_cnt = mlfq_reenq_cnt_step(ctx->reenq_cnt);
 
 	if (ctx->queue != MLFQ_Q_INTERACTIVE && ctx->queue != MLFQ_Q_DEFAULT)
 		return false;
-	if (ctx->ema <= t_h || ctx->reenq_cnt < MLFQ_DEMOTE_REENQS)
+	if (ctx->g < t_h || ctx->reenq_cnt < MLFQ_DEMOTE_EXHAUSTIONS)
 		return false;
 
 	ctx->queue++;
@@ -469,7 +470,7 @@ static inline bool mlfq_preempt_owed(struct task_struct *p,
  */
 static inline void mlfq_reset_classification(struct mlfq_ctx *ctx)
 {
-	ctx->ema = 0;
+	ctx->g = 0;
 	ctx->last_sleep_at = 0;
 	ctx->queued_at = 0;
 	ctx->last_boost_at = 0;
