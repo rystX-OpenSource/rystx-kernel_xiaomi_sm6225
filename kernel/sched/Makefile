@@ -19,7 +19,7 @@ endif
 obj-y += core.o loadavg.o clock.o cputime.o
 obj-y += idle.o fair.o rt.o deadline.o
 obj-y += wait.o wait_bit.o swait.o completion.o
-obj-y += mlfq_classify.o mlfq_adapt.o
+obj-y += mlfq_classify.o mlfq_main.o
 obj-$(CONFIG_PROC_FS) += mlfq_stats.o
 
 obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o

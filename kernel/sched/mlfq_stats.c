@@ -79,7 +79,6 @@ struct mlfq_totals {
 /*
  * Summed over the possible CPUs rather than the online ones, so that a CPU
  * that has been offlined does not take its share of the counters with it.
- * mlfq_adapt_step() folds its windows over the same set for the same reason.
  */
 static void mlfq_read_totals(struct mlfq_totals *t)
 {
@@ -225,31 +224,9 @@ static u64 mlfq_us(u64 ns)
 	return div_u64(ns, NSEC_PER_USEC);
 }
 
-/*
- * The adaptation shift as a percentage with one decimal, which is what the
- * dashboard's Adapt shift row is. The shift is one-sided and bounded to a half
- * by MLFQ_ADAPT_MAX_SHIFT, so a tenth of a percent is the whole resolution of
- * it rather than a rounding of something finer, and the only reason the sign is
- * handled at all is to keep a value that should not exist from printing as an
- * enormous positive one. Magnitude first and sign separately, because a shift
- * right of a negative value is not a division by a power of two;
- * mlfq_adapt_band() splits it the same way for the same reason.
- */
-static u64 mlfq_shift_pct(s64 shift, u32 *tenth)
-{
-	u64 mag = shift < 0 ? (u64)-shift : (u64)shift;
-
-	return div_u64_rem((mag * 1000) >> MLFQ_FP_SHIFT, 10, tenth);
-}
-
 static void mlfq_seq_count(struct seq_file *m, const char *label, u64 val)
 {
 	seq_printf(m, " %" MLFQ_LABEL_WIDTH "%llu\n", label, val);
-}
-
-static void mlfq_seq_us(struct seq_file *m, const char *label, u64 ns)
-{
-	seq_printf(m, " %" MLFQ_LABEL_WIDTH "%llu us\n", label, mlfq_us(ns));
 }
 
 /*
@@ -291,29 +268,25 @@ static void mlfq_show_per_cpu(struct seq_file *m)
 /*
  * The Summary, in the shape buildSummary() gives it: a TL;DR that says whether
  * the classifier is doing its job, and an Explanation that walks through the
- * live gauges and the rule each one is being judged against.
+ * counters and the rule each one is being judged against.
  *
- * Upstream's version is written around its learned burst-prediction tree,
- * which is not part of this port, so the sentences that quote the model's
- * error and its correlation have nothing to quote. The band controller is what
- * adapts here, so they are replaced by the gauges it reads and the shift it
- * has arrived at, and the threshold the TL;DR turns on becomes the
- * controller's own target latency -- upstream's threshold is likewise the
- * scheduler's own published rule for when a fit is good enough, rather than a
- * number picked to make the sentence work.
+ * Upstream reads five of the counters below and turns them into two shares of
+ * the wakeup total, one for the wakeups that ended in a demotion and one for the
+ * wakeups that ended in a promotion of any kind, then picks its sentence from
+ * where those two fall against a hundredth and a twentieth. The comparisons here
+ * are the same ones, multiplied out into whole counts so there is no division,
+ * and they are made against the same totals the System grid prints rather than a
+ * second reading of the per-CPU state, so the prose and the numbers below it can
+ * never disagree.
  */
-static void mlfq_show_summary(struct seq_file *m)
+static void mlfq_show_summary(struct seq_file *m, const struct mlfq_totals *t)
 {
-	u64 target_us = MLFQ_ADAPT_TARGET_LAT_NS / NSEC_PER_USEC;
-	u64 base_l_us = MLFQ_THRESH_LOW_NS / NSEC_PER_USEC;
-	u64 base_h_us = MLFQ_THRESH_HIGH_NS / NSEC_PER_USEC;
-	u64 lat = mlfq_us(READ_ONCE(mlfq_sys_gauge.lat_ema));
-	u64 rate = READ_ONCE(mlfq_sys_gauge.rate_ema) >> MLFQ_FP_SHIFT;
-	bool folded = READ_ONCE(mlfq_sys_gauge.step_at) != 0;
-	s64 shift = READ_ONCE(mlfq_adapt_state.shift_fp);
-	struct mlfq_bands bands = mlfq_read_bands();
-	u64 pct;
-	u32 tenth;
+	u64 wakes = t->wake_total;
+	u64 demotes = t->stat[MLFQ_STAT_DEMOTIONS];
+	u64 ups = t->stat[MLFQ_STAT_PROMOTIONS] +
+		  t->stat[MLFQ_STAT_AGING_BOOSTS] +
+		  t->stat[MLFQ_STAT_SHORT_SLEEP_BOOSTS];
+	u32 on_cpu = mlfq_on_cpu_now();
 
 	seq_puts(m, "\nSummary\n TL;DR\n  ");
 
@@ -327,50 +300,44 @@ static void mlfq_show_summary(struct seq_file *m)
 		return;
 	}
 
-	/*
-	 * Asked before the still-learning state below, because with the
-	 * controller off there is nothing for the bands to learn: they are at
-	 * their base values and will stay there, whether or not a window has
-	 * been folded into the gauge that would otherwise have moved them.
-	 */
-	if (!sched_feat(MLFQ_ADAPT)) {
+	if (!wakes) {
 		seq_puts(m,
-			 "MLFQ is working as expected, with adaptive band tuning turned off.\n");
+			 "MLFQ is working as expected but has not seen a wakeup yet.\n");
 		seq_puts(m, " Explanation\n  ");
 		seq_printf(m,
-			   "As you can see from the wakeup-latency gauge, it shows %llu us, against the %llu us target the bands would have been tuned to deliver. sched_feat(MLFQ_ADAPT) is off, so the band edges stay at %llu us and %llu us for good and the wakeup-rate gauge stays frozen, since the only thing that reads it is the storm gate the controller would have applied. Based on the internal rules of this scheduler, the latency gauge is folded either way, so that turning the controller on is an informed choice, and this shows what it would have been reacting to.\n",
-			   lat, target_us, mlfq_us(bands.t_l),
-			   mlfq_us(bands.t_h));
+			   "Nothing has been classified so far. Based on the internal rules of this scheduler, a task's level is only ever revisited when it wakes from a sleep or when it uses a whole request without sleeping, so every task is still in Q2 on its %llu us request, and this shows a machine that has had nothing to do since MLFQ was turned on.\n",
+			   mlfq_us(MLFQ_SLICE_Q2_NS));
 		return;
 	}
 
-	if (!folded) {
+	if (demotes * 100 < wakes && ups) {
 		seq_puts(m,
-			 "MLFQ is working as expected and is still learning your workload.\n");
+			 "MLFQ is working as expected and your workload is predominantly interactive.\n");
 		seq_puts(m, " Explanation\n  ");
 		seq_printf(m,
-			   "No measurement window has been folded yet, so the gauges are still collecting this machine's own wakeup behaviour, and the classifier is comparing against the base band edges of %llu us and %llu us. Based on the internal rules of this scheduler, the bands only ever move away from those edges while the wakeup-latency gauge runs above its %llu us target, and this shows that MLFQ is starting from the thresholds it was designed around.\n",
-			   base_l_us, base_h_us, target_us);
-		return;
+			   "As you can see from the counters, %llu wakeups have produced %llu promotions and %llu demotions. Based on the internal rules of this scheduler, a task is only demoted once it has used %d whole requests in a row without sleeping, so fewer than one demotion per hundred wakeups says that almost everything here sleeps between short pieces of work, and this shows the interactive level holding the tasks that belong in it.",
+			   wakes, ups, demotes, MLFQ_DEMOTE_REENQS);
+	} else if (demotes * 20 > wakes) {
+		seq_puts(m,
+			 "MLFQ is working as expected and is sorting a mixed workload.\n");
+		seq_puts(m, " Explanation\n  ");
+		seq_printf(m,
+			   "As you can see from the counters, %llu of the %llu wakeups seen so far ended in a demotion, against %llu promotions the other way. Based on the internal rules of this scheduler, those two are driven by opposite evidence -- %d consecutive exhausted requests demote, a short sleep or a stay of %llu ms promote -- so both of them running at once is what a machine with real work and real interaction looks like, and this shows the classifier telling the two apart.",
+			   demotes, wakes, ups, MLFQ_DEMOTE_REENQS,
+			   div_u64(MLFQ_AGING_PERIOD_NS, NSEC_PER_MSEC));
+	} else {
+		seq_puts(m,
+			 "MLFQ is working as expected.\n");
+		seq_puts(m, " Explanation\n  ");
+		seq_printf(m,
+			   "As you can see from the counters, %llu wakeups have produced %llu promotions and %llu demotions, and the three levels below hold what that sorting arrived at. Based on the internal rules of this scheduler, a level only changes on evidence that has repeated, so a machine whose tasks are already where they belong reclassifies little, and this shows the classification holding steady rather than idling.",
+			   wakes, ups, demotes);
 	}
 
-	seq_printf(m, "MLFQ is working as expected and is %s to your workload.\n",
-		   lat <= target_us ? "adapting correctly" : "still adapting");
-	seq_puts(m, " Explanation\n  ");
-	seq_printf(m,
-		   "As you can see from the wakeup-latency gauge, it shows %llu us, against a target of %llu us. ",
-		   lat, target_us);
-	if (rate)
-		seq_printf(m, "The wakeup-rate gauge shows %llu per second, ",
-			   rate);
-	else
-		seq_puts(m, "The wakeup-rate gauge is still warming up, ");
+	if (on_cpu)
+		seq_printf(m, " %u tasks are on a CPU right now.", on_cpu);
 
-	pct = mlfq_shift_pct(shift, &tenth);
-	seq_printf(m,
-		   "and the classifier is comparing against band edges of %llu us and %llu us, from base edges of %llu us and %llu us. Based on the internal rules of this scheduler, the bands only ever widen, only while the gauge runs above target, and by at most ten percentage points per step, so the final result is a shift of %s%llu.%u %%, and this shows that MLFQ is adapting to what your machine is actually doing.\n",
-		   mlfq_us(bands.t_l), mlfq_us(bands.t_h), base_l_us, base_h_us,
-		   shift < 0 ? "-" : "", pct, tenth);
+	seq_putc(m, '\n');
 }
 
 /*
@@ -414,20 +381,12 @@ static void mlfq_show_llc_loads(struct seq_file *m)
 }
 
 /*
- * The System counter grid: the dashboard's own fields, in its own order, with
- * the adaptation gauges after the counters as they are there. The fields it
- * fills from state this port does not keep are left out rather than printed as
- * zero, and mlfq_show_absent() lists them.
+ * The System counter grid: the dashboard's own fields, in its own order. The
+ * fields it fills from state this port does not keep are left out rather than
+ * printed as zero, and mlfq_show_absent() lists them.
  */
-static void mlfq_show_system(struct seq_file *m)
+static void mlfq_show_system(struct seq_file *m, const struct mlfq_totals *t)
 {
-	struct mlfq_totals t;
-	s64 shift;
-	u64 pct;
-	u32 tenth;
-
-	mlfq_read_totals(&t);
-
 	seq_puts(m, "\nSystem\n");
 
 	mlfq_seq_count(m, "on cpu", mlfq_on_cpu_now());
@@ -439,45 +398,28 @@ static void mlfq_show_system(struct seq_file *m)
 	 * only and reads the gauge from the runqueues directly, which cannot
 	 * drift the way a hand-balanced pair can.
 	 */
-	mlfq_seq_count(m, "switch-ins", t.stat[MLFQ_STAT_ON_CPU]);
+	mlfq_seq_count(m, "switch-ins", t->stat[MLFQ_STAT_ON_CPU]);
 
 	seq_printf(m, " %" MLFQ_LABEL_WIDTH, "uptime");
 	mlfq_seq_duration(m, ktime_get_ns());
 
 	seq_printf(m, " %" MLFQ_LABEL_WIDTH, "service");
-	mlfq_seq_duration(m, t.stat[MLFQ_STAT_TOTAL_RUNTIME]);
+	mlfq_seq_duration(m, t->stat[MLFQ_STAT_TOTAL_RUNTIME]);
 
-	mlfq_seq_count(m, "q1 placements", t.stat[MLFQ_STAT_Q1_PLACEMENTS]);
-	mlfq_seq_count(m, "q2 placements", t.stat[MLFQ_STAT_Q2_PLACEMENTS]);
-	mlfq_seq_count(m, "q3 placements", t.stat[MLFQ_STAT_Q3_PLACEMENTS]);
-	mlfq_seq_count(m, "q1 runnable", t.q_runnable[MLFQ_Q_INTERACTIVE]);
-	mlfq_seq_count(m, "q2 runnable", t.q_runnable[MLFQ_Q_DEFAULT]);
-	mlfq_seq_count(m, "q3 runnable", t.q_runnable[MLFQ_Q_BATCH]);
-	mlfq_seq_count(m, "promotions", t.stat[MLFQ_STAT_PROMOTIONS]);
-	mlfq_seq_count(m, "demotions", t.stat[MLFQ_STAT_DEMOTIONS]);
-	mlfq_seq_count(m, "aging boosts", t.stat[MLFQ_STAT_AGING_BOOSTS]);
+	mlfq_seq_count(m, "q1 placements", t->stat[MLFQ_STAT_Q1_PLACEMENTS]);
+	mlfq_seq_count(m, "q2 placements", t->stat[MLFQ_STAT_Q2_PLACEMENTS]);
+	mlfq_seq_count(m, "q3 placements", t->stat[MLFQ_STAT_Q3_PLACEMENTS]);
+	mlfq_seq_count(m, "q1 runnable", t->q_runnable[MLFQ_Q_INTERACTIVE]);
+	mlfq_seq_count(m, "q2 runnable", t->q_runnable[MLFQ_Q_DEFAULT]);
+	mlfq_seq_count(m, "q3 runnable", t->q_runnable[MLFQ_Q_BATCH]);
+	mlfq_seq_count(m, "promotions", t->stat[MLFQ_STAT_PROMOTIONS]);
+	mlfq_seq_count(m, "demotions", t->stat[MLFQ_STAT_DEMOTIONS]);
+	mlfq_seq_count(m, "aging boosts", t->stat[MLFQ_STAT_AGING_BOOSTS]);
 	mlfq_seq_count(m, "short-sleep boosts",
-		       t.stat[MLFQ_STAT_SHORT_SLEEP_BOOSTS]);
+		       t->stat[MLFQ_STAT_SHORT_SLEEP_BOOSTS]);
 	mlfq_seq_count(m, "preemption kicks",
-		       t.stat[MLFQ_STAT_PREEMPTION_KICKS]);
-
-	mlfq_seq_us(m, "wakeup lat", READ_ONCE(mlfq_sys_gauge.lat_ema));
-
-	seq_printf(m, " %" MLFQ_LABEL_WIDTH "%llu /s\n", "wakeup rate",
-		   READ_ONCE(mlfq_sys_gauge.rate_ema) >> MLFQ_FP_SHIFT);
-
-	seq_printf(m, " %" MLFQ_LABEL_WIDTH "%llu / %llu us\n",
-		   "t_l / t_h eff",
-		   mlfq_us(READ_ONCE(mlfq_adapt_state.t_l_eff_ns)),
-		   mlfq_us(READ_ONCE(mlfq_adapt_state.t_h_eff_ns)));
-
-	shift = READ_ONCE(mlfq_adapt_state.shift_fp);
-	pct = mlfq_shift_pct(shift, &tenth);
-	seq_printf(m, " %" MLFQ_LABEL_WIDTH "%s%llu.%u %%\n", "adapt shift",
-		   shift < 0 ? "-" : "", pct, tenth);
-
-	mlfq_seq_count(m, "wakeups", t.wake_total);
-	mlfq_seq_count(m, "adapt steps", READ_ONCE(mlfq_sys_gauge.adapt_steps));
+		       t->stat[MLFQ_STAT_PREEMPTION_KICKS]);
+	mlfq_seq_count(m, "wakeups", t->wake_total);
 
 	mlfq_show_llc_loads(m);
 }
@@ -540,15 +482,17 @@ static void mlfq_show_absent(struct seq_file *m)
 
 static int mlfq_stats_show(struct seq_file *m, void *v)
 {
+	struct mlfq_totals t;
+
+	mlfq_read_totals(&t);
+
 	seq_puts(m,
 		 "scx_mlfq on EEVDF: multilevel feedback queues, virtual time, placement\n");
-	seq_printf(m, "mlfq: %s   adaptive bands: %s\n",
-		   sched_feat(MLFQ) ? "on" : "off",
-		   sched_feat(MLFQ_ADAPT) ? "on" : "off");
+	seq_printf(m, "mlfq: %s\n", sched_feat(MLFQ) ? "on" : "off");
 
 	mlfq_show_per_cpu(m);
-	mlfq_show_summary(m);
-	mlfq_show_system(m);
+	mlfq_show_summary(m, &t);
+	mlfq_show_system(m, &t);
 	mlfq_show_absent(m);
 
 	return 0;

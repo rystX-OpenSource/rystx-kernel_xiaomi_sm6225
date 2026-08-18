@@ -768,15 +768,15 @@ struct wake_q_node {
  *			queue began; zero while the task is in Q1.
  * @last_boost_at:	rq clock at the last short-sleep boost, used to
  *			rate limit it.
- * @wake_enq_at:	rq clock at which the task was enqueued by a wakeup, or
- *			zero when no wakeup is in flight. Non-zero doubles as
- *			scx_mlfq's MLFQ_TF_ENQ_WAKEUP: it says that the wait
- *			ending at the task's next switch-in is a wakeup latency
- *			and should be fed to the system gauge.
  * @queue:		the queue the task currently belongs to, 1..3, where
  *			1 is the interactive queue and 3 the batch queue.
  * @reenq_cnt:		consecutive request exhaustions at the current level.
  * @wake_cnt:		consecutive short sleeps at the current level.
+ * @wake_pending:	set when the task was enqueued by a wakeup and cleared
+ *			once it has been placed. scx_mlfq's MLFQ_TF_ENQ_WAKEUP,
+ *			kept here because a wakeup does not always reach
+ *			placement with its enqueue flags; see
+ *			mlfq_wakeup_pending().
  * @last_qid:		the level this task was counted into on the runqueue it
  *			is queued on, or 0 when it is not counted. Owned by
  *			mlfq_runnable_enter() and mlfq_runnable_exit() alone, so
@@ -791,10 +791,10 @@ struct mlfq_ctx {
 	u64		last_sleep_at;
 	u64		queued_at;
 	u64		last_boost_at;
-	u64		wake_enq_at;
 	u8		queue;
 	u8		reenq_cnt;
 	u8		wake_cnt;
+	u8		wake_pending;
 	u8		last_qid;
 };
 
