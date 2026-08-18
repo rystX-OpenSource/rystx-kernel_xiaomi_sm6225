@@ -32,6 +32,13 @@
  * guaranteed batch-queue share of each dispatch batch provided in scx_mlfq, so
  * no quota is carried over.
  *
+ * A level's request size is also the budget of a CBS server, and a task that
+ * blocks before its request runs out leaves part of that budget unspent. The
+ * remainder is reclaimed for the level that owned it, so the next task placed at
+ * that level is granted the leftover on top of its own request; see struct
+ * mlfq_bonus. That is the only thing besides the classification that changes a
+ * request, and it changes it by at most the level's own size.
+ *
  * Everything below the classifier is unchanged EEVDF: placement, lag,
  * the tree, throttling, group scheduling and load balancing.
  *
@@ -303,6 +310,118 @@ static inline u8 mlfq_reenq_cnt_step(u8 cnt)
 }
 
 /**
+ * struct mlfq_bonus - a level's reclaim pool
+ * @ns:		request time granted to tasks of this level and never used,
+ *		because they blocked before their request ran out. Bounded by
+ *		the level's own request size.
+ * @since:	the rq clock at the last deposit, which is what the pool decays
+ *		from. Zero exactly when @ns is zero.
+ *
+ * Fair-share CBS reclaim: a level's server is (Q_i, P_i), and a task that
+ * blocks early hands back what it did not use so that another task of the same
+ * level can have it. The pool is only ever the unused part of budget the level
+ * had already been granted, so reclaiming it hands out no bandwidth the level
+ * did not have, and it is never shared across levels: what an interactive task
+ * gives back can only go to another interactive task, so no latency budget ever
+ * reaches a CPU-bound one.
+ *
+ * scx_mlfq keeps one pool per level for the whole machine, inside the queue_ctx
+ * its dispatch queues are described by, and reaches it with relaxed atomics.
+ * Here there is a pool per level per runqueue, in struct mlfq_pcpu, for two
+ * reasons. The slack is idle capacity on one CPU, and a task queued on another
+ * CPU never had that capacity available to it, so a machine-wide pool would
+ * hand it somewhere it cannot be spent. And both ends of the transfer happen
+ * under one runqueue's lock, which a per-runqueue pool is therefore already
+ * serialised by, so the atomics upstream needs are not needed here.
+ */
+struct mlfq_bonus {
+	u64	ns;
+	u64	since;
+};
+
+/**
+ * mlfq_fcbs_slack - the unused part of a request
+ * @grant_end: the sum_exec_runtime at which the request runs out
+ * @used: the task's sum_exec_runtime now
+ *
+ * A task that gives the CPU back before its request runs out leaves the
+ * remainder unused, and that remainder is what the pool is made of.
+ *
+ * scx_mlfq compares the grant against the length of the run segment, because a
+ * sched_ext task is dispatched with a slice grant and runs until it is used up
+ * or the task blocks, so the two are the same measurement. Under EEVDF a task
+ * can be preempted in the middle of a request and come back to the rest of it,
+ * so a run segment is not a request; what is compared here instead is the
+ * task's own sum_exec_runtime against the value it would have reached had the
+ * request been used in full. That is the same subtraction against a total that
+ * survives preemption and migration, and it needs no clock.
+ *
+ * A zero @grant_end means the task has no request to give anything back from,
+ * which is how the preemption burst declines to donate; the guarded subtraction
+ * returns zero for it without a case of its own. See mlfq_preempt_burst().
+ *
+ * Returns the unused nanoseconds.
+ */
+static inline u64 mlfq_fcbs_slack(u64 grant_end, u64 used)
+{
+	return grant_end > used ? grant_end - used : 0;
+}
+
+/**
+ * mlfq_fcbs_deposit - give a level's pool the unused part of a request
+ * @b: the level's pool
+ * @slack: the unused nanoseconds
+ * @q_i: the level's request size, which caps the pool
+ * @now: current rq clock
+ *
+ * The cap is what bounds everything downstream: a pool that holds at most one
+ * request means a reclaimed request is at most twice a level's own, so the
+ * bound is structural and no consumer has to clamp.
+ *
+ * @since is restamped on every deposit, so the decay in mlfq_fcbs_consume()
+ * measures how long the pool has gone unclaimed rather than how long ago it
+ * first held anything. scx_mlfq only stamps it when it is unset and never
+ * clears it, which anchors the decay at the first deposit after boot and so
+ * subtracts the whole uptime from every later pool; its own comment calls the
+ * field "the scx_bpf_now() of the last deposit", which is what this does.
+ */
+static inline void mlfq_fcbs_deposit(struct mlfq_bonus *b, u64 slack, u64 q_i,
+				     u64 now)
+{
+	b->ns = min(b->ns + slack, q_i);
+	b->since = now;
+}
+
+/**
+ * mlfq_fcbs_consume - take a level's pool into a request
+ * @b: the level's pool
+ * @slice: the level's own request size
+ * @now: current rq clock
+ *
+ * The pool is worth less the longer it goes unclaimed, because what it stands
+ * for is capacity that was free at the moment it was given back. It is decayed
+ * by the time since the last deposit and emptied, so it is granted once and to
+ * one task; nothing accumulates across levels and nothing is granted twice.
+ *
+ * Returns the request to grant, which is at most twice @slice.
+ */
+static inline u64 mlfq_fcbs_consume(struct mlfq_bonus *b, u64 slice, u64 now)
+{
+	u64 idle, bonus;
+
+	if (!b->ns)
+		return slice;
+
+	idle = mlfq_elapsed(now, b->since);
+	bonus = b->ns > idle ? b->ns - idle : 0;
+
+	b->ns = 0;
+	b->since = 0;
+
+	return slice + bonus;
+}
+
+/**
  * mlfq_boost_pending - does this wakeup earn the interactive boost
  * @ctx: the task's classification state
  * @sleep_ns: how long the task slept, 0 if unknown
@@ -474,6 +593,7 @@ static inline void mlfq_reset_classification(struct mlfq_ctx *ctx)
 	ctx->last_sleep_at = 0;
 	ctx->queued_at = 0;
 	ctx->last_boost_at = 0;
+	ctx->grant_end_ns = 0;
 	ctx->wake_pending = 0;
 	ctx->queue = MLFQ_Q_DEFAULT;
 	ctx->reenq_cnt = 0;
@@ -507,6 +627,8 @@ enum mlfq_stat_item {
 	MLFQ_STAT_AGING_BOOSTS,
 	MLFQ_STAT_SHORT_SLEEP_BOOSTS,
 	MLFQ_STAT_PREEMPTION_KICKS,
+	MLFQ_STAT_FCBS_GRANTS,		/* requests enlarged from a pool */
+	MLFQ_STAT_FCBS_SLACK_EVENTS,	/* deposits into a pool */
 	MLFQ_NR_STATS,
 };
 
@@ -517,20 +639,43 @@ enum mlfq_stat_item {
  * @q_runnable:	tasks of each level currently queued on this CPU's runqueue,
  *		indexed by level, so slot 0 is unused. Written only under this
  *		runqueue's lock, by the enqueue and dequeue hooks.
+ * @bonus:	the reclaim pool of each level on this runqueue, indexed by
+ *		level, so slot 0 is unused. Written only under this runqueue's
+ *		lock, which is what serialises it; see struct mlfq_bonus.
  * @wake_total:	wakeup enqueues seen on this CPU since boot, for the reader.
  *
  * scx_mlfq keeps the same split: one per-CPU array for the counters, and its
  * runnable occupancy derived from per-task ownership records rather than from
  * a shared total. Its wakeup total is per-CPU for the same reason -- nothing on
- * a scheduling path should have to touch a shared line to count an event.
+ * a scheduling path should have to touch a shared line to count an event. The
+ * reclaim pools are per-CPU here where upstream shares them; struct mlfq_bonus
+ * says why.
  */
 struct mlfq_pcpu {
-	u64	stat[MLFQ_NR_STATS];
-	u32	q_runnable[MLFQ_NR_QUEUES + 1];
-	u64	wake_total;
+	u64			stat[MLFQ_NR_STATS];
+	u32			q_runnable[MLFQ_NR_QUEUES + 1];
+	struct mlfq_bonus	bonus[MLFQ_NR_QUEUES + 1];
+	u64			wake_total;
 };
 
 DECLARE_PER_CPU(struct mlfq_pcpu, mlfq_pcpu);
+
+/**
+ * mlfq_bonus_of - the reclaim pool of a level on a runqueue
+ * @cpu: the runqueue, whose lock the caller holds
+ * @queue: the queue level, 1..3
+ *
+ * Returns %NULL for a level outside 1..3, including the zero a freshly
+ * allocated task_struct carries, which is scx_mlfq's failed queue lookup and is
+ * what its callers fall back to the plain request size on.
+ */
+static inline struct mlfq_bonus *mlfq_bonus_of(int cpu, u8 queue)
+{
+	if (!queue || queue > MLFQ_NR_QUEUES)
+		return NULL;
+
+	return &per_cpu(mlfq_pcpu, cpu).bonus[queue];
+}
 
 /*
  * Both of these are called from the scheduling paths with a runqueue lock

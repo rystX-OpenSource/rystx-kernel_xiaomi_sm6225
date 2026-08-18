@@ -284,6 +284,7 @@ static void mlfq_show_summary(struct seq_file *m, const struct mlfq_totals *t)
 {
 	u64 wakes = t->wake_total;
 	u64 demotes = t->stat[MLFQ_STAT_DEMOTIONS];
+	u64 grants = t->stat[MLFQ_STAT_FCBS_GRANTS];
 	u64 ups = t->stat[MLFQ_STAT_PROMOTIONS] +
 		  t->stat[MLFQ_STAT_AGING_BOOSTS] +
 		  t->stat[MLFQ_STAT_SHORT_SLEEP_BOOSTS];
@@ -334,6 +335,11 @@ static void mlfq_show_summary(struct seq_file *m, const struct mlfq_totals *t)
 			   "As you can see from the counters, %llu wakeups have produced %llu promotions and %llu demotions, and the three levels below hold what that sorting arrived at. Based on the internal rules of this scheduler, a level only changes on evidence that has repeated, so a machine whose tasks are already where they belong reclassifies little, and this shows the classification holding steady rather than idling.",
 			   wakes, ups, demotes);
 	}
+
+	if (grants)
+		seq_printf(m,
+			   " %llu requests were enlarged by budget handed back from tasks that blocked early.",
+			   grants);
 
 	if (on_cpu)
 		seq_printf(m, " %u tasks are on a CPU right now.", on_cpu);
@@ -420,6 +426,9 @@ static void mlfq_show_system(struct seq_file *m, const struct mlfq_totals *t)
 		       t->stat[MLFQ_STAT_SHORT_SLEEP_BOOSTS]);
 	mlfq_seq_count(m, "preemption kicks",
 		       t->stat[MLFQ_STAT_PREEMPTION_KICKS]);
+	mlfq_seq_count(m, "fcbs grants", t->stat[MLFQ_STAT_FCBS_GRANTS]);
+	mlfq_seq_count(m, "fcbs slack",
+		       t->stat[MLFQ_STAT_FCBS_SLACK_EVENTS]);
 	mlfq_seq_count(m, "wakeups", t->wake_total);
 
 	mlfq_show_llc_loads(m);
@@ -474,7 +483,7 @@ static int mlfq_stats_show(struct seq_file *m, void *v)
 	mlfq_read_totals(&t);
 
 	seq_puts(m,
-		 "scx_mlfq on EEVDF: fixed-window burst gauge, three queues, virtual time, placement\n");
+		 "scx_mlfq on EEVDF: fixed-window burst gauge, three queues, virtual time, placement, budget reclaim\n");
 	seq_printf(m, "mlfq: %s\n", sched_feat(MLFQ) ? "on" : "off");
 
 	mlfq_show_per_cpu(m);

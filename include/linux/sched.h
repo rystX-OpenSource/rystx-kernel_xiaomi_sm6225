@@ -769,6 +769,10 @@ struct wake_q_node {
  *			queue began; zero while the task is in Q1.
  * @last_boost_at:	rq clock at the last short-sleep boost, used to
  *			rate limit it.
+ * @grant_end_ns:	the se.sum_exec_runtime at which the request the task was
+ *			last granted runs out, or zero when it has no request to
+ *			donate the remainder of. What is left of it when the task
+ *			blocks is the FCBS slack; see mlfq_fcbs_slack().
  * @queue:		the queue the task currently belongs to, 1..3, where
  *			1 is the interactive queue and 3 the batch queue.
  * @reenq_cnt:		consecutive request exhaustions at the current level.
@@ -792,6 +796,7 @@ struct mlfq_ctx {
 	u64		last_sleep_at;
 	u64		queued_at;
 	u64		last_boost_at;
+	u64		grant_end_ns;
 	u8		queue;
 	u8		reenq_cnt;
 	u8		wake_cnt;
