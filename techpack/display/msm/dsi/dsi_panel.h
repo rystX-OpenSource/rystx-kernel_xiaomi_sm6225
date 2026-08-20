@@ -154,6 +154,7 @@ struct dsi_panel_reset_config {
 	u32 count;
 
 	int reset_gpio;
+	bool fts_reset_seq;
 	int disp_en_gpio;
 	int lcm_enp_gpio;
 	int lcm_enn_gpio;

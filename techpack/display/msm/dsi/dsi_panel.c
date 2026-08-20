@@ -528,6 +528,27 @@ static int dsi_panel_power_on(struct dsi_panel *panel)
 			goto error_disable_lcm_gpio;
 		}
 	udelay(3000);
+
+	if (panel->reset_config.fts_reset_seq) {
+		if (gpio_is_valid(panel->reset_config.reset_gpio)) {
+			DSI_INFO("set reset gpio to 1\n");
+			gpio_set_value(panel->reset_config.reset_gpio, 1);
+		}
+
+		usleep_range(5000, 6000);
+		if (gpio_is_valid(panel->reset_config.reset_gpio)) {
+			DSI_INFO("set reset gpio to 0\n");
+			gpio_set_value(panel->reset_config.reset_gpio, 0);
+		}
+
+		usleep_range(5000, 6000);
+		if (gpio_is_valid(panel->reset_config.reset_gpio)) {
+			DSI_INFO("set reset gpio to 1\n");
+			gpio_set_value(panel->reset_config.reset_gpio, 1);
+		}
+
+		msleep(35);
+	}
 #endif
 #ifdef CONFIG_TARGET_PROJECT_K7T
 	int power_status = DRM_PANEL_BLANK_UNBLANK;
@@ -2497,6 +2518,9 @@ static int dsi_panel_parse_gpios(struct dsi_panel *panel)
 		DSI_ERR("lcm: [%s] project qcom,lcm-enn-gpio is not set, rc=%d\n",
 			 panel->name, rc);
 	}
+
+	panel->reset_config.fts_reset_seq = utils->read_bool(utils->data,
+					"qcom,mdss-dsi-focaltech-reset-sequence");
 #endif
 	panel->reset_config.lcd_mode_sel_gpio = utils->get_named_gpio(
 		utils->data, mode_set_gpio_name, 0);
