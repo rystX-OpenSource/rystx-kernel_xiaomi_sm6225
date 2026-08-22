@@ -122,7 +122,15 @@ static inline void psi_ttwu_dequeue(struct task_struct *p)
 		rq = __task_rq_lock(p, &rf);
 		psi_task_change(p, clear, 0);
 		p->sched_psi_wake_requeue = 1;
+#ifdef CONFIG_SCHED_MUQSS
+		/*
+		 * MuQSS.h provides mainline's 3-arg __task_rq_unlock(); 4.19's
+		 * sched.h still has the 2-arg one this file was written against.
+		 */
+		__task_rq_unlock(rq, p, &rf);
+#else
 		__task_rq_unlock(rq, &rf);
+#endif
 	}
 }
 

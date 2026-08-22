@@ -231,7 +231,18 @@ struct task_struct;
 /* Free all resources held by a thread. */
 extern void release_thread(struct task_struct *);
 
-unsigned long get_wchan(struct task_struct *p);
+/*
+ * Mainline 42a20f86dc19 renamed the arch stack walker to __get_wchan() and
+ * moved the "make sure the task really is blocked, and keep it that way"
+ * wrapper into the scheduler. MuQSS.c carries that wrapper, so the walker has
+ * to answer to the new name for a MuQSS build. 4.19's CFS core.c has no such
+ * wrapper, so for a !CONFIG_SCHED_MUQSS build the walker keeps its old name
+ * and fs/proc keeps reaching it exactly as before.
+ */
+unsigned long __get_wchan(struct task_struct *p);
+#ifndef CONFIG_SCHED_MUQSS
+#define get_wchan(p)	__get_wchan(p)
+#endif
 
 /* Thread switching */
 extern struct task_struct *cpu_switch_to(struct task_struct *prev,

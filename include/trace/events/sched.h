@@ -135,6 +135,7 @@ TRACE_EVENT(sched_kthread_work_execute_end,
 	TP_printk("work struct %p: function %ps", __entry->work, __entry->function)
 );
 
+#ifndef CONFIG_SCHED_MUQSS
 /*
  * Tracepoint for task enqueue/dequeue:
  */
@@ -179,6 +180,7 @@ TRACE_EVENT(sched_enq_deq_task,
 			__entry->cpus_allowed, __entry->demand,
 			__entry->pred_demand)
 );
+#endif /* !CONFIG_SCHED_MUQSS */
 
 /*
  * Tracepoint for waking up a task:
@@ -742,6 +744,15 @@ TRACE_EVENT(sched_wake_idle_without_ipi,
 );
 
 #ifdef CONFIG_SMP
+/*
+ * Everything from here to the end of the CONFIG_SMP block reaches into
+ * struct cfs_rq, struct sched_entity, PELT averages and the WALT/core_ctl
+ * helpers, none of which exist under MuQSS: fair.c, pelt.c and sched_avg.c
+ * are the only callers of these tracepoints and they are not built. The
+ * definitions would still be instantiated by the CREATE_TRACE_POINTS include
+ * in MuQSS.c, so they have to be compiled out rather than merely unused.
+ */
+#ifndef CONFIG_SCHED_MUQSS
 #ifdef CREATE_TRACE_POINTS
 static inline
 int __trace_sched_cpu(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -1561,7 +1572,35 @@ DECLARE_TRACE(pelt_thermal_tp,
 	TP_PROTO(struct rq *rq),
 	TP_ARGS(rq));
 
+#endif /* !CONFIG_SCHED_MUQSS */
 #endif /* CONFIG_SMP */
+
+#ifdef CONFIG_SCHED_MUQSS
+/*
+ * MuQSS mirrors the bare-tracepoint surface mainline's core.c exports. 4.19's
+ * CFS has no equivalent of these three, so they are declared for MuQSS builds
+ * only; a !CONFIG_SCHED_MUQSS kernel sees this header exactly as before.
+ *
+ * The _tp suffix is spelled out because 4.19's DECLARE_TRACE() takes the name
+ * verbatim, while 6.17+ appends _tp itself - same tracepoint names and same
+ * trace_<name>() helpers either way, as with pelt_thermal_tp in this file.
+ */
+struct rq;
+
+DECLARE_TRACE(sched_update_nr_running_tp,
+	TP_PROTO(struct rq *rq, int change),
+	TP_ARGS(rq, change));
+
+DECLARE_TRACE_CONDITION(sched_set_state_tp,
+	TP_PROTO(struct task_struct *tsk, int state),
+	TP_ARGS(tsk, state),
+	TP_CONDITION(!!(tsk->state) != !!state));
+
+DECLARE_TRACE(sched_set_need_resched_tp,
+	TP_PROTO(struct task_struct *tsk, int cpu, int tif),
+	TP_ARGS(tsk, cpu, tif));
+#endif /* CONFIG_SCHED_MUQSS */
+
 #endif /* _TRACE_SCHED_H */
 
 /* This part must be outside protection */

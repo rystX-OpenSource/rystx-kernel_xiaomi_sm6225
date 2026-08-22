@@ -586,7 +586,15 @@ static inline void load_sp0(unsigned long sp0)
 /* Free all resources held by a thread. */
 extern void release_thread(struct task_struct *);
 
-unsigned long get_wchan(struct task_struct *p);
+/* See the arm64 copy of this comment: mainline 42a20f86dc19 split the walker
+ * out as __get_wchan() and put the blocked-task wrapper in the scheduler, which
+ * is where MuQSS.c has it. CFS builds here have no wrapper, so they keep
+ * calling the walker under its 4.19 name.
+ */
+unsigned long __get_wchan(struct task_struct *p);
+#ifndef CONFIG_SCHED_MUQSS
+#define get_wchan(p)	__get_wchan(p)
+#endif
 
 /*
  * Generic CPUID function

@@ -29,6 +29,9 @@
 #include <linux/mm_types_task.h>
 #include <linux/mm_event.h>
 #include <linux/task_io_accounting.h>
+#ifdef CONFIG_SCHED_MUQSS
+#include <linux/skip_list.h>
+#endif
 #include <linux/rseq.h>
 #include <linux/android_kabi.h>
 
@@ -756,6 +759,9 @@ struct task_struct {
 	/* -1 unrunnable, 0 runnable, >0 stopped: */
 	volatile long			state;
 
+	/* saved state for "spinlock sleepers" */
+	unsigned int			saved_state;
+
 	/*
 	 * This begins the randomizable portion of task_struct. Only
 	 * scheduling-critical items should be added above here.
@@ -796,6 +802,86 @@ struct task_struct {
 	int				normal_prio;
 	unsigned int			rt_priority;
 
+#ifdef CONFIG_SCHED_MUQSS
+	int				time_slice;
+	u64				deadline;
+	skiplist_node			node; /* Skip list node */
+	u64				last_ran;
+	u64				sched_time; /* sched_clock time spent running */
+#ifdef CONFIG_SMT_NICE
+	int				smt_bias; /* Policy/nice level bias across smt siblings */
+#endif
+#ifdef CONFIG_HOTPLUG_CPU
+	bool				zerobound; /* Bound to CPU0 for hotplug */
+#endif
+	unsigned long			rt_timeout;
+	/* Unbanked cpu time */
+	unsigned long			utime_ns, stime_ns;
+#ifdef CONFIG_MUQSS_IOTIME
+	/*
+	 * Block device time consumed on this task's behalf. Updated from
+	 * I/O completion, which may be any CPU, so these are atomic. Read
+	 * via /proc/<pid>/iotime. Not inherited across fork. Bytes are not
+	 * counted here, task_io_accounting already has them.
+	 *
+	 * io_latency_ns is end to end per bio, so it includes queue wait and
+	 * is what a waiting task experiences. io_occupancy_ns is device
+	 * service time per request, which is what this task cost everybody
+	 * else, and is the only one of the two fit to charge for.
+	 *
+	 * io_debt_ns is occupancy not yet charged to the deadline. The
+	 * scheduler consumes and zeroes it; see consume_iotime_penalty().
+	 */
+	atomic64_t			io_latency_ns;
+	atomic64_t			io_count;
+	atomic64_t			io_occupancy_ns;
+	atomic64_t			io_debt_ns;
+
+	/*
+	 * CPU time burnt in some other thread's context on this task's
+	 * behalf, currently kworkers running work items it queued. Unlike the
+	 * I/O counters above this is CPU time, which the task would have been
+	 * charged against its own time_slice had the kernel done the work
+	 * synchronously instead of handing it to a worker.
+	 *
+	 * kern_time_ns is cumulative and only for reporting. kern_debt_ns is
+	 * the part not yet charged to the deadline; the scheduler consumes
+	 * and zeroes it, see consume_kerntime_penalty().
+	 */
+	atomic64_t			kern_time_ns;
+	atomic64_t			kern_debt_ns;
+
+	/*
+	 * Index of this task's slot in the I/O owner table, stamped into
+	 * page->flags when it dirties a page so writeback can be charged
+	 * back to it. 0 means no slot; allocated lazily on first dirty and
+	 * released on exit.
+	 */
+	unsigned int			io_owner_slot;
+
+	/*
+	 * The task this one is currently working on behalf of, or NULL.
+	 * kworkers publish the task that queued a work item here for the
+	 * duration of the item, which attributes any I/O the work submits,
+	 * and any pages it dirties, to the task that queued the work rather
+	 * than losing them to a kernel thread.
+	 *
+	 * Only ever written by the task itself and only read while it is
+	 * running, so it needs no locking. The publisher holds a reference
+	 * to the pointee for the whole window.
+	 */
+	struct task_struct		*io_owner_override;
+#endif
+	u64				last_sleep_ts;
+
+	int				boost;
+	u64				boost_period;
+	u64				boost_expires;
+
+#ifdef CONFIG_CGROUP_SCHED
+	struct task_group		*sched_task_group;
+#endif
+#else /* CONFIG_SCHED_MUQSS */
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
@@ -809,6 +895,7 @@ struct task_struct {
 	struct task_group		*sched_task_group;
 #endif
 	struct sched_dl_entity		dl;
+#endif /* CONFIG_SCHED_MUQSS */
 
 #ifdef CONFIG_UCLAMP_TASK
 	/*
@@ -835,8 +922,13 @@ struct task_struct {
 	unsigned int			policy;
 	unsigned long			max_allowed_capacity;
 	int				nr_cpus_allowed;
+	const cpumask_t			*cpus_ptr;
+	cpumask_t			*user_cpus_ptr;
 	cpumask_t			cpus_allowed;
 	cpumask_t			cpus_requested;
+	void				*migration_pending;
+	unsigned short			migration_disabled;
+	unsigned short			migration_flags;
 
 #ifdef CONFIG_PREEMPT_RCU
 	int				rcu_read_lock_nesting;
@@ -894,6 +986,9 @@ struct task_struct {
 	unsigned			sched_contributes_to_load:1;
 	unsigned			sched_migrated:1;
 	unsigned			sched_remote_wakeup:1;
+#ifdef CONFIG_RT_MUTEXES
+	unsigned			sched_rt_mutex:1;
+#endif
 #ifdef CONFIG_PSI
 	unsigned			sched_psi_wake_requeue:1;
 #endif
@@ -1136,6 +1231,10 @@ struct task_struct {
 	int				lockdep_depth;
 	unsigned int			lockdep_recursion;
 	struct held_lock		held_locks[MAX_LOCK_DEPTH];
+#endif
+
+#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+	int				non_block_count;
 #endif
 
 #ifdef CONFIG_UBSAN
@@ -1466,6 +1565,8 @@ struct task_struct {
 	 */
 };
 
+#include <linux/muqss.h>
+
 static inline struct pid *task_pid(struct task_struct *task)
 {
 	return task->thread_pid;
@@ -1654,6 +1755,20 @@ extern struct pid *cad_pid;
 #define PF_FREEZER_SKIP		0x40000000	/* Freezer should not count it as freezable */
 #define PF_SUSPEND_TASK		0x80000000      /* This thread called freeze_processes() and should not be frozen */
 
+#ifdef CONFIG_SCHED_MUQSS
+/*
+ * MuQSS - and MUQSS_IOTIME's block/blk-iotime.c - test PF_IO_WORKER alongside
+ * PF_WQ_WORKER and PF_KTHREAD. 4.19 has neither the flag nor io-wq: io_uring
+ * arrived in 5.1 and PF_IO_WORKER in 5.12, so nothing in this tree can ever
+ * set it. Defining it as 0 rather than burning one of the last free bits makes
+ * every one of those tests fold away at compile time, and leaves the io-wq
+ * arms as dead code that still typechecks. The io_wq_worker_sleeping() and
+ * io_wq_worker_running() stubs those arms call live in kernel/sched/MuQSS.h,
+ * which is their only caller.
+ */
+#define PF_IO_WORKER		0
+#endif /* CONFIG_SCHED_MUQSS */
+
 /*
  * Only the _current_ task can read/write to tsk->flags, but other
  * tasks can access tsk->flags in readonly mode for example
@@ -1691,6 +1806,20 @@ static __always_inline bool is_percpu_thread(void)
 	return true;
 #endif
 }
+
+#ifdef CONFIG_SCHED_MUQSS
+/*
+ * Mainline tests (PF_KTHREAD | PF_USER_WORKER) here. 4.19 has no
+ * PF_USER_WORKER: the io_uring and vhost workers it was introduced for do not
+ * exist in this tree, so PF_KTHREAD alone still covers every task that runs
+ * without being a user task. Only MuQSS uses this, so CFS builds are
+ * unaffected.
+ */
+static __always_inline bool is_user_task(struct task_struct *task)
+{
+	return task->mm && !(task->flags & PF_KTHREAD);
+}
+#endif /* CONFIG_SCHED_MUQSS */
 
 /* Per-process atomic flags. */
 #define PFA_NO_NEW_PRIVS		0	/* May not gain new privileges. */
@@ -1751,9 +1880,22 @@ extern int task_can_attach(struct task_struct *p, const struct cpumask *cs_cpus_
 extern void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask);
 extern int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask);
 extern bool cpupri_check_rt(void);
+extern int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src, int node);
+extern void release_user_cpus_ptr(struct task_struct *p);
+extern void force_compatible_cpus_allowed_ptr(struct task_struct *p);
+extern void relax_compatible_cpus_allowed_ptr(struct task_struct *p);
+extern void ___migrate_enable(void);
 #else
 static inline void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 {
+}
+static inline int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src, int node)
+{
+	return 0;
+}
+static inline void release_user_cpus_ptr(struct task_struct *p)
+{
+	WARN_ON(p->user_cpus_ptr);
 }
 static inline int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
 {
@@ -1998,6 +2140,23 @@ static inline int spin_needbreak(spinlock_t *lock)
 #endif
 }
 
+#ifdef CONFIG_SCHED_MUQSS
+/*
+ * Same question for a rwlock. Mainline keeps both of these in
+ * <linux/spinlock.h>; 4.19 still has spin_needbreak() here, so its sibling
+ * goes here too rather than moving anything. rwlock_is_contended() is already
+ * provided by <linux/rwlock.h>.
+ */
+static inline int rwlock_needbreak(rwlock_t *lock)
+{
+#ifdef CONFIG_PREEMPT
+	return rwlock_is_contended(lock);
+#else
+	return 0;
+#endif
+}
+#endif /* CONFIG_SCHED_MUQSS */
+
 static __always_inline bool need_resched(void)
 {
 	return unlikely(tif_need_resched());
@@ -2034,8 +2193,24 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
 
 static inline bool task_is_runnable(struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_MUQSS
+	/* MuQSS has no delayed dequeue: queued means runnable. */
+	return p->on_rq;
+#else
 	return p->on_rq && !p->se.sched_delayed;
+#endif
 }
+
+#ifdef CONFIG_SCHED_MUQSS
+/*
+ * Mainline 42a20f86dc19 moved the blocked-task wrapper around the arch stack
+ * walker into the scheduler and declared it here; MuQSS.c defines that
+ * wrapper. Under CFS this tree has no wrapper, and <asm/processor.h> keeps
+ * pointing get_wchan() straight at the arch walker instead, so the
+ * declaration is only needed - and only correct - for MuQSS builds.
+ */
+extern unsigned long get_wchan(struct task_struct *p);
+#endif /* CONFIG_SCHED_MUQSS */
 
 /*
  * In order to reduce various lock holder preemption latencies provide an

@@ -234,6 +234,13 @@ void ftrace_likely_update(struct ftrace_likely_data *f, int val,
 
 #define absolute_pointer(val)	RELOC_HIDE((void *)(val), 0)
 
+/*
+ * data_race(): mark an intentionally racy access so that a race detector does
+ * not flag it.  There is no KCSAN in this tree, so this is documentation only
+ * and evaluates to the expression itself.
+ */
+#define data_race(expr)		(expr)
+
 #ifndef OPTIMIZER_HIDE_VAR
 /* Make the optimizer believe the variable can be manipulated arbitrarily. */
 #define OPTIMIZER_HIDE_VAR(var)						\

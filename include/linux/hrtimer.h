@@ -358,11 +358,19 @@ extern void hrtimers_resume(void);
 DECLARE_PER_CPU(struct tick_device, tick_cpu_device);
 
 
+static inline enum hrtimer_restart hrtimer_dummy_timeout(struct hrtimer *unused)
+{
+	return HRTIMER_NORESTART;
+}
+
 /* Exported timer functions: */
 
 /* Initialize timers: */
 extern void hrtimer_init(struct hrtimer *timer, clockid_t which_clock,
 			 enum hrtimer_mode mode);
+extern void hrtimer_setup(struct hrtimer *timer,
+			  enum hrtimer_restart (*function)(struct hrtimer *),
+			  clockid_t clock_id, enum hrtimer_mode mode);
 
 #ifdef CONFIG_DEBUG_OBJECTS_TIMERS
 extern void hrtimer_init_on_stack(struct hrtimer *timer, clockid_t which_clock,
