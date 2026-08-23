@@ -232,6 +232,18 @@ struct signal_struct {
 	struct mm_struct *oom_mm;	/* recorded mm when the thread group got
 					 * killed by the oom killer */
 
+#ifdef CONFIG_ANDROID_TAGLMK
+	/*
+	 * TAGLMK task classification cache: bits 7:0 hold the class, bits 31:8
+	 * the pin list generation it was decided against.  Read and written
+	 * with single accesses so a reader can never observe a torn value, and
+	 * every writer computes the same answer from the same inputs, so the
+	 * race between them is harmless.  Generations start at one, which makes
+	 * the zero this is allocated with mean "never classified".
+	 */
+	u32 taglmk_class;
+#endif
+
 	struct mutex cred_guard_mutex;	/* guard against foreign influences on
 					 * credential calculations
 					 * (notably. ptrace) */
