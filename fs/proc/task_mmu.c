@@ -9,16 +9,19 @@
 #include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/pagemap.h>
+#include <linux/mm_inline.h>
 #include <linux/mempolicy.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/signal.h>
 #include <linux/swapops.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
+#include <linux/taglmk.h>
 
 #include <asm/elf.h>
 #include <asm/tlb.h>
@@ -1837,6 +1840,479 @@ const struct file_operations proc_pagemap_operations = {
 	.release	= pagemap_release,
 };
 #endif /* CONFIG_PROC_PAGE_MONITOR */
+
+#ifdef CONFIG_ANDROID_TAGLMK
+
+/*
+ * TAGLMK independent Android reclaim driver
+ * =========================================
+ *
+ * A self contained, per address space reclaimer.  It exists so the TAGLMK core
+ * can take memory back from a task without killing it, and so userspace can ask
+ * for the same thing through /proc/<pid>/reclaim.
+ *
+ * Anonymous pages are isolated and pushed through shrink_page_list(), which on
+ * Android means they end up compressed in ZRAM.  File pages are only moved to
+ * the inactive list: discarding them would shrink the active file LRU that both
+ * vmscan and lmkd read as their health signal, and they are cheap to fetch from
+ * flash again anyway.
+ *
+ * Pages shared with another process are always left alone.  On Android most of
+ * those come from zygote, so swapping them out would penalise every application
+ * at once instead of the one we were asked about.
+ *
+ * The walk only ever clears young bits, so it needs no per entry TLB
+ * invalidation; a single flush_tlb_mm() once the walk is over is enough.  The
+ * actual unmapping, and the invalidation that needs, happens later inside
+ * shrink_page_list() -> try_to_unmap().
+ */
+
+/**
+ * struct taglmk_reclaim_walk - state carried through one reclaim walk
+ * @type: Which mappings the caller asked us to act upon.
+ * @nr_to_reclaim: Stop once this many pages have been reclaimed.  Zero means
+ *	walk the whole address space.
+ * @stat: Running tally, handed back to the caller when the walk ends.
+ */
+struct taglmk_reclaim_walk {
+	enum taglmk_reclaim_type	type;
+	unsigned long			nr_to_reclaim;
+	struct taglmk_reclaim_stat	stat;
+};
+
+/* What taglmk_handle_pmd() leaves for the caller to do. */
+enum taglmk_pmd_result {
+	TAGLMK_PMD_HANDLED,	/* this pmd needs no further attention */
+	TAGLMK_PMD_WALK_PTES,	/* carry on at the pte level */
+};
+
+static bool taglmk_budget_met(const struct taglmk_reclaim_walk *ctl)
+{
+	if (!ctl->nr_to_reclaim)
+		return false;
+
+	/*
+	 * Deactivations count towards the budget.  They are the whole of the
+	 * work a file pass does, since nothing there is ever handed to
+	 * reclaim_pages(), so a caller that asked for a bounded amount of work
+	 * would otherwise walk the entire address space before noticing it was
+	 * already done.
+	 */
+	return ctl->stat.nr_reclaimed + ctl->stat.nr_deactivated >=
+	       ctl->nr_to_reclaim;
+}
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+/**
+ * taglmk_handle_pmd - act on a pmd mapped transparent huge page
+ * @ctl: Walk state.
+ * @walk: Walker the callback was invoked with.
+ * @pmd: The pmd to look at.
+ * @addr: First address covered by this walk step.
+ * @end: One past the last address covered by this walk step.
+ * @isolated: List collecting anonymous pages for the shrink pass.
+ * @nr_isolated: Running count of pages on @isolated.
+ *
+ * Return: %TAGLMK_PMD_HANDLED when there is nothing left to do for this pmd,
+ * %TAGLMK_PMD_WALK_PTES when the caller should descend to the pte level.
+ */
+static enum taglmk_pmd_result taglmk_handle_pmd(struct taglmk_reclaim_walk *ctl,
+						struct mm_walk *walk,
+						pmd_t *pmd, unsigned long addr,
+						unsigned long end,
+						struct list_head *isolated,
+						unsigned int *nr_isolated)
+{
+	struct vm_area_struct *vma = walk->vma;
+	struct page *page;
+	spinlock_t *ptl;
+
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (!ptl)
+		return TAGLMK_PMD_WALK_PTES;
+
+	if (!pmd_present(*pmd) || is_huge_zero_pmd(*pmd))
+		goto unlock;
+
+	page = pmd_page(*pmd);
+
+	/* Shared with another process: not ours to reclaim. */
+	if (page_mapcount(page) > 1)
+		goto unlock;
+
+	/*
+	 * The huge page reaches past the range we were asked about, so it
+	 * cannot be handled as a whole.  Split it and let the caller deal with
+	 * the parts that are in range.  Collapsing a THP is never cheap, hence
+	 * the check: a split is only paid for when the page really is only
+	 * partially ours.
+	 */
+	if (end - addr != HPAGE_PMD_SIZE) {
+		int err;
+
+		get_page(page);
+		spin_unlock(ptl);
+		lock_page(page);
+		err = split_huge_page(page);
+		unlock_page(page);
+		put_page(page);
+
+		return err ? TAGLMK_PMD_HANDLED : TAGLMK_PMD_WALK_PTES;
+	}
+
+	if (page_is_file_cache(page)) {
+		if (ctl->type == TAGLMK_RECLAIM_ANON)
+			goto unlock;
+
+		pmdp_test_and_clear_young(vma, addr, pmd);
+		deactivate_page(page);
+		ctl->stat.nr_scanned += HPAGE_PMD_NR;
+		ctl->stat.nr_deactivated += HPAGE_PMD_NR;
+		goto unlock;
+	}
+
+	if (ctl->type == TAGLMK_RECLAIM_FILE)
+		goto unlock;
+
+	if (isolate_lru_page(page))
+		goto unlock;
+
+	ctl->stat.nr_scanned += HPAGE_PMD_NR;
+	list_add(&page->lru, isolated);
+	*nr_isolated += HPAGE_PMD_NR;
+unlock:
+	spin_unlock(ptl);
+	return TAGLMK_PMD_HANDLED;
+}
+#else /* !CONFIG_TRANSPARENT_HUGEPAGE */
+static enum taglmk_pmd_result taglmk_handle_pmd(struct taglmk_reclaim_walk *ctl,
+						struct mm_walk *walk,
+						pmd_t *pmd, unsigned long addr,
+						unsigned long end,
+						struct list_head *isolated,
+						unsigned int *nr_isolated)
+{
+	return TAGLMK_PMD_WALK_PTES;
+}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+
+/**
+ * taglmk_handle_page - act on one small candidate page
+ * @ctl: Walk state.
+ * @vma: VMA the page is mapped in.
+ * @addr: Address @pte maps.
+ * @pte: The mapping itself, still under the page table lock.
+ * @page: Candidate page, already known to be mapped exclusively.
+ * @isolated: List collecting anonymous pages for the shrink pass.
+ *
+ * Return: number of pages added to @isolated.
+ */
+static unsigned int taglmk_handle_page(struct taglmk_reclaim_walk *ctl,
+				       struct vm_area_struct *vma,
+				       unsigned long addr, pte_t *pte,
+				       struct page *page,
+				       struct list_head *isolated)
+{
+	if (page_is_file_cache(page)) {
+		if (ctl->type == TAGLMK_RECLAIM_ANON)
+			return 0;
+
+		ptep_test_and_clear_young(vma, addr, pte);
+		deactivate_page(page);
+		ctl->stat.nr_scanned++;
+		ctl->stat.nr_deactivated++;
+		return 0;
+	}
+
+	if (ctl->type == TAGLMK_RECLAIM_FILE)
+		return 0;
+
+	/*
+	 * Leave the young bit alone here.  shrink_page_list() consults it and
+	 * will rotate a page that is genuinely still hot instead of paying to
+	 * compress it, which is exactly the behaviour we want.
+	 */
+	if (isolate_lru_page(page))
+		return 0;
+
+	ctl->stat.nr_scanned++;
+	list_add(&page->lru, isolated);
+	return 1;
+}
+
+static int taglmk_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long end,
+			    struct mm_walk *walk)
+{
+	struct taglmk_reclaim_walk *ctl = walk->private;
+	struct vm_area_struct *vma = walk->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned int nr_isolated = 0;
+	pte_t *orig_pte, *pte;
+	spinlock_t *ptl;
+	struct page *page;
+	LIST_HEAD(isolated);
+
+	if (fatal_signal_pending(current))
+		return -EINTR;
+
+	if (taglmk_handle_pmd(ctl, walk, pmd, addr, end, &isolated,
+			      &nr_isolated) == TAGLMK_PMD_HANDLED)
+		goto out;
+
+	if (pmd_trans_unstable(pmd))
+		goto out;
+
+	orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	for (; addr < end; pte++, addr += PAGE_SIZE) {
+		pte_t ptent = *pte;
+
+		if (!pte_present(ptent))
+			continue;
+
+		/*
+		 * Asking for device public pages, as the THP aware per process
+		 * reclaim this is modelled on does, is only safe because of the
+		 * PageLRU() test below: such a page is never on an LRU, so it is
+		 * dropped before anything here tries to move it between lists.
+		 */
+		page = _vm_normal_page(vma, addr, ptent, true);
+		if (!page)
+			continue;
+
+		/*
+		 * A huge page that is mapped by ptes.  Split it so the rest of
+		 * the loop only ever sees single pages, then revisit this very
+		 * address.  Anything not exclusively ours is left alone, and so
+		 * is the remainder of the pmd, because the pages behind it
+		 * belong to the same huge page.
+		 */
+		if (PageTransCompound(page)) {
+			if (page_mapcount(page) != 1)
+				break;
+
+			get_page(page);
+			if (!trylock_page(page)) {
+				put_page(page);
+				break;
+			}
+			pte_unmap_unlock(orig_pte, ptl);
+
+			if (split_huge_page(page)) {
+				unlock_page(page);
+				put_page(page);
+				orig_pte = pte = pte_offset_map_lock(mm, pmd,
+								addr, &ptl);
+				break;
+			}
+			unlock_page(page);
+			put_page(page);
+
+			orig_pte = pte = pte_offset_map_lock(mm, pmd, addr,
+							     &ptl);
+			pte--;
+			addr -= PAGE_SIZE;
+			continue;
+		}
+
+		if (!PageLRU(page))
+			continue;
+
+		/* Shared with another process: not ours to reclaim. */
+		if (page_mapcount(page) > 1)
+			continue;
+
+		nr_isolated += taglmk_handle_page(ctl, vma, addr, pte, page,
+						  &isolated);
+		if (nr_isolated < SWAP_CLUSTER_MAX)
+			continue;
+
+		/*
+		 * shrink_page_list() sleeps, so the page table lock has to go
+		 * first.  The mmap lock is still held for reading, which keeps
+		 * this page table allocated across the gap, so the mapping can
+		 * simply be picked up again afterwards.
+		 */
+		pte_unmap_unlock(orig_pte, ptl);
+		ctl->stat.nr_reclaimed += reclaim_pages(&isolated);
+		nr_isolated = 0;
+		cond_resched();
+
+		if (taglmk_budget_met(ctl))
+			return 1;
+
+		orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	}
+	pte_unmap_unlock(orig_pte, ptl);
+
+out:
+	if (nr_isolated)
+		ctl->stat.nr_reclaimed += reclaim_pages(&isolated);
+
+	cond_resched();
+
+	return taglmk_budget_met(ctl) ? 1 : 0;
+}
+
+static const struct mm_walk_ops taglmk_reclaim_ops = {
+	.pmd_entry = taglmk_pmd_entry,
+};
+
+/**
+ * taglmk_skip_vma - decide whether a mapping should be left out of the walk
+ * @ctl: Walk state.
+ * @vma: Mapping to judge.
+ *
+ * Return: %true when @vma must not be walked.
+ */
+static bool taglmk_skip_vma(const struct taglmk_reclaim_walk *ctl,
+			    struct vm_area_struct *vma)
+{
+	/* Hugetlb sits on no LRU, and locked pages have to stay resident. */
+	if (is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_LOCKED))
+		return true;
+
+	/* No struct page behind these, so there is nothing to reclaim. */
+	if (vma->vm_flags & (VM_PFNMAP | VM_IO))
+		return true;
+
+	if (vma_is_anonymous(vma)) {
+		if (ctl->type == TAGLMK_RECLAIM_FILE)
+			return true;
+
+		/*
+		 * With nowhere to put them, anonymous pages can be scanned but
+		 * never reclaimed.  Do not pay for the walk.
+		 */
+		if (get_nr_swap_pages() <= 0 ||
+		    get_mm_counter(vma->vm_mm, MM_ANONPAGES) == 0)
+			return true;
+	} else if (ctl->type == TAGLMK_RECLAIM_ANON) {
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * taglmk_reclaim - run one reclaim pass over @mm
+ * @mm: Address space to reclaim from.  The caller holds a reference.
+ * @ctl: Walk state, pre-filled with the request and an empty tally.
+ *
+ * Return: 0 once the walk is over, %-EBUSY if the mmap lock was contended, or
+ * the error the walk stopped on.
+ */
+static int taglmk_reclaim(struct mm_struct *mm,
+			  struct taglmk_reclaim_walk *ctl)
+{
+	struct vm_area_struct *vma;
+	int ret = 0;
+
+	/*
+	 * Never wait here.  This runs from the TAGLMK worker, and the task
+	 * holding the mmap lock may itself be blocked waiting for the memory
+	 * that worker is about to free.  Backing off keeps the kill path, which
+	 * does not need this lock at all, free to make progress.
+	 */
+	if (!mmap_read_trylock(mm))
+		return -EBUSY;
+
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (taglmk_skip_vma(ctl, vma))
+			continue;
+
+		ret = walk_page_vma(vma, &taglmk_reclaim_ops, ctl);
+		if (ret) {
+			/* A positive result only means the budget was met. */
+			if (ret > 0)
+				ret = 0;
+			break;
+		}
+	}
+
+	/* One invalidation covering every young bit the walk cleared. */
+	if (ctl->stat.nr_deactivated)
+		flush_tlb_mm(mm);
+
+	mmap_read_unlock(mm);
+
+	return ret;
+}
+
+int taglmk_reclaim_mm(struct task_struct *tsk, enum taglmk_reclaim_type type,
+		      unsigned long nr_to_reclaim,
+		      struct taglmk_reclaim_stat *stat)
+{
+	struct taglmk_reclaim_walk ctl = {
+		.type		= type,
+		.nr_to_reclaim	= nr_to_reclaim,
+	};
+	struct mm_struct *mm;
+	int ret = 0;
+
+	if (type != TAGLMK_RECLAIM_FILE && type != TAGLMK_RECLAIM_ANON &&
+	    type != TAGLMK_RECLAIM_ALL)
+		return -EINVAL;
+
+	/*
+	 * A task on its way out has nothing worth reclaiming, and its pages are
+	 * about to be freed outright.  That is not an error.
+	 */
+	mm = get_task_mm(tsk);
+	if (mm) {
+		ret = taglmk_reclaim(mm, &ctl);
+		mmput(mm);
+	}
+
+	if (stat)
+		*stat = ctl.stat;
+
+	return ret;
+}
+
+static ssize_t taglmk_reclaim_write(struct file *file, const char __user *buf,
+				    size_t count, loff_t *ppos)
+{
+	char buffer[PROC_NUMBUF];
+	enum taglmk_reclaim_type type;
+	struct task_struct *task;
+	const char *arg;
+	int ret;
+
+	if (!capable(CAP_SYS_NICE))
+		return -EPERM;
+
+	memset(buffer, 0, sizeof(buffer));
+	if (count > sizeof(buffer) - 1)
+		count = sizeof(buffer) - 1;
+	if (copy_from_user(buffer, buf, count))
+		return -EFAULT;
+
+	arg = strstrip(buffer);
+	if (!strcmp(arg, "file"))
+		type = TAGLMK_RECLAIM_FILE;
+	else if (!strcmp(arg, "anon"))
+		type = TAGLMK_RECLAIM_ANON;
+	else if (!strcmp(arg, "all"))
+		type = TAGLMK_RECLAIM_ALL;
+	else
+		return -EINVAL;
+
+	task = get_proc_task(file_inode(file));
+	if (!task)
+		return -ESRCH;
+
+	ret = taglmk_reclaim_mm(task, type, 0, NULL);
+	put_task_struct(task);
+
+	return ret ? ret : count;
+}
+
+const struct file_operations proc_taglmk_reclaim_operations = {
+	.write		= taglmk_reclaim_write,
+	.llseek		= noop_llseek,
+};
+
+#endif /* CONFIG_ANDROID_TAGLMK */
 
 #ifdef CONFIG_NUMA
 

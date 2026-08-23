@@ -73,6 +73,46 @@ config ANDROID_BINDER_LOGS
 
           Say N on production builds.
 
+config ANDROID_TAGLMK
+	bool "Android Task-aware Guided Low Memory Killer"
+	depends on PROC_FS && MMU
+	help
+	  TAGLMK is an in-kernel low memory killer built for Android devices
+	  with little memory, where the cost of a wrong decision is a cold start
+	  of whatever the user was looking at.
+
+	  It watches free swap and the active file cache, and reacts in two
+	  stages.  While there is still swap to fill it only reclaims, walking
+	  the address spaces of background tasks and pushing cold anonymous
+	  pages into ZRAM so that nothing has to die.  Once swap is exhausted it
+	  starts killing, and it picks its victims by how much CPU time each
+	  application has accumulated: the one the user actually lives in has a
+	  great deal and is killed last, the one they opened once and forgot
+	  about has almost none and is killed first.
+
+	  Tasks are sorted into four classes.  Android's own cores are never
+	  candidates, system applications only become candidates once the file
+	  cache has collapsed, and packages named through
+	  /sys/kernel/mm/taglmk/pin survive longer than ordinary ones.
+
+	  Tuning presets are selected from installed RAM at boot and every one
+	  of them is adjustable at runtime under /sys/kernel/mm/taglmk.
+
+	  Say N if userspace already runs its own low memory killer.
+
+config ANDROID_TAGLMK_ARM64_NEON
+	bool "TAGLMK ARM64 NEON accelerator"
+	depends on ANDROID_TAGLMK && ARM64 && KERNEL_MODE_NEON
+	default y
+	help
+	  Compute the load prediction and the ZRAM balancer's regression with
+	  NEON instead of scalar code.  Every kernel is integer only and 64 bit
+	  accumulated, so this changes how long a pass takes and nothing about
+	  the decisions it reaches; the scalar path remains and is used whenever
+	  the FPU cannot be touched from the calling context.
+
+	  Say Y unless you are chasing a difference between the two paths.
+
 endif # if ANDROID
 
 endmenu
