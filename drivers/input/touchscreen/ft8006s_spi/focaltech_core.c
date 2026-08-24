@@ -40,6 +40,9 @@
 #include <linux/notifier.h>
 #include <drm/drm_panel.h>
 #include "focaltech_core.h"
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+#include "../xiaomi/xiaomi_touch.h"
+#endif
 
 /*****************************************************************************
 * Private constant and macro definitions using #define
@@ -71,6 +74,17 @@ extern touchscreen_usb_plugin_data_t g_touchscreen_usb_pulgin;
 *****************************************************************************/
 struct fts_ts_data *fts_data;
 static bool delay_gesture = false;
+
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+extern void set_lcd_reset_gpio_keep_high(bool en);
+static struct xiaomi_touch_interface xiaomi_touch_interfaces;
+static int fts_get_mode_value(int mode, int value_type);
+static int fts_get_mode_all(int mode, int *value);
+static int fts_reset_mode(int mode);
+static int fts_set_cur_value(int mode, int value);
+static void fts_init_touchmode_data(void);
+static void fts_refresh_cur_value(void);
+#endif
 
 #if LCT_TP_USB_PLUGIN
 void fts_ts_usb_event_callback(void)
@@ -627,7 +641,12 @@ static int fts_read_touchdata(struct fts_ts_data *data)
     }
 
 
-    if (data->gesture_mode) {
+    /*
+     * Use the suspend-time latch, not the live gesture_mode: the IC is only
+     * emitting gesture packets when suspend actually armed it, and the flag
+     * may have been toggled from sysfs/ioctl in between.
+     */
+    if (data->gesture_suspended) {
         ret = fts_gesture_readdata(data, buf + FTS_TOUCH_DATA_LEN);
         if (0 == ret) {
             FTS_INFO("succuss to get gesture data in irq handler");
@@ -1481,27 +1500,61 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
         FTS_ERROR("Unable to register drm_notifier: %d\n", ret);
     }
 
-	if (ts_data->fts_tp_class == NULL) {
-		if (ts_data->fts_tp_class) {
-			ts_data->fts_touch_dev = device_create(ts_data->fts_tp_class, NULL, 0x38, ts_data, "tp_dev");
-			if (IS_ERR(ts_data->fts_touch_dev)) {
-				FTS_ERROR("Failed to create device !");
-				goto err_class_create;
-			}
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+	/*
+	 * The "touch" class is owned by the xiaomi_touch core (subsys_initcall,
+	 * so it is already up by the time this device_initcall_sync driver
+	 * probes).  We only borrow it here - never class_destroy() it.
+	 */
+	ts_data->fts_tp_class = get_xiaomi_touch_class();
+	if (ts_data->fts_tp_class) {
+		ts_data->fts_touch_dev = device_create(ts_data->fts_tp_class,
+						       NULL, 0x38, ts_data,
+						       "tp_dev");
+		if (IS_ERR(ts_data->fts_touch_dev)) {
+			/*
+			 * Non fatal: touch reporting and the /sys/touchpanel
+			 * gesture knob keep working, only the touchfeature
+			 * ioctl is unavailable.  Do not unwind the probe here,
+			 * the error ladder below does not undo gesture/fwupg/
+			 * sysfs init.
+			 */
+			FTS_ERROR("Failed to create tp_dev: %ld",
+				  PTR_ERR(ts_data->fts_touch_dev));
+			ts_data->fts_touch_dev = NULL;
+			ts_data->fts_tp_class = NULL;
+		} else {
 			dev_set_drvdata(ts_data->fts_touch_dev, ts_data);
+
+			memset(&xiaomi_touch_interfaces, 0x00,
+			       sizeof(struct xiaomi_touch_interface));
+			xiaomi_touch_interfaces.getModeValue = fts_get_mode_value;
+			xiaomi_touch_interfaces.setModeValue = fts_set_cur_value;
+			xiaomi_touch_interfaces.resetMode = fts_reset_mode;
+			xiaomi_touch_interfaces.getModeAll = fts_get_mode_all;
+			fts_init_touchmode_data();
+			xiaomitouch_register_modedata(&xiaomi_touch_interfaces);
 		}
+	} else {
+		FTS_ERROR("xiaomi touch class not ready, touchfeature disabled");
 	}
+#endif
 #if LCT_TP_USB_PLUGIN
 	g_touchscreen_usb_pulgin.event_callback = fts_ts_usb_event_callback;
 #endif
 
     FTS_FUNC_EXIT();
     return 0;
-err_class_create:
-	class_destroy(ts_data->fts_tp_class);
-	ts_data->fts_tp_class = NULL;
 
 err_irq_req:
+    /*
+     * Only reached from the fts_irq_registration() failure above, i.e. always
+     * after fts_gesture_init() ran.  Tearing the gesture nodes down matters:
+     * ts_data is kfree()d when this probe fails, so /sys/touchpanel/double_tap
+     * and the gesture attributes on the spi device would otherwise stay live
+     * on top of freed driver state.
+     */
+    fts_gesture_exit(ts_data);
 #if FTS_POWER_SOURCE_CUST_EN
 err_power_init:
     fts_power_source_exit(ts_data);
@@ -1547,6 +1600,18 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
     fts_gesture_exit(ts_data);
     fts_bus_exit(ts_data);
 
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+    /*
+     * Only the child device belongs to us, the "touch" class itself is owned
+     * by the xiaomi_touch core.
+     */
+    if (ts_data->fts_touch_dev) {
+        device_destroy(ts_data->fts_tp_class, ts_data->fts_touch_dev->devt);
+        ts_data->fts_touch_dev = NULL;
+    }
+    ts_data->fts_tp_class = NULL;
+#endif
+
     free_irq(ts_data->irq, ts_data);
     input_unregister_device(ts_data->input_dev);
 
@@ -1577,13 +1642,197 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
     return 0;
 }
 
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+/*****************************************************************************
+* Xiaomi touchfeature interface
+*
+* Only the knobs the ft8006s firmware on this project actually implements are
+* advertised with a usable range.  The game-mode registers (0x81/0x85/0x8C/
+* 0x8D) are not documented for this IC/FW combination, so those modes are kept
+* as bookkeeping only - a blind register write there would corrupt the touch
+* configuration instead of tuning it.
+*****************************************************************************/
+static void fts_init_touchmode_data(void)
+{
+    int i = 0;
+
+    FTS_FUNC_ENTER();
+
+    /* double tap to wake */
+    xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_MAX_VALUE] = 1;
+    xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_MIN_VALUE] = 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_DEF_VALUE] = 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][SET_CUR_VALUE] = 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_CUR_VALUE] = 0;
+
+    /* always on display */
+    xiaomi_touch_interfaces.touch_mode[Touch_Aod_Enable][GET_MAX_VALUE] = 1;
+    xiaomi_touch_interfaces.touch_mode[Touch_Aod_Enable][GET_MIN_VALUE] = 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Aod_Enable][GET_DEF_VALUE] = 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Aod_Enable][SET_CUR_VALUE] = 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Aod_Enable][GET_CUR_VALUE] = 0;
+
+    for (i = 0; i < Touch_Mode_NUM; i++) {
+        FTS_INFO("mode:%d, set cur:%d, get cur:%d, def:%d min:%d max:%d", i,
+                 xiaomi_touch_interfaces.touch_mode[i][SET_CUR_VALUE],
+                 xiaomi_touch_interfaces.touch_mode[i][GET_CUR_VALUE],
+                 xiaomi_touch_interfaces.touch_mode[i][GET_DEF_VALUE],
+                 xiaomi_touch_interfaces.touch_mode[i][GET_MIN_VALUE],
+                 xiaomi_touch_interfaces.touch_mode[i][GET_MAX_VALUE]);
+    }
+
+    FTS_FUNC_EXIT();
+}
+
+static int fts_set_cur_value(int mode, int value)
+{
+    struct fts_ts_data *ts_data = fts_data;
+    int max_value = 0;
+    int min_value = 0;
+
+    if (!ts_data) {
+        FTS_ERROR("fts_data is null");
+        return -ENODEV;
+    }
+
+    /* the mode comes straight from an ioctl argument, never trust it */
+    if ((mode < 0) || (mode >= Touch_Mode_NUM)) {
+        FTS_ERROR("mode:%d is invalid", mode);
+        return -EINVAL;
+    }
+
+    FTS_INFO("mode:%d, value:%d", mode, value);
+
+    max_value = xiaomi_touch_interfaces.touch_mode[mode][GET_MAX_VALUE];
+    min_value = xiaomi_touch_interfaces.touch_mode[mode][GET_MIN_VALUE];
+    if (value > max_value)
+        value = max_value;
+    else if (value < min_value)
+        value = min_value;
+
+    xiaomi_touch_interfaces.touch_mode[mode][SET_CUR_VALUE] = value;
+
+    switch (mode) {
+    case Touch_Doubletap_Mode:
+        mutex_lock(&ts_data->input_dev->mutex);
+        ts_data->gesture_mode = !!value;
+        /*
+         * Touch reset is shared with the LCD reset line on this incell
+         * panel: keep it high while gesture wakeup is armed.
+         */
+        set_lcd_reset_gpio_keep_high(!!value);
+        mutex_unlock(&ts_data->input_dev->mutex);
+        break;
+    case Touch_Aod_Enable:
+        mutex_lock(&ts_data->input_dev->mutex);
+        ts_data->aod_changed = !!value;
+        mutex_unlock(&ts_data->input_dev->mutex);
+        break;
+    default:
+        /* not implemented by this IC/FW, keep the value for readback only */
+        FTS_INFO("mode:%d is not supported by fw, bookkeeping only", mode);
+        break;
+    }
+
+    xiaomi_touch_interfaces.touch_mode[mode][GET_CUR_VALUE] =
+        xiaomi_touch_interfaces.touch_mode[mode][SET_CUR_VALUE];
+
+    return 0;
+}
+
+/*
+ * gesture_mode/aod_changed can also be flipped through /sys/touchpanel/double_tap
+ * and through the WAKEUP_ON/OFF input event, so resync the readback cache from
+ * the live driver state before answering a GET.
+ */
+static void fts_refresh_cur_value(void)
+{
+    struct fts_ts_data *ts_data = fts_data;
+
+    if (!ts_data)
+        return;
+
+    xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_CUR_VALUE] =
+        ts_data->gesture_mode ? 1 : 0;
+    xiaomi_touch_interfaces.touch_mode[Touch_Aod_Enable][GET_CUR_VALUE] =
+        ts_data->aod_changed ? 1 : 0;
+}
+
+static int fts_get_mode_value(int mode, int value_type)
+{
+    if ((mode < 0) || (mode >= Touch_Mode_NUM)) {
+        FTS_ERROR("mode:%d is invalid", mode);
+        return -EINVAL;
+    }
+
+    if ((value_type < 0) || (value_type >= VALUE_TYPE_SIZE)) {
+        FTS_ERROR("value_type:%d is invalid", value_type);
+        return -EINVAL;
+    }
+
+    fts_refresh_cur_value();
+
+    FTS_INFO("mode:%d, value_type:%d, value:%d", mode, value_type,
+             xiaomi_touch_interfaces.touch_mode[mode][value_type]);
+
+    return xiaomi_touch_interfaces.touch_mode[mode][value_type];
+}
+
+static int fts_get_mode_all(int mode, int *value)
+{
+    if (!value)
+        return -EINVAL;
+
+    if ((mode < 0) || (mode >= Touch_Mode_NUM)) {
+        FTS_ERROR("mode:%d is invalid", mode);
+        return -EINVAL;
+    }
+
+    fts_refresh_cur_value();
+
+    value[0] = xiaomi_touch_interfaces.touch_mode[mode][GET_CUR_VALUE];
+    value[1] = xiaomi_touch_interfaces.touch_mode[mode][GET_DEF_VALUE];
+    value[2] = xiaomi_touch_interfaces.touch_mode[mode][GET_MIN_VALUE];
+    value[3] = xiaomi_touch_interfaces.touch_mode[mode][GET_MAX_VALUE];
+
+    FTS_INFO("mode:%d, value:%d:%d:%d:%d", mode,
+             value[0], value[1], value[2], value[3]);
+
+    return 0;
+}
+
+static int fts_reset_mode(int mode)
+{
+    int i = 0;
+
+    if ((mode < 0) || (mode > Touch_Mode_NUM)) {
+        FTS_ERROR("mode:%d is invalid", mode);
+        return -EINVAL;
+    }
+
+    if (mode == Touch_Mode_NUM) {
+        /* reset every mode to its default */
+        for (i = 0; i < Touch_Mode_NUM; i++)
+            fts_set_cur_value(i,
+                xiaomi_touch_interfaces.touch_mode[i][GET_DEF_VALUE]);
+    } else {
+        fts_set_cur_value(mode,
+            xiaomi_touch_interfaces.touch_mode[mode][GET_DEF_VALUE]);
+    }
+
+    FTS_INFO("mode:%d reset", mode);
+
+    return 0;
+}
+#endif /* CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE */
+
 static int fts_ts_suspend(struct device *dev)
 {
     int ret = 0;
     struct fts_ts_data *ts_data = fts_data;
 
     FTS_FUNC_ENTER();
-    if (ts_data->suspended) {
+    if (READ_ONCE(ts_data->suspended)) {
         FTS_INFO("Already in suspend state");
         return 0;
     }
@@ -1620,7 +1869,9 @@ static int fts_ts_suspend(struct device *dev)
     }
 
     fts_release_all_finger();
-    ts_data->suspended = true;
+    WRITE_ONCE(ts_data->suspended, true);
+    /* pairs with READ_ONCE(suspended) in the irq thread */
+    smp_wmb();
     FTS_FUNC_EXIT();
     return 0;
 }
@@ -1630,13 +1881,13 @@ static int fts_ts_resume(struct device *dev)
     struct fts_ts_data *ts_data = fts_data;
 
     FTS_FUNC_ENTER();
-    if (!ts_data->suspended) {
+    if (!READ_ONCE(ts_data->suspended)) {
         FTS_DEBUG("Already in awake state");
         return 0;
     }
 
-    /* if gesture_mode enabled, touch reset gpio pull up */
-    if (!ts_data->gesture_mode)
+    /* if gesture wakeup was armed, the reset gpio is already held high */
+    if (!ts_data->gesture_suspended)
         gpio_direction_output(fts_data->pdata->reset_gpio, 1 );
 
     fts_release_all_finger();
@@ -1655,12 +1906,12 @@ static int fts_ts_resume(struct device *dev)
     fts_esdcheck_resume();
 #endif
 
-    if (ts_data->gesture_mode) {
+    if (ts_data->gesture_suspended)
         fts_gesture_resume(ts_data);
-    } else {
-    }
 
-    ts_data->suspended = false;
+    WRITE_ONCE(ts_data->suspended, false);
+    /* pairs with READ_ONCE(suspended) in the irq thread */
+    smp_wmb();
 
     if (delay_gesture) {
         delay_gesture = false;
@@ -1740,6 +1991,14 @@ static int fts_ts_probe(struct spi_device *spi)
     ret = fts_ts_probe_entry(ts_data);
     if (ret) {
         FTS_ERROR("Touch Screen(SPI BUS) driver probe fail");
+        /*
+         * Retire both handles before the memory goes away: any sysfs
+         * attribute that the unwind above could not remove reaches the
+         * driver through one of these two, and every such handler NULL
+         * checks what it gets back.
+         */
+        fts_data = NULL;
+        spi_set_drvdata(spi, NULL);
         kfree_safe(ts_data);
         return ret;
     }

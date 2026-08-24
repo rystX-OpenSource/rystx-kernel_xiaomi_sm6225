@@ -1,8 +1,14 @@
 
 config TOUCHSCREEN_XIAOMI_TOUCHFEATURE
-	tristate "Xiaomi Touch Feature"
+	bool "Xiaomi Touch Feature"
 	depends on INPUT_TOUCHSCREEN
 	help
-	  Say Y here if you enable xiaomi touch feature.
+	  Say Y here to enable the xiaomi touchfeature core: it provides the
+	  /dev/xiaomi-touch misc device, the "touch" class that touchscreen
+	  drivers hang their tp_dev child off, and the mode ioctl used by the
+	  vendor userspace to toggle features such as double tap to wake.
+
+	  This has to be built in rather than as a module: the touchscreen
+	  drivers that call into it are boolean and are linked into vmlinux.
+
 	  If unsure, say N.
-	  To compile this driver as a module, choose M here:

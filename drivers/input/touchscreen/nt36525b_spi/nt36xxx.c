@@ -51,6 +51,19 @@
 #include <linux/input/tp_common.h>
 #endif
 extern void set_lcd_reset_gpio_keep_high(bool en);
+/*
+ * Set from the kernel command line (init.is_dt2w_sensor / init.is_st2w_sensor).
+ * When true the gesture is exported to userspace through the *_pressed sysfs
+ * nodes and consumed by the gesture sensor HAL; when false the legacy input
+ * key path (KEY_WAKEUP / KEY_GOTO) is used instead.
+ */
+extern bool is_dt2w_sensor;
+extern bool is_st2w_sensor;
+#define nt_info(fmt, ...) printk(KERN_INFO "NetErnels: " fmt, ##__VA_ARGS__)
+#endif
+
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+#include "../xiaomi/xiaomi_touch.h"
 #endif
 
 #ifdef CHECK_TOUCH_VENDOR
@@ -131,6 +144,7 @@ const uint16_t gesture_key_array[] = {
 	KEY_WAKEUP,  //GESTURE_SLIDE_DOWN
 	KEY_WAKEUP,  //GESTURE_SLIDE_LEFT
 	KEY_WAKEUP,  //GESTURE_SLIDE_RIGHT
+	KEY_GOTO,    //GESTURE_SINGLE_CLICK
 };
 #endif
 
@@ -143,7 +157,7 @@ int nvt_gesture_switch(struct input_dev *dev, unsigned int type, unsigned int co
 {
 	NVT_LOG("Enter. type = %u, code = %u, value = %d\n", type, code, value);
 	if (type == EV_SYN && code == SYN_CONFIG) {
-		if (!bTouchIsAwake) {
+		if (!READ_ONCE(bTouchIsAwake)) {
 			ts->delay_gesture = true;
 		}
 
@@ -168,23 +182,77 @@ static int32_t nvt_ts_suspend(struct device *dev);
 static ssize_t double_tap_show(struct kobject *kobj,
                                struct kobj_attribute *attr, char *buf)
 {
-    return sprintf(buf, "%d\n", ts->is_gesture_mode);
+	if (!ts)
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", ts->is_gesture_mode);
 }
+
 static ssize_t double_tap_store(struct kobject *kobj,
                                 struct kobj_attribute *attr, const char *buf,
                                 size_t count)
 {
-    int rc, val;
-    rc = kstrtoint(buf, 10, &val);
-    if (rc)
-    return -EINVAL;
+	int rc = 0;
+	int val = 0;
 
-    ts->is_gesture_mode = !!val;
-    return count;
+	if (!ts)
+		return -ENODEV;
+
+	rc = kstrtoint(buf, 10, &val);
+	if (rc)
+		return -EINVAL;
+
+	mutex_lock(&ts->lock);
+	ts->is_gesture_mode = !!val;
+	mutex_unlock(&ts->lock);
+
+	return count;
 }
+
 static struct tp_common_ops double_tap_ops = {
-    .show = double_tap_show,
-    .store = double_tap_store
+	.show = double_tap_show,
+	.store = double_tap_store
+};
+#endif
+
+#if WAKEUP_GESTURE
+/*
+ * Read only gesture state for the userspace sensor HAL.  A sysfs_notify() from
+ * nvt_ts_wakeup_gesture_report() wakes the poll()ing reader.
+ */
+static ssize_t double_tap_pressed_show(struct device *dev,
+                                       struct device_attribute *attr, char *buf)
+{
+	struct nvt_ts_data *data = dev_get_drvdata(dev);
+
+	if (!data)
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%i\n", data->double_tap_pressed);
+}
+
+static ssize_t single_tap_pressed_show(struct device *dev,
+                                       struct device_attribute *attr, char *buf)
+{
+	struct nvt_ts_data *data = dev_get_drvdata(dev);
+
+	if (!data)
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%i\n", data->single_tap_pressed);
+}
+
+static DEVICE_ATTR(double_tap_pressed, S_IRUGO, double_tap_pressed_show, NULL);
+static DEVICE_ATTR(single_tap_pressed, S_IRUGO, single_tap_pressed_show, NULL);
+
+static struct attribute *nvt_gesture_attrs[] = {
+	&dev_attr_double_tap_pressed.attr,
+	&dev_attr_single_tap_pressed.attr,
+	NULL,
+};
+
+static const struct attribute_group nvt_gesture_attr_group = {
+	.attrs = nvt_gesture_attrs,
 };
 #endif
 
@@ -199,7 +267,7 @@ static void nvt_ts_usb_plugin_work_func(struct work_struct *work)
 {
 	uint8_t buf[8] = {0};
 	int32_t ret = 0;
-	if ( !bTouchIsAwake ) {
+	if (!READ_ONCE(bTouchIsAwake)) {
 		NVT_ERR("tp is suspended, can not to set\n");
 		return;
 	}
@@ -1011,6 +1079,7 @@ static void nvt_flash_proc_deinit(void)
 #define GESTURE_SLIDE_LEFT      23
 #define GESTURE_SLIDE_RIGHT     24
 /* customized gesture id */
+#define GESTURE_SINGLE_CLICK    25
 #define DATA_PROTOCOL           30
 
 /* function page definition */
@@ -1039,6 +1108,23 @@ void nvt_ts_wakeup_gesture_report(uint8_t gesture_id, uint8_t *data)
 
 	NVT_LOG("gesture_id = %d\n", gesture_id);
 
+	/*
+	 * Modernized path: publish the gesture through sysfs and let the
+	 * userspace sensor HAL turn it into a wakeup.  Keep the legacy input
+	 * key reporting for whichever of the two is not sensor backed.
+	 */
+	if (is_dt2w_sensor) {
+		ts->double_tap_pressed =
+			(gesture_id == GESTURE_DOUBLE_CLICK) ? 1 : 0;
+		sysfs_notify(&ts->client->dev.kobj, NULL, "double_tap_pressed");
+	}
+
+	if (is_st2w_sensor) {
+		ts->single_tap_pressed =
+			(gesture_id == GESTURE_SINGLE_CLICK) ? 1 : 0;
+		sysfs_notify(&ts->client->dev.kobj, NULL, "single_tap_pressed");
+	}
+
 	switch (gesture_id) {
 		case GESTURE_WORD_C:
 			NVT_LOG("Gesture : Word-C.\n");
@@ -1054,7 +1140,8 @@ void nvt_ts_wakeup_gesture_report(uint8_t gesture_id, uint8_t *data)
 			break;
 		case GESTURE_DOUBLE_CLICK:
 			NVT_LOG("Gesture : Double Click.\n");
-			keycode = gesture_key_array[3];
+			if (!is_dt2w_sensor)
+				keycode = gesture_key_array[3];
 			break;
 		case GESTURE_WORD_Z:
 			NVT_LOG("Gesture : Word-Z.\n");
@@ -1092,7 +1179,13 @@ void nvt_ts_wakeup_gesture_report(uint8_t gesture_id, uint8_t *data)
 			NVT_LOG("Gesture : Slide RIGHT.\n");
 			keycode = gesture_key_array[12];
 			break;
+		case GESTURE_SINGLE_CLICK:
+			NVT_LOG("Gesture : Single Click.\n");
+			if (!is_st2w_sensor)
+				keycode = gesture_key_array[13];
+			break;
 		default:
+			NVT_LOG("unknown gesture_id = %d, skip\n", gesture_id);
 			break;
 	}
 
@@ -1392,7 +1485,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	uint32_t pen_battery = 0;
 
 #if WAKEUP_GESTURE
-	if (bTouchIsAwake == 0) {
+	if (READ_ONCE(bTouchIsAwake) == 0) {
 		pm_wakeup_event(&ts->input_dev->dev, 5000);
 	}
 #ifdef CONFIG_PM
@@ -1453,7 +1546,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 
 	input_id = (uint8_t)(point_data[1] >> 3);
 #if WAKEUP_GESTURE
-	if (bTouchIsAwake == 0) {
+	if (READ_ONCE(bTouchIsAwake) == 0) {
 		//input_id = (uint8_t)(point_data[1] >> 3);
 		nvt_ts_wakeup_gesture_report(input_id, point_data);
 		mutex_unlock(&ts->lock);
@@ -1732,6 +1825,166 @@ static void nvt_suspend_work(struct work_struct *work)
 	nvt_ts_suspend(&ts_core->client->dev);
 }
 
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+/*****************************************************************************
+* Xiaomi touchfeature interface
+*
+* Only the knobs this nt36525b firmware actually implements are advertised with
+* a usable range.  The game mode / pocket palm host commands are not part of
+* the firmware shipped on this project, so those modes are kept as bookkeeping
+* only: blindly poking undocumented host commands would corrupt the touch
+* configuration instead of tuning it.
+*****************************************************************************/
+static struct xiaomi_touch_interface xiaomi_touch_interfaces;
+
+static void nvt_init_touchmode_data(void)
+{
+	int i = 0;
+
+	/* double tap to wake */
+	xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_MAX_VALUE] = 1;
+	xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_MIN_VALUE] = 0;
+	xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_DEF_VALUE] = 0;
+	xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][SET_CUR_VALUE] = 0;
+	xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_CUR_VALUE] = 0;
+
+	for (i = 0; i < Touch_Mode_NUM; i++) {
+		NVT_LOG("mode:%d, set cur:%d, get cur:%d, def:%d min:%d max:%d\n", i,
+			xiaomi_touch_interfaces.touch_mode[i][SET_CUR_VALUE],
+			xiaomi_touch_interfaces.touch_mode[i][GET_CUR_VALUE],
+			xiaomi_touch_interfaces.touch_mode[i][GET_DEF_VALUE],
+			xiaomi_touch_interfaces.touch_mode[i][GET_MIN_VALUE],
+			xiaomi_touch_interfaces.touch_mode[i][GET_MAX_VALUE]);
+	}
+}
+
+/*
+ * is_gesture_mode can also be flipped through /sys/touchpanel/double_tap and
+ * through the WAKEUP_ON/OFF input event, so resync the readback cache from the
+ * live driver state before answering a GET.
+ */
+static void nvt_refresh_cur_value(void)
+{
+	if (!ts)
+		return;
+
+	xiaomi_touch_interfaces.touch_mode[Touch_Doubletap_Mode][GET_CUR_VALUE] =
+		ts->is_gesture_mode ? 1 : 0;
+}
+
+static int nvt_set_cur_value(int mode, int value)
+{
+	int max_value = 0;
+	int min_value = 0;
+
+	if (!ts) {
+		NVT_ERR("ts is null\n");
+		return -ENODEV;
+	}
+
+	/* the mode comes straight from an ioctl argument, never trust it */
+	if ((mode < 0) || (mode >= Touch_Mode_NUM)) {
+		NVT_ERR("mode:%d is invalid\n", mode);
+		return -EINVAL;
+	}
+
+	NVT_LOG("mode:%d, value:%d\n", mode, value);
+
+	max_value = xiaomi_touch_interfaces.touch_mode[mode][GET_MAX_VALUE];
+	min_value = xiaomi_touch_interfaces.touch_mode[mode][GET_MIN_VALUE];
+	if (value > max_value)
+		value = max_value;
+	else if (value < min_value)
+		value = min_value;
+
+	xiaomi_touch_interfaces.touch_mode[mode][SET_CUR_VALUE] = value;
+
+	switch (mode) {
+	case Touch_Doubletap_Mode:
+		mutex_lock(&ts->lock);
+		ts->is_gesture_mode = !!value;
+		mutex_unlock(&ts->lock);
+		break;
+	default:
+		/* not implemented by this fw, keep the value for readback only */
+		NVT_LOG("mode:%d is not supported by fw, bookkeeping only\n", mode);
+		break;
+	}
+
+	xiaomi_touch_interfaces.touch_mode[mode][GET_CUR_VALUE] =
+		xiaomi_touch_interfaces.touch_mode[mode][SET_CUR_VALUE];
+
+	return 0;
+}
+
+static int nvt_get_mode_value(int mode, int value_type)
+{
+	if ((mode < 0) || (mode >= Touch_Mode_NUM)) {
+		NVT_ERR("mode:%d is invalid\n", mode);
+		return -EINVAL;
+	}
+
+	if ((value_type < 0) || (value_type >= VALUE_TYPE_SIZE)) {
+		NVT_ERR("value_type:%d is invalid\n", value_type);
+		return -EINVAL;
+	}
+
+	nvt_refresh_cur_value();
+
+	NVT_LOG("mode:%d, value_type:%d, value:%d\n", mode, value_type,
+		xiaomi_touch_interfaces.touch_mode[mode][value_type]);
+
+	return xiaomi_touch_interfaces.touch_mode[mode][value_type];
+}
+
+static int nvt_get_mode_all(int mode, int *value)
+{
+	if (!value)
+		return -EINVAL;
+
+	if ((mode < 0) || (mode >= Touch_Mode_NUM)) {
+		NVT_ERR("mode:%d is invalid\n", mode);
+		return -EINVAL;
+	}
+
+	nvt_refresh_cur_value();
+
+	value[0] = xiaomi_touch_interfaces.touch_mode[mode][GET_CUR_VALUE];
+	value[1] = xiaomi_touch_interfaces.touch_mode[mode][GET_DEF_VALUE];
+	value[2] = xiaomi_touch_interfaces.touch_mode[mode][GET_MIN_VALUE];
+	value[3] = xiaomi_touch_interfaces.touch_mode[mode][GET_MAX_VALUE];
+
+	NVT_LOG("mode:%d, value:%d:%d:%d:%d\n", mode,
+		value[0], value[1], value[2], value[3]);
+
+	return 0;
+}
+
+static int nvt_reset_mode(int mode)
+{
+	int i = 0;
+
+	if ((mode < 0) || (mode > Touch_Mode_NUM)) {
+		NVT_ERR("mode:%d is invalid\n", mode);
+		return -EINVAL;
+	}
+
+	if (mode == Touch_Mode_NUM) {
+		/* reset every mode to its default */
+		for (i = 0; i < Touch_Mode_NUM; i++)
+			nvt_set_cur_value(i,
+				xiaomi_touch_interfaces.touch_mode[i][GET_DEF_VALUE]);
+	} else {
+		nvt_set_cur_value(mode,
+			xiaomi_touch_interfaces.touch_mode[mode][GET_DEF_VALUE]);
+	}
+
+	NVT_LOG("mode:%d reset\n", mode);
+
+	return 0;
+}
+#endif /* CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE */
+
 /*******************************************************
 Description:
 	Novatek touchscreen driver probe function.
@@ -1909,17 +2162,37 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 #endif
 
 #if WAKEUP_GESTURE
-	ts->input_dev->event =nvt_gesture_switch;
-	for (retry = 0; retry < (sizeof(gesture_key_array) / sizeof(gesture_key_array[0])); retry++)
+	ts->input_dev->event = nvt_gesture_switch;
+	if (is_dt2w_sensor)
+		nt_info("DT2W sensor detected! Reporting double tap through sysfs\n");
+	else
+		nt_info("Legacy DT2W detected! Reporting double tap as KEY_WAKEUP\n");
+	if (is_st2w_sensor)
+		nt_info("ST2W sensor detected! Reporting single tap through sysfs\n");
+	else
+		nt_info("Legacy ST2W detected! Reporting single tap as KEY_GOTO\n");
+
+	for (retry = 0; retry < (sizeof(gesture_key_array) / sizeof(gesture_key_array[0])); retry++) {
+		/*
+		 * When the gesture is handed to the userspace sensor HAL there
+		 * is no key to report, so do not advertise a capability that
+		 * would let the input core wake the device on its own.
+		 */
+		if (is_dt2w_sensor && gesture_key_array[retry] == KEY_WAKEUP)
+			continue;
+		if (is_st2w_sensor && gesture_key_array[retry] == KEY_GOTO)
+			continue;
+
 		input_set_capability(ts->input_dev, EV_KEY, gesture_key_array[retry]);
+	}
 #endif
 
 #ifdef CONFIG_TP_COMMON
-	ret = tp_common_set_double_tap_ops(&double_tap_ops);
+	ret = tp_common_set_ops(TP_FEATURE_DOUBLE_TAP, &double_tap_ops);
 	if (ret < 0) {
 		NVT_ERR("%s: Failed to create double_tap node err=%d\n",
-                	__func__, ret);
-    }
+			__func__, ret);
+	}
 #endif
 
 	sprintf(ts->phys, "input/ts");
@@ -1995,6 +2268,14 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 #if WAKEUP_GESTURE
 	device_init_wakeup(&ts->input_dev->dev, 1);
+
+	/*
+	 * Non fatal: without these nodes only the sensor backed DT2W/ST2W path
+	 * is unavailable, touch reporting and the legacy key path still work.
+	 */
+	ret = sysfs_create_group(&client->dev.kobj, &nvt_gesture_attr_group);
+	if (ret)
+		NVT_ERR("create gesture sysfs group failed. ret=%d\n", ret);
 #endif
 
 #if BOOT_UPDATE_FIRMWARE
@@ -2084,7 +2365,45 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 #endif
 
-	bTouchIsAwake = 1;
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+	/*
+	 * The "touch" class is owned by the xiaomi_touch core (subsys_initcall,
+	 * so it is already up by the time this device_initcall_sync driver
+	 * probes).  We only borrow it here - never class_destroy() it.
+	 */
+	ts->nvt_tp_class = get_xiaomi_touch_class();
+	if (ts->nvt_tp_class) {
+		ts->nvt_touch_dev = device_create(ts->nvt_tp_class, NULL, 0x38,
+						  ts, "tp_dev");
+		if (IS_ERR(ts->nvt_touch_dev)) {
+			/*
+			 * Non fatal, and deliberately not unwound: the error
+			 * ladder below does not undo the proc/notifier/workqueue
+			 * setup done above.  Touch keeps working, only the
+			 * touchfeature ioctl is unavailable.
+			 */
+			NVT_ERR("Failed to create tp_dev: %ld\n",
+				PTR_ERR(ts->nvt_touch_dev));
+			ts->nvt_touch_dev = NULL;
+			ts->nvt_tp_class = NULL;
+		} else {
+			dev_set_drvdata(ts->nvt_touch_dev, ts);
+
+			memset(&xiaomi_touch_interfaces, 0x00,
+			       sizeof(struct xiaomi_touch_interface));
+			xiaomi_touch_interfaces.getModeValue = nvt_get_mode_value;
+			xiaomi_touch_interfaces.setModeValue = nvt_set_cur_value;
+			xiaomi_touch_interfaces.resetMode = nvt_reset_mode;
+			xiaomi_touch_interfaces.getModeAll = nvt_get_mode_all;
+			nvt_init_touchmode_data();
+			xiaomitouch_register_modedata(&xiaomi_touch_interfaces);
+		}
+	} else {
+		NVT_ERR("xiaomi touch class not ready, touchfeature disabled\n");
+	}
+#endif
+
+	WRITE_ONCE(bTouchIsAwake, 1);
 	NVT_LOG("end\n");
 
 	nvt_irq_enable(true);
@@ -2141,6 +2460,7 @@ err_create_nvt_esd_check_wq_failed:
 err_create_nvt_fwu_wq_failed:
 #endif
 #if WAKEUP_GESTURE
+	sysfs_remove_group(&client->dev.kobj, &nvt_gesture_attr_group);
 	device_init_wakeup(&ts->input_dev->dev, 0);
 #endif
 	free_irq(client->irq, ts);
@@ -2164,6 +2484,14 @@ err_input_register_device_failed:
 		input_free_device(ts->input_dev);
 		ts->input_dev = NULL;
 	}
+#ifdef CONFIG_TP_COMMON
+	/*
+	 * Every goto that can land here happened after tp_common_set_ops(), so
+	 * drop /sys/touchpanel/double_tap again rather than leaving a node
+	 * behind for a device that failed to probe.
+	 */
+	tp_common_remove_ops(TP_FEATURE_DOUBLE_TAP);
+#endif
 err_input_dev_alloc_failed:
 err_chipvertrim_failed:
 	mutex_destroy(&ts->xbuf_lock);
@@ -2246,7 +2574,24 @@ static int32_t nvt_ts_remove(struct spi_device *client)
 	}
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+	/*
+	 * Only the child device belongs to us, the "touch" class itself is
+	 * owned by the xiaomi_touch core.
+	 */
+	if (ts->nvt_touch_dev) {
+		device_destroy(ts->nvt_tp_class, ts->nvt_touch_dev->devt);
+		ts->nvt_touch_dev = NULL;
+	}
+	ts->nvt_tp_class = NULL;
+#endif
+
+#ifdef CONFIG_TP_COMMON
+	tp_common_remove_ops(TP_FEATURE_DOUBLE_TAP);
+#endif
+
 #if WAKEUP_GESTURE
+	sysfs_remove_group(&client->dev.kobj, &nvt_gesture_attr_group);
 	device_init_wakeup(&ts->input_dev->dev, 0);
 #endif
 
@@ -2351,14 +2696,24 @@ static int32_t nvt_ts_suspend(struct device *dev)
 	uint32_t i = 0;
 #endif
 
-	if (!bTouchIsAwake) {
+	if (!READ_ONCE(bTouchIsAwake)) {
 		NVT_LOG("Touch is already suspend\n");
 		return 0;
 	}
 
 #if WAKEUP_GESTURE
-    set_lcd_reset_gpio_keep_high(true);
-	if (!ts->is_gesture_mode) {
+	/*
+	 * Latch the gesture decision exactly once: is_gesture_mode can be
+	 * flipped from the WAKEUP_ON/OFF input event, from /sys/touchpanel and
+	 * from the touchfeature ioctl, so re-reading it further down could arm
+	 * the irq without arming the firmware (or the other way round) and
+	 * would leave resume with nothing to undo.
+	 */
+	ts->gesture_suspended = ts->is_gesture_mode;
+
+	/* touch reset is tied to the LCD reset line, hold it high while asleep */
+	set_lcd_reset_gpio_keep_high(true);
+	if (!ts->gesture_suspended) {
 		nvt_irq_enable(false);
           	NVT_LOG("NVT_IRQ_FALSE\n");
 		//spi bus pm_runtime_get
@@ -2381,16 +2736,19 @@ static int32_t nvt_ts_suspend(struct device *dev)
 
 	NVT_LOG("start\n");
 
-	bTouchIsAwake = 0;
+	WRITE_ONCE(bTouchIsAwake, 0);
+	/* pairs with READ_ONCE(bTouchIsAwake) in the irq thread */
+	smp_wmb();
 
 #if WAKEUP_GESTURE
-	if (ts->is_gesture_mode) {
+	if (ts->gesture_suspended) {
 	//---write command to enter "wakeup gesture mode"---
 	buf[0] = EVENT_MAP_HOST_CMD;
 	buf[1] = 0x13;
 	CTP_SPI_WRITE(ts->client, buf, 2);
 
-	enable_irq_wake(ts->client->irq);
+	if (enable_irq_wake(ts->client->irq))
+		NVT_ERR("enable_irq_wake(irq:%d) fail\n", ts->client->irq);
 	NVT_LOG("Enabled touch wakeup gesture\n");
 	} else {
 		//---write command to enter "deep sleep mode"---
@@ -2455,10 +2813,23 @@ return:
 *******************************************************/
 static int32_t nvt_ts_resume(struct device *dev)
 {
-	if (bTouchIsAwake) {
+	if (READ_ONCE(bTouchIsAwake)) {
 		NVT_LOG("Touch is already resume\n");
 		return 0;
 	}
+
+#if WAKEUP_GESTURE
+	/*
+	 * Undo what suspend armed, driven by the latch and not by the live
+	 * is_gesture_mode: otherwise a DT2W toggle while the panel was off
+	 * would leak the irq wake reference and leave the firmware in gesture
+	 * mode while the driver thinks it is in normal mode.
+	 */
+	if (ts->gesture_suspended) {
+		if (disable_irq_wake(ts->client->irq))
+			NVT_ERR("disable_irq_wake(irq:%d) fail\n", ts->client->irq);
+	}
+#endif
 
 	mutex_lock(&ts->lock);
 
@@ -2475,7 +2846,7 @@ static int32_t nvt_ts_resume(struct device *dev)
 	}
 
 #if WAKEUP_GESTURE
-	if (!ts->is_gesture_mode) {
+	if (!ts->gesture_suspended) {
 		nvt_irq_enable(true);
           	NVT_LOG("NVT_IRQ_TURE\n");
 		//spi bus pm_runtime_get
@@ -2495,11 +2866,26 @@ static int32_t nvt_ts_resume(struct device *dev)
 			msecs_to_jiffies(NVT_TOUCH_ESD_CHECK_PERIOD));
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
-	bTouchIsAwake = 1;
+	WRITE_ONCE(bTouchIsAwake, 1);
+	/* pairs with READ_ONCE(bTouchIsAwake) in the irq thread */
+	smp_wmb();
 
 	mutex_unlock(&ts->lock);
 
 #if WAKEUP_GESTURE
+	ts->gesture_suspended = false;
+
+	/*
+	 * The LCD reset hold that nvt_ts_suspend() takes is deliberately NOT
+	 * released here.  nvt_ts_suspend() runs from ts->event_wq, so it is
+	 * asynchronous with respect to the DRM blank notifier: releasing the
+	 * hold on resume would mean every following screen-off has to re-arm it
+	 * from that worker, racing dsi_panel_power_off().  Losing that race
+	 * drops the shared touch/LCD reset line and resets the touch IC, which
+	 * kills gesture wakeup for the whole sleep cycle.  Leaving the hold in
+	 * place keeps the stock behaviour of this panel.
+	 */
+
 	if (ts->delay_gesture) {
 		ts->delay_gesture = false;
 	}

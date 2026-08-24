@@ -569,7 +569,7 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
     fts_create_gesture_sysfs(ts_data->dev);
 
 #ifdef CONFIG_TP_COMMON
-    ret = tp_common_set_double_tap_ops(&double_tap_ops);
+    ret = tp_common_set_ops(TP_FEATURE_DOUBLE_TAP, &double_tap_ops);
     if (ret < 0) {
         FTS_ERROR("%s: Failed to create double_tap node err=%d\n",
                   __func__, ret);
@@ -586,6 +586,9 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
 int fts_gesture_exit(struct fts_ts_data *ts_data)
 {
     FTS_FUNC_ENTER();
+#ifdef CONFIG_TP_COMMON
+    tp_common_remove_ops(TP_FEATURE_DOUBLE_TAP);
+#endif
     sysfs_remove_group(&ts_data->dev->kobj, &fts_gesture_group);
     FTS_FUNC_EXIT();
     return 0;

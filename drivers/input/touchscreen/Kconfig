@@ -1366,7 +1366,6 @@ source "drivers/input/touchscreen/ft8006s_spi/Kconfig"
 
 config TOUCHSCREEN_COMMON
     bool "touchscreen for xiaomi project"
-	 depends on I2C
 	 default n
 	 help
 	Say Y here if you have a xiaomi touchscreen and want to enable support for the built-in touchscreen.

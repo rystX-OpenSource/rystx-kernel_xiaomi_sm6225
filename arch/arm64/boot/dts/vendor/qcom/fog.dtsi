@@ -1,5 +1,14 @@
 #include "khaje-idp.dtsi"
 
+/* xiaomi touchfeature core: /dev/xiaomi-touch + the "touch" class */
+&soc {
+	xiaomi_touch {
+		status = "okay";
+		compatible = "xiaomi-touch";
+		touch,name = "xiaomi-touch";
+	};
+};
+
 /*&dsi_td4330_truly_v2_video {
 	/delete-property/ qcom,esd-check-enabled;
 };

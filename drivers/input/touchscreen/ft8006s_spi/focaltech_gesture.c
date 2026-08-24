@@ -33,15 +33,14 @@
 * 1.Included header files
 *****************************************************************************/
 #include "focaltech_core.h"
-/*
 #ifdef CONFIG_TP_COMMON
 #include <linux/input/tp_common.h>
 #endif
-*/
+
 /******************************************************************************
 * Private constant and macro definitions using #define
 *****************************************************************************/
-#define KEY_GESTURE_U                           KEY_WAKEUP
+#define KEY_GESTURE_DOUBLECLICK                 KEY_WAKEUP
 #define KEY_GESTURE_UP                          KEY_UP
 #define KEY_GESTURE_DOWN                        KEY_DOWN
 #define KEY_GESTURE_LEFT                        KEY_LEFT
@@ -55,12 +54,14 @@
 #define KEY_GESTURE_V                           KEY_V
 #define KEY_GESTURE_C                           KEY_C
 #define KEY_GESTURE_Z                           KEY_Z
+#define KEY_GESTURE_SINGLECLICK                 KEY_GOTO
 
 #define GESTURE_LEFT                            0x20
 #define GESTURE_RIGHT                           0x21
 #define GESTURE_UP                              0x22
 #define GESTURE_DOWN                            0x23
 #define GESTURE_DOUBLECLICK                     0x24
+#define GESTURE_SINGLECLICK                     0x25
 #define GESTURE_O                               0x30
 #define GESTURE_W                               0x31
 #define GESTURE_M                               0x32
@@ -70,6 +71,15 @@
 #define GESTURE_V                               0x54
 #define GESTURE_Z                               0x41
 #define GESTURE_C                               0x34
+
+#define nt_info(fmt, ...) printk(KERN_INFO "NetErnels: " fmt, ##__VA_ARGS__)
+
+#define WAKEUP_OFF                              4
+#define WAKEUP_ON                               5
+
+#define GESTURE_RETRY_COUNT                     5
+#define GESTURE_RETRY_DELAY_US_MIN              1000
+#define GESTURE_RETRY_DELAY_US_MAX              1500
 
 /*****************************************************************************
 * Private enumerations, structures and unions using typedef
@@ -100,50 +110,125 @@ static struct fts_gesture_st fts_gesture_data;
 * Global variable or extern global variabls/functions
 *****************************************************************************/
 extern void set_lcd_reset_gpio_keep_high(bool en);
+extern bool is_dt2w_sensor;
+extern bool is_st2w_sensor;
 
 /*****************************************************************************
 * Static function prototypes
 *****************************************************************************/
-/*
+
+/**
+ * fts_gesture_write_mask - Program all gesture-enable mask registers.
+ *
+ * Enables the full gesture bitmask (0xD1-0xD2, 0xD5-0xD8).  Called both
+ * during suspend entry and state recovery after a reset.
+ *
+ * Return: 0 on success, negative errno on bus failure.
+ */
+static int fts_gesture_write_mask(void)
+{
+    int ret = 0;
+
+    ret = fts_write_reg(0xD1, 0xFF);
+    if (ret < 0) {
+        FTS_ERROR("write 0xD1 fail: %d", ret);
+        return ret;
+    }
+
+    ret = fts_write_reg(0xD2, 0xFF);
+    if (ret < 0) {
+        FTS_ERROR("write 0xD2 fail: %d", ret);
+        return ret;
+    }
+
+    ret = fts_write_reg(0xD5, 0xFF);
+    if (ret < 0) {
+        FTS_ERROR("write 0xD5 fail: %d", ret);
+        return ret;
+    }
+
+    ret = fts_write_reg(0xD6, 0xFF);
+    if (ret < 0) {
+        FTS_ERROR("write 0xD6 fail: %d", ret);
+        return ret;
+    }
+
+    ret = fts_write_reg(0xD7, 0xFF);
+    if (ret < 0) {
+        FTS_ERROR("write 0xD7 fail: %d", ret);
+        return ret;
+    }
+
+    ret = fts_write_reg(0xD8, 0xFF);
+    if (ret < 0) {
+        FTS_ERROR("write 0xD8 fail: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
 #ifdef CONFIG_TP_COMMON
 static ssize_t double_tap_show(struct kobject *kobj,
                                struct kobj_attribute *attr, char *buf)
 {
-	struct fts_ts_data *ts_data = fts_data;
-    return sprintf(buf, "%d\n", ts_data->gesture_mode);
+    struct fts_ts_data *ts_data = fts_data;
+
+    if (!ts_data)
+        return -ENODEV;
+
+    return scnprintf(buf, PAGE_SIZE, "%d\n", ts_data->gesture_mode);
 }
+
 static ssize_t double_tap_store(struct kobject *kobj,
                                 struct kobj_attribute *attr, const char *buf,
                                 size_t count)
 {
-	int rc, val;
     struct fts_ts_data *ts_data = fts_data;
+    int rc = 0;
+    int val = 0;
 
-	rc = kstrtoint(buf, 10, &val);
-	if (rc)
-	return -EINVAL;
+    if (!ts_data)
+        return -ENODEV;
 
-	ts_data->gesture_mode = !!val;
-	return count;
+    rc = kstrtoint(buf, 10, &val);
+    if (rc)
+        return -EINVAL;
+
+    mutex_lock(&ts_data->input_dev->mutex);
+    ts_data->gesture_mode = !!val;
+    /*
+     * Touch reset is shared with the LCD reset line on this incell panel:
+     * keep it high while gesture wakeup is armed.
+     */
+    set_lcd_reset_gpio_keep_high(!!val);
+    mutex_unlock(&ts_data->input_dev->mutex);
+
+    return count;
 }
+
 static struct tp_common_ops double_tap_ops = {
-	.show = double_tap_show,
-	.store = double_tap_store
+    .show = double_tap_show,
+    .store = double_tap_store
 };
 #endif
-*/
+
 static ssize_t fts_gesture_show(
     struct device *dev, struct device_attribute *attr, char *buf)
 {
+    int ret = 0;
     int count = 0;
     u8 val = 0;
     struct fts_ts_data *ts_data = fts_data;
 
     mutex_lock(&ts_data->input_dev->mutex);
-    fts_read_reg(FTS_REG_GESTURE_EN, &val);
+    ret = fts_read_reg(FTS_REG_GESTURE_EN, &val);
+    if (ret < 0)
+        FTS_ERROR("read gesture en reg fail: %d", ret);
+
     count = snprintf(buf, PAGE_SIZE, "Gesture Mode:%s\n",
                      ts_data->gesture_mode ? "On" : "Off");
-    count += snprintf(buf + count, PAGE_SIZE, "Reg(0xD0)=%d\n", val);
+    count += snprintf(buf + count, PAGE_SIZE - count, "Reg(0xD0)=%d\n", val);
     mutex_unlock(&ts_data->input_dev->mutex);
 
     return count;
@@ -180,18 +265,19 @@ static ssize_t fts_gesture_buf_show(
 
     mutex_lock(&input_dev->mutex);
     count = snprintf(buf, PAGE_SIZE, "Gesture ID:%d\n", gesture->gesture_id);
-    count += snprintf(buf + count, PAGE_SIZE, "Gesture PointNum:%d\n",
+    count += snprintf(buf + count, PAGE_SIZE - count, "Gesture PointNum:%d\n",
                       gesture->point_num);
-    count += snprintf(buf + count, PAGE_SIZE, "Gesture Points Buffer:\n");
+    count += snprintf(buf + count, PAGE_SIZE - count,
+                      "Gesture Points Buffer:\n");
 
     /* save point data,max:6 */
     for (i = 0; i < FTS_GESTURE_POINTS_MAX; i++) {
-        count += snprintf(buf + count, PAGE_SIZE, "%3d(%4d,%4d) ", i,
+        count += snprintf(buf + count, PAGE_SIZE - count, "%3d(%4d,%4d) ", i,
                           gesture->coordinate_x[i], gesture->coordinate_y[i]);
         if ((i + 1) % 4 == 0)
-            count += snprintf(buf + count, PAGE_SIZE, "\n");
+            count += snprintf(buf + count, PAGE_SIZE - count, "\n");
     }
-    count += snprintf(buf + count, PAGE_SIZE, "\n");
+    count += snprintf(buf + count, PAGE_SIZE - count, "\n");
     mutex_unlock(&input_dev->mutex);
 
     return count;
@@ -204,6 +290,34 @@ static ssize_t fts_gesture_buf_store(
     return -EPERM;
 }
 
+/*
+ * DT2W/ST2W state consumed by the userspace gesture sensor HAL.  Each
+ * report also raises a sysfs event so the HAL can poll()/select() instead
+ * of relying on an input key.
+ */
+static inline ssize_t double_tap_pressed_get(struct device *device,
+                                             struct device_attribute *attribute,
+                                             char *buffer)
+{
+    struct fts_ts_data *ts = dev_get_drvdata(device);
+
+    if (!ts)
+        return -ENODEV;
+
+    return scnprintf(buffer, PAGE_SIZE, "%i\n", ts->double_tap_pressed);
+}
+
+static inline ssize_t single_tap_pressed_get(struct device *device,
+                                             struct device_attribute *attribute,
+                                             char *buffer)
+{
+    struct fts_ts_data *ts = dev_get_drvdata(device);
+
+    if (!ts)
+        return -ENODEV;
+
+    return scnprintf(buffer, PAGE_SIZE, "%i\n", ts->single_tap_pressed);
+}
 
 /* sysfs gesture node
  *   read example: cat  fts_gesture_mode       ---read gesture mode
@@ -217,10 +331,16 @@ static DEVICE_ATTR(fts_gesture_mode, S_IRUGO | S_IWUSR, fts_gesture_show,
  */
 static DEVICE_ATTR(fts_gesture_buf, S_IRUGO | S_IWUSR,
                    fts_gesture_buf_show, fts_gesture_buf_store);
+static DEVICE_ATTR(double_tap_pressed, S_IRUGO,
+                   double_tap_pressed_get, NULL);
+static DEVICE_ATTR(single_tap_pressed, S_IRUGO,
+                   single_tap_pressed_get, NULL);
 
 static struct attribute *fts_gesture_mode_attrs[] = {
     &dev_attr_fts_gesture_mode.attr,
     &dev_attr_fts_gesture_buf.attr,
+    &dev_attr_double_tap_pressed.attr,
+    &dev_attr_single_tap_pressed.attr,
     NULL,
 };
 
@@ -246,6 +366,23 @@ static void fts_gesture_report(struct input_dev *input_dev, int gesture_id)
 {
     int gesture;
 
+    /*
+     * Modernized path: publish the tap state on sysfs and wake the HAL.
+     * The legacy input-key path below stays active for whichever of the
+     * two gestures has no sensor HAL behind it.
+     */
+    if (is_dt2w_sensor) {
+        fts_data->double_tap_pressed =
+            (gesture_id == GESTURE_DOUBLECLICK) ? 1 : 0;
+        sysfs_notify(&fts_data->dev->kobj, NULL, "double_tap_pressed");
+    }
+
+    if (is_st2w_sensor) {
+        fts_data->single_tap_pressed =
+            (gesture_id == GESTURE_SINGLECLICK) ? 1 : 0;
+        sysfs_notify(&fts_data->dev->kobj, NULL, "single_tap_pressed");
+    }
+
     FTS_DEBUG("gesture_id:0x%x", gesture_id);
     switch (gesture_id) {
     case GESTURE_LEFT:
@@ -261,7 +398,16 @@ static void fts_gesture_report(struct input_dev *input_dev, int gesture_id)
         gesture = KEY_GESTURE_DOWN;
         break;
     case GESTURE_DOUBLECLICK:
-        gesture = KEY_GESTURE_U;
+        if (is_dt2w_sensor)
+            gesture = -1;
+        else
+            gesture = KEY_GESTURE_DOUBLECLICK;
+        break;
+    case GESTURE_SINGLECLICK:
+        if (is_st2w_sensor)
+            gesture = -1;
+        else
+            gesture = KEY_GESTURE_SINGLECLICK;
         break;
     case GESTURE_O:
         gesture = KEY_GESTURE_O;
@@ -291,6 +437,7 @@ static void fts_gesture_report(struct input_dev *input_dev, int gesture_id)
         gesture = KEY_GESTURE_C;
         break;
     default:
+        FTS_DEBUG("unknown gesture_id:0x%x, skip", gesture_id);
         gesture = -1;
         break;
     }
@@ -327,7 +474,7 @@ int fts_gesture_readdata(struct fts_ts_data *ts_data, u8 *data)
     struct input_dev *input_dev = ts_data->input_dev;
     struct fts_gesture_st *gesture = &fts_gesture_data;
 
-    if (!ts_data->suspended || !ts_data->gesture_mode) {
+    if (!READ_ONCE(ts_data->suspended) || !ts_data->gesture_suspended) {
         return 1;
     }
 
@@ -368,85 +515,170 @@ int fts_gesture_readdata(struct fts_ts_data *ts_data, u8 *data)
 
 void fts_gesture_recovery(struct fts_ts_data *ts_data)
 {
-    if (ts_data->gesture_mode && ts_data->suspended) {
-        FTS_DEBUG("gesture recovery...");
-        fts_write_reg(0xD1, 0xFF);
-        fts_write_reg(0xD2, 0xFF);
-        fts_write_reg(0xD5, 0xFF);
-        fts_write_reg(0xD6, 0xFF);
-        fts_write_reg(0xD7, 0xFF);
-        fts_write_reg(0xD8, 0xFF);
-        fts_write_reg(FTS_REG_GESTURE_EN, ENABLE);
+    int ret = 0;
+
+    /*
+     * Only restore what suspend actually armed: when gesture was not armed the
+     * IC was put into sleep mode with reset pulled low, and writing the gesture
+     * registers there would just fail on the bus.
+     */
+    if (!READ_ONCE(ts_data->suspended) || !ts_data->gesture_suspended)
+        return;
+
+    FTS_DEBUG("gesture recovery...");
+
+    ret = fts_gesture_write_mask();
+    if (ret < 0) {
+        FTS_ERROR("gesture recovery: write mask fail: %d", ret);
+        return;
     }
+
+    ret = fts_write_reg(FTS_REG_GESTURE_EN, ENABLE);
+    if (ret < 0)
+        FTS_ERROR("gesture recovery: write en fail: %d", ret);
 }
 
+/*****************************************************************************
+* Name: fts_gesture_suspend
+* Brief: Put the IC into gesture-wakeup mode for system sleep.  Writes the
+*        gesture mask and enables gesture mode, then polls until the IC
+*        confirms the register write.
+* Return: 0 on success, -EIO if the IC does not acknowledge within the retry
+*         budget, or a negative errno on bus failure.
+*****************************************************************************/
 int fts_gesture_suspend(struct fts_ts_data *ts_data)
 {
     int i = 0;
+    int ret = 0;
     u8 state = 0xFF;
 
+    FTS_FUNC_ENTER();
+
+    /* touch reset is tied to the LCD reset line, hold it high while asleep */
     set_lcd_reset_gpio_keep_high(true);
 
-    FTS_FUNC_ENTER();
     if (enable_irq_wake(ts_data->irq)) {
         FTS_DEBUG("enable_irq_wake(irq:%d) fail", ts_data->irq);
     }
 
-    for (i = 0; i < 5; i++) {
-        fts_write_reg(0xD1, 0xFF);
-        fts_write_reg(0xD2, 0xFF);
-        fts_write_reg(0xD5, 0xFF);
-        fts_write_reg(0xD6, 0xFF);
-        fts_write_reg(0xD7, 0xFF);
-        fts_write_reg(0xD8, 0xFF);
-        fts_write_reg(FTS_REG_GESTURE_EN, ENABLE);
-        msleep(1);
-        fts_read_reg(FTS_REG_GESTURE_EN, &state);
+    /*
+     * Armed from here on: fts_gesture_resume() must run even if gesture_mode
+     * gets cleared in the meantime, otherwise the irq wake reference and the
+     * LCD reset hold are never released.
+     */
+    ts_data->gesture_suspended = true;
+
+    for (i = 0; i < GESTURE_RETRY_COUNT; i++) {
+        ret = fts_gesture_write_mask();
+        if (ret < 0) {
+            FTS_ERROR("write gesture mask fail: %d", ret);
+            goto out;
+        }
+
+        ret = fts_write_reg(FTS_REG_GESTURE_EN, ENABLE);
+        if (ret < 0) {
+            FTS_ERROR("write gesture en fail: %d", ret);
+            goto out;
+        }
+
+        usleep_range(GESTURE_RETRY_DELAY_US_MIN, GESTURE_RETRY_DELAY_US_MAX);
+
+        ret = fts_read_reg(FTS_REG_GESTURE_EN, &state);
+        if (ret < 0) {
+            FTS_ERROR("read gesture en fail: %d", ret);
+            goto out;
+        }
+
         if (state == ENABLE)
             break;
     }
 
-    if (i >= 5)
+    if (i >= GESTURE_RETRY_COUNT) {
         FTS_ERROR("make IC enter into gesture(suspend) fail,state:%x", state);
-    else
-        FTS_INFO("Enter into gesture(suspend) successfully");
+        ret = -EIO;
+        goto out;
+    }
 
+    FTS_INFO("Enter into gesture(suspend) successfully");
+    ret = 0;
+
+out:
     FTS_FUNC_EXIT();
-    return 0;
+    return ret;
 }
 
+/*****************************************************************************
+* Name: fts_gesture_resume
+* Brief: Take the IC out of gesture-wakeup mode on system resume.
+* Return: 0 on success, -EIO if the IC does not acknowledge within the retry
+*         budget, or a negative errno on bus failure.
+*****************************************************************************/
 int fts_gesture_resume(struct fts_ts_data *ts_data)
 {
     int i = 0;
+    int ret = 0;
     u8 state = 0xFF;
 
     FTS_FUNC_ENTER();
-    if (disable_irq_wake(ts_data->irq)) {
-        FTS_DEBUG("disable_irq_wake(irq:%d) fail", ts_data->irq);
+
+    if (!ts_data->gesture_suspended) {
+        FTS_DEBUG("gesture suspend was not armed, nothing to undo");
+        return 0;
     }
 
-    for (i = 0; i < 5; i++) {
-        fts_write_reg(FTS_REG_GESTURE_EN, DISABLE);
-        msleep(1);
-        fts_read_reg(FTS_REG_GESTURE_EN, &state);
+    for (i = 0; i < GESTURE_RETRY_COUNT; i++) {
+        ret = fts_write_reg(FTS_REG_GESTURE_EN, DISABLE);
+        if (ret < 0) {
+            FTS_ERROR("write gesture en fail: %d", ret);
+            goto out;
+        }
+
+        usleep_range(GESTURE_RETRY_DELAY_US_MIN, GESTURE_RETRY_DELAY_US_MAX);
+
+        ret = fts_read_reg(FTS_REG_GESTURE_EN, &state);
+        if (ret < 0) {
+            FTS_ERROR("read gesture en fail: %d", ret);
+            goto out;
+        }
+
         if (state == DISABLE)
             break;
     }
 
-    if (i >= 5)
+    if (i >= GESTURE_RETRY_COUNT) {
         FTS_ERROR("make IC exit gesture(resume) fail,state:%x", state);
-    else
-        FTS_INFO("resume from gesture successfully");
+        ret = -EIO;
+        goto out;
+    }
+
+    FTS_INFO("resume from gesture successfully");
+    ret = 0;
+
+out:
+    ts_data->gesture_suspended = false;
+
+    if (disable_irq_wake(ts_data->irq)) {
+        FTS_DEBUG("disable_irq_wake(irq:%d) fail", ts_data->irq);
+    }
+
+    /*
+     * The LCD reset hold is deliberately NOT released here.  It is owned by the
+     * places that enable/disable gesture wakeup (double_tap_store(),
+     * fts_gesture_store() and fts_set_cur_value()), not by the suspend cycle:
+     * dsi_panel_power_off() is the only consumer and it only ever runs while
+     * the panel is going down, so arming the hold from the enable path keeps it
+     * correct even when fts_ts_suspend() bails out early (fw upgrade in
+     * progress) and never gets to arm it.
+     */
 
     FTS_FUNC_EXIT();
-    return 0;
+    return ret;
 }
 
-#define WAKEUP_OFF 4
-#define WAKEUP_ON 5
 int fts_gesture_switch(struct input_dev *dev, unsigned int type, unsigned int code, int value)
 {
     struct fts_ts_data *ts_data = fts_data;
+
     FTS_INFO("Enter. type = %u, code = %u, value = %d", type, code, value);
     if (type == EV_SYN && code == SYN_CONFIG) {
         if (value == WAKEUP_OFF)
@@ -461,17 +693,24 @@ int fts_gesture_switch(struct input_dev *dev, unsigned int type, unsigned int co
 int fts_gesture_init(struct fts_ts_data *ts_data)
 {
     struct input_dev *input_dev = ts_data->input_dev;
-/*
 #ifdef CONFIG_TP_COMMON
-    int ret;
+    int ret = 0;
 #endif
-*/
+
     FTS_FUNC_ENTER();
 
     input_dev->event =fts_gesture_switch;
 
     input_set_capability(input_dev, EV_KEY, KEY_POWER);
-    input_set_capability(input_dev, EV_KEY, KEY_GESTURE_U);
+    input_set_capability(input_dev, EV_KEY, KEY_SLEEP);
+    if (!is_dt2w_sensor) {
+        nt_info("Legacy DT2W detected! Setting capability for it...");
+        input_set_capability(input_dev, EV_KEY, KEY_GESTURE_DOUBLECLICK);
+    }
+    if (!is_st2w_sensor) {
+        nt_info("Legacy ST2W detected! Setting capability for it...");
+        input_set_capability(input_dev, EV_KEY, KEY_GESTURE_SINGLECLICK);
+    }
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_UP);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_DOWN);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_LEFT);
@@ -486,11 +725,19 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_Z);
     input_set_capability(input_dev, EV_KEY, KEY_GESTURE_C);
 
+    __set_bit(KEY_SLEEP, input_dev->keybit);
     __set_bit(KEY_GESTURE_RIGHT, input_dev->keybit);
     __set_bit(KEY_GESTURE_LEFT, input_dev->keybit);
     __set_bit(KEY_GESTURE_UP, input_dev->keybit);
     __set_bit(KEY_GESTURE_DOWN, input_dev->keybit);
-    __set_bit(KEY_GESTURE_U, input_dev->keybit);
+    if (!is_dt2w_sensor) {
+        nt_info("Legacy DT2W detected! Setting key bit for it...");
+        __set_bit(KEY_GESTURE_DOUBLECLICK, input_dev->keybit);
+    }
+    if (!is_st2w_sensor) {
+        nt_info("Legacy ST2W detected! Setting key bit for it...");
+        __set_bit(KEY_GESTURE_SINGLECLICK, input_dev->keybit);
+    }
     __set_bit(KEY_GESTURE_O, input_dev->keybit);
     __set_bit(KEY_GESTURE_E, input_dev->keybit);
     __set_bit(KEY_GESTURE_M, input_dev->keybit);
@@ -502,15 +749,15 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
     __set_bit(KEY_GESTURE_Z, input_dev->keybit);
 
     fts_create_gesture_sysfs(ts_data->dev);
-/*
+
 #ifdef CONFIG_TP_COMMON
-    ret = tp_common_set_double_tap_ops(&double_tap_ops);
+    ret = tp_common_set_ops(TP_FEATURE_DOUBLE_TAP, &double_tap_ops);
     if (ret < 0) {
         FTS_ERROR("%s: Failed to create double_tap node err=%d\n",
                   __func__, ret);
     }
 #endif
-*/
+
     memset(&fts_gesture_data, 0, sizeof(struct fts_gesture_st));
     ts_data->gesture_mode = FTS_GESTURE_EN;
 
@@ -521,6 +768,9 @@ int fts_gesture_init(struct fts_ts_data *ts_data)
 int fts_gesture_exit(struct fts_ts_data *ts_data)
 {
     FTS_FUNC_ENTER();
+#ifdef CONFIG_TP_COMMON
+    tp_common_remove_ops(TP_FEATURE_DOUBLE_TAP);
+#endif
     sysfs_remove_group(&ts_data->dev->kobj, &fts_gesture_group);
     FTS_FUNC_EXIT();
     return 0;

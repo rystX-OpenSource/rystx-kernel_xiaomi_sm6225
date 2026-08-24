@@ -185,6 +185,12 @@ struct fts_ts_data {
     bool charger_mode;
     bool gesture_mode;      /* gesture enable or disable, default: disable */
     bool aod_changed;
+    /*
+     * Latches the decision taken in fts_ts_suspend() so that resume undoes
+     * exactly what suspend did, even if gesture_mode is toggled from sysfs or
+     * the touchfeature ioctl while the panel is off.
+     */
+    bool gesture_suspended;
     /* multi-touch */
     struct ts_event *events;
     u8 *bus_tx_buf;
@@ -209,6 +215,9 @@ struct fts_ts_data {
 	struct mutex reg_lock;
 	struct device *fts_touch_dev;
   	struct class *fts_tp_class;
+	/* DT2W/ST2W state exported to the userspace gesture sensor HAL */
+	int double_tap_pressed;
+	int single_tap_pressed;
 };
 
 enum _FTS_BUS_TYPE {

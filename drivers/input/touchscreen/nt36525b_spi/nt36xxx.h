@@ -176,6 +176,15 @@ struct nvt_ts_data {
 #if WAKEUP_GESTURE
 	bool delay_gesture;
 	bool is_gesture_mode;
+	/*
+	 * Latches the decision taken in nvt_ts_suspend() so that resume undoes
+	 * exactly what suspend did, even if is_gesture_mode is toggled from
+	 * sysfs or the touchfeature ioctl while the panel is off.
+	 */
+	bool gesture_suspended;
+	/* DT2W/ST2W state exported to the userspace gesture sensor HAL */
+	int double_tap_pressed;
+	int single_tap_pressed;
 #ifdef CONFIG_PM
 	bool dev_pm_suspend;
 	struct completion dev_pm_suspend_completion;
@@ -185,6 +194,11 @@ struct nvt_ts_data {
 //	struct regulator *pwr_ibb; /* VSN -5V */
 #endif
 //struct mutex reg_lock;
+#ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+	/* borrowed from the xiaomi_touch core, never destroyed here */
+	struct class *nvt_tp_class;
+	struct device *nvt_touch_dev;
+#endif
 	struct workqueue_struct *event_wq;
 	struct work_struct suspend_work;
 	struct work_struct resume_work;
