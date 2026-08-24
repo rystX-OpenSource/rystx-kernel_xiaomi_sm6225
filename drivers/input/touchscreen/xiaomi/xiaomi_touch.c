@@ -295,18 +295,23 @@ static struct attribute *touch_attr_group[] = {
 static int xiaomi_touch_parse_dt(struct device *dev,
 				 struct xiaomi_touch_pdata *data)
 {
-	int ret;
-	struct device_node *np;
+	struct device_node *np = dev->of_node;
 
-	np = dev->of_node;
-	if (!np)
-		return -ENODEV;
+	/*
+	 * Everything here is optional.  Nothing in this driver reads a DT
+	 * property to decide behaviour - "touch,name" only ends up in a log
+	 * line - so a device instantiated without a node (see
+	 * xiaomi_touch_init()) is exactly as usable as one matched from DT.
+	 * of_property_read_string() leaves data->name alone when it fails, so
+	 * the default set here survives a node that lacks the property.
+	 */
+	data->name = "xiaomi-touch";
 
-	ret = of_property_read_string(np, "touch,name", &data->name);
-	if (ret)
-		return ret;
+	if (np)
+		of_property_read_string(np, "touch,name", &data->name);
 
-	pr_info("%s: touch,name: %s\n", __func__, data->name);
+	pr_info("%s: touch,name: %s (%s)\n", __func__, data->name,
+		np ? "from dt" : "no of_node");
 	return 0;
 }
 
@@ -477,13 +482,60 @@ static struct platform_driver xiaomi_touch_device_driver = {
 	.remove	= xiaomi_touch_remove,
 };
 
+/* Only used when the device tree has no usable node, see xiaomi_touch_init(). */
+static struct platform_device *xiaomi_touch_fallback_pdev;
+
 static int __init xiaomi_touch_init(void)
 {
-	return platform_driver_register(&xiaomi_touch_device_driver);
+	struct device_node *np;
+	bool have_of_node = false;
+	int ret;
+
+	ret = platform_driver_register(&xiaomi_touch_device_driver);
+	if (ret)
+		return ret;
+
+	np = of_find_compatible_node(NULL, NULL, "xiaomi-touch");
+	if (np) {
+		have_of_node = of_device_is_available(np);
+		of_node_put(np);
+	}
+
+	if (have_of_node)
+		return 0;
+
+	/*
+	 * No usable node.  That is what a kernel-only flash looks like on this
+	 * board: the node lives in a dtbo and the dtbo partition still holds
+	 * the stock overlay.  Instantiate the device here so the core comes up
+	 * regardless - the platform bus falls back to matching .driver.name
+	 * against the device name when there is no of_node, so the same driver
+	 * binds either way.  Registering this only when DT has nothing usable
+	 * keeps it to exactly one device and one probe.
+	 */
+	pr_info("%s: no usable xiaomi-touch node in dt, registering the device\n",
+		__func__);
+
+	xiaomi_touch_fallback_pdev =
+		platform_device_register_simple("xiaomi-touch", -1, NULL, 0);
+	if (IS_ERR(xiaomi_touch_fallback_pdev)) {
+		ret = PTR_ERR(xiaomi_touch_fallback_pdev);
+		xiaomi_touch_fallback_pdev = NULL;
+		pr_err("%s: register device failed: %d\n", __func__, ret);
+		platform_driver_unregister(&xiaomi_touch_device_driver);
+		return ret;
+	}
+
+	return 0;
 }
 
 static void __exit xiaomi_touch_exit(void)
 {
+	if (xiaomi_touch_fallback_pdev) {
+		platform_device_unregister(xiaomi_touch_fallback_pdev);
+		xiaomi_touch_fallback_pdev = NULL;
+	}
+
 	platform_driver_unregister(&xiaomi_touch_device_driver);
 }
 
