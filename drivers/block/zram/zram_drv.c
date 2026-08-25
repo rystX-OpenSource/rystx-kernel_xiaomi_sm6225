@@ -33,6 +33,7 @@
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
 #include <linux/sysctl.h>
+#include <linux/zram_ir.h>
 
 #include "zram_drv.h"
 
@@ -75,6 +76,35 @@ static struct ctl_table zram_sysctl_table[] = {
 		.extra2		= &three,
 	},
 };
+
+/*
+ * How many compression priorities the store path may walk before giving up
+ * on a page.  A reclaimer that knows the pages it is writing out are cold
+ * can raise this for its own stores via zram_ir_set_depth(); every other
+ * context follows the sysctl.
+ *
+ * This only ever changes how many algorithms are *tried*, never the size a
+ * result has to beat.  The distinction matters: the store path has no
+ * previously stored object to fall back on, so the huge_class_size test at
+ * the bottom of the compression loop is a compressibility verdict as much as
+ * an escalation trigger.  Lowering it to chase a smaller object would push
+ * pages that compress perfectly well into write_incompressible_page(), i.e.
+ * a full PAGE_SIZE object - the opposite of the intent.  Size goals belong
+ * in the recompression path, which keeps the old object when a retry fails
+ * to beat it.
+ *
+ * The result is clamped against zram->num_active_comps by the caller, so an
+ * out-of-range hint can only ever mean "as deep as this device goes".
+ */
+static u8 zram_ir_depth(void)
+{
+	u8 depth = current->zram_ir_depth;
+
+	if (depth)
+		return depth;
+
+	return sysctl_zram_recomp_immediate + 1;
+}
 #endif //CONFIG_ZRAM_MULTI_COMP
 
 #define slot_dep_map(zram, index) (&(zram)->table[(index)].dep_map)
@@ -263,12 +293,17 @@ struct zram_pp_ctl {
 	struct list_head	pp_buckets[NUM_PP_BUCKETS];
 };
 
-static struct zram_pp_ctl *init_pp_ctl(void)
+/*
+ * @gfp lets a caller running under memory pressure avoid GFP_KERNEL here:
+ * this is a ~2K allocation held across the whole sweep, and entering direct
+ * reclaim for it while already reclaiming is the wrong way round.
+ */
+static struct zram_pp_ctl *init_pp_ctl(gfp_t gfp)
 {
 	struct zram_pp_ctl *ctl;
 	u32 idx;
 
-	ctl = kmalloc(sizeof(*ctl), GFP_KERNEL);
+	ctl = kmalloc(sizeof(*ctl), gfp);
 	if (!ctl)
 		return NULL;
 
@@ -867,7 +902,7 @@ static ssize_t writeback_store(struct device *dev,
 		goto release_init_lock;
 	}
 
-	ctl = init_pp_ctl();
+	ctl = init_pp_ctl(GFP_KERNEL);
 	if (!ctl) {
 		ret = -ENOMEM;
 		goto release_init_lock;
@@ -1798,7 +1833,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
 	bool same_filled;
 	u8 prio, prio_max = zram->num_active_comps;
 #ifdef CONFIG_ZRAM_MULTI_COMP
-	prio_max = min_t(u8, prio_max, sysctl_zram_recomp_immediate + 1);
+	prio_max = min_t(u8, prio_max, zram_ir_depth());
 #endif //CONFIG_ZRAM_MULTI_COMP
 
 	/* First, free memory allocated to this slot (if any) */
@@ -1911,10 +1946,19 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 #define RECOMPRESS_IDLE		(1 << 0)
 #define RECOMPRESS_HUGE		(1 << 1)
 
+/*
+ * Collect up to @max_slots eligible slots into @ctl.  Tracking every eligible
+ * slot on the device costs a pp-slot allocation each and a walk over the whole
+ * disksize, which is fine for an operator-driven sweep but not for a caller
+ * running under memory pressure; such callers bound the walk instead.  Pass
+ * ULONG_MAX for the unbounded behaviour.
+ */
 static int scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio_max,
+				     unsigned long max_slots,
 				     struct zram_pp_ctl *ctl)
 {
 	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	unsigned long nr_slots = 0;
 	unsigned long index;
 
 	for (index = 0; index < nr_pages; index++) {
@@ -1942,10 +1986,17 @@ static int scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio_max,
 			goto next;
 
 		ok = place_pp_slot(zram, ctl, index);
+		if (ok)
+			nr_slots++;
 next:
 		zram_slot_unlock(zram, index);
 		if (!ok)
 			break;
+
+		if (nr_slots >= max_slots)
+			break;
+
+		cond_resched();
 	}
 
 	return 0;
@@ -2215,13 +2266,13 @@ static ssize_t recompress_store(struct device *dev,
 		goto release_init_lock;
 	}
 
-	ctl = init_pp_ctl();
+	ctl = init_pp_ctl(GFP_KERNEL);
 	if (!ctl) {
 		ret = -ENOMEM;
 		goto release_init_lock;
 	}
 
-	scan_slots_for_recompress(zram, mode, prio_max, ctl);
+	scan_slots_for_recompress(zram, mode, prio_max, ULONG_MAX, ctl);
 
 	ret = len;
 	while ((pps = select_pp_slot(ctl))) {
@@ -2257,6 +2308,218 @@ release_init_lock:
 	up_read(&zram->init_lock);
 	return ret;
 }
+
+/*
+ * In-kernel recompression entry points.
+ *
+ * These exist so a reclaimer that already knows what it is swapping out, and
+ * how valuable the owning task is, can drive recompression directly instead
+ * of leaving it to a periodic userspace sweep that has none of that context.
+ *
+ * The per-device locking mirrors recompress_store() exactly.  Two things are
+ * deliberately different:
+ *
+ *  - the scratch page is supplied by the caller, so a pass on a
+ *    memory-pressure path does not have to allocate a page in order to free
+ *    memory, and
+ *  - the slot scan is bounded, because tracking every eligible slot on the
+ *    device costs one allocation per slot.
+ */
+static long zram_ir_recompress_dev(struct zram *zram,
+				   const struct zram_ir_req *req,
+				   unsigned long max_slots)
+{
+	u64 num_recomp_pages = req->max_pages ? req->max_pages : ULLONG_MAX;
+	u32 prio = ZRAM_SECONDARY_COMP;
+	struct zram_pp_ctl *ctl = NULL;
+	struct zram_pp_slot *pps;
+	long attempted = 0;
+	u32 prio_max;
+	int ret = 0;
+
+	down_read(&zram->init_lock);
+	if (!init_done(zram)) {
+		up_read(&zram->init_lock);
+		return -ENODEV;
+	}
+
+	/* Do not permit concurrent post-processing actions. */
+	if (atomic_xchg(&zram->pp_in_progress, 1)) {
+		up_read(&zram->init_lock);
+		return -EAGAIN;
+	}
+
+	/*
+	 * Nothing to escalate to when only the primary algorithm is
+	 * configured.  Checking this before the cast below also keeps the
+	 * signed num_active_comps away from unsigned comparisons.
+	 */
+	if (zram->num_active_comps <= (s8)ZRAM_SECONDARY_COMP) {
+		ret = -ENODEV;
+		goto release_init_lock;
+	}
+	prio_max = min_t(u32, zram->num_active_comps, ZRAM_MAX_COMPS);
+
+	ctl = init_pp_ctl(GFP_NOIO | __GFP_NOWARN);
+	if (!ctl) {
+		ret = -ENOMEM;
+		goto release_init_lock;
+	}
+
+	scan_slots_for_recompress(zram, req->mode, prio_max, max_slots, ctl);
+
+	while ((pps = select_pp_slot(ctl))) {
+		int err = 0;
+
+		if (!num_recomp_pages)
+			break;
+
+		zram_slot_lock(zram, pps->index);
+		if (!zram_test_flag(zram, pps->index, ZRAM_PP_SLOT))
+			goto next;
+
+		err = recompress_slot(zram, pps->index, req->scratch,
+				      &num_recomp_pages, req->threshold,
+				      prio, prio_max);
+		if (!err)
+			attempted++;
+next:
+		zram_slot_unlock(zram, pps->index);
+		release_pp_slot(zram, pps);
+
+		if (err) {
+			ret = err;
+			break;
+		}
+
+		cond_resched();
+	}
+
+release_init_lock:
+	release_pp_ctl(zram, ctl);
+	atomic_set(&zram->pp_in_progress, 0);
+	up_read(&zram->init_lock);
+
+	return ret ? ret : attempted;
+}
+
+/**
+ * zram_ir_recompress - run a bounded recompression sweep on every device
+ * @req: what to sweep and how far, see struct zram_ir_req
+ *
+ * Returns the number of slots recompression was attempted on, which is not
+ * the number of slots that got smaller: recompress_slot() reports success
+ * both when it improved an object and when it decided to keep the one it
+ * already had.  Callers that want the effect should difference
+ * zram_ir_get_stats() around the call.
+ *
+ * Returns -EAGAIN if a device is already busy with post-processing or the
+ * device registry is contended, so a caller on a pressure path never waits.
+ */
+long zram_ir_recompress(const struct zram_ir_req *req)
+{
+	int last_err = -ENODEV;
+	unsigned long max_slots;
+	struct zram *zram;
+	long total = 0;
+	int nr_ok = 0;
+	int id;
+
+	if (!req || !req->scratch)
+		return -EINVAL;
+
+	/* huge_class_size is only known once a device has been initialised. */
+	if (!huge_class_size)
+		return -ENODEV;
+
+	/*
+	 * Same rejection recompress_store() makes: a threshold at or above the
+	 * huge class asks for an object no algorithm here can produce.
+	 */
+	if (req->threshold >= huge_class_size)
+		return -EINVAL;
+
+	max_slots = req->max_slots ? req->max_slots : ULONG_MAX;
+
+	/*
+	 * zram_index_mutex is what keeps a device in the idr and alive, so it
+	 * is held across the sweep rather than just the lookup (see
+	 * hot_remove_store()).  trylock, because the caller may be reclaiming
+	 * and must not wait behind a device add or remove.
+	 */
+	if (!mutex_trylock(&zram_index_mutex))
+		return -EAGAIN;
+
+	idr_for_each_entry(&zram_index_idr, zram, id) {
+		long ret = zram_ir_recompress_dev(zram, req, max_slots);
+
+		if (ret < 0) {
+			last_err = ret;
+			continue;
+		}
+
+		nr_ok++;
+		total += ret;
+	}
+
+	mutex_unlock(&zram_index_mutex);
+
+	return nr_ok ? total : last_err;
+}
+EXPORT_SYMBOL_GPL(zram_ir_recompress);
+
+/**
+ * zram_ir_get_stats - aggregate accounting over all initialised devices
+ * @stats: filled in on success, zeroed first
+ *
+ * Returns -ENODEV when no device is initialised and -EAGAIN when the device
+ * registry is contended.
+ */
+int zram_ir_get_stats(struct zram_ir_stats *stats)
+{
+	unsigned int nr_comps = ZRAM_MAX_COMPS;
+	struct zram *zram;
+	int id;
+
+	if (!stats)
+		return -EINVAL;
+
+	memset(stats, 0, sizeof(*stats));
+
+	if (!mutex_trylock(&zram_index_mutex))
+		return -EAGAIN;
+
+	idr_for_each_entry(&zram_index_idr, zram, id) {
+		down_read(&zram->init_lock);
+		if (!init_done(zram)) {
+			up_read(&zram->init_lock);
+			continue;
+		}
+
+		stats->compr_bytes += atomic64_read(&zram->stats.compr_data_size);
+		stats->stored_pages += atomic64_read(&zram->stats.pages_stored);
+		stats->huge_pages += atomic64_read(&zram->stats.huge_pages);
+		stats->same_pages += atomic64_read(&zram->stats.same_pages);
+		stats->mem_used_pages += zs_get_total_pages(zram->mem_pool);
+		nr_comps = min_t(unsigned int, nr_comps,
+				 clamp_t(int, zram->num_active_comps,
+					 1, ZRAM_MAX_COMPS));
+		stats->nr_devices++;
+		up_read(&zram->init_lock);
+	}
+
+	mutex_unlock(&zram_index_mutex);
+
+	if (!stats->nr_devices)
+		return -ENODEV;
+
+	stats->nr_comps = nr_comps;
+	stats->ir_depth = min_t(unsigned int,
+				sysctl_zram_recomp_immediate + 1u, nr_comps);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zram_ir_get_stats);
 #endif
 
 static void zram_bio_discard(struct zram *zram, struct bio *bio)
