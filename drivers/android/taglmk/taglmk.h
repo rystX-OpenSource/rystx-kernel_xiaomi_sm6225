@@ -218,6 +218,12 @@ struct taglmk_victim {
  * @nr_killed: Tasks killed since boot.
  * @nr_reclaimed: Pages reclaimed since boot.
  * @nr_passes: Passes run since boot.
+ * @nr_kill_passes: Passes that found the situation bad enough to enter the kill
+ *	band, whether or not anything was actually killed.  Read together with
+ *	@nr_killed this separates "never needed to kill" from "wanted to kill
+ *	and could not", which are very different states to be in and look
+ *	identical from a kill count alone.
+ * @nr_no_candidate: Kill passes that came back with an empty candidate list.
  *
  * The tunables above are plain naturally aligned words.  Passes read them
  * without holding anything and sysfs writes them without holding anything
@@ -251,6 +257,8 @@ struct taglmk_state {
 	atomic_long_t		nr_killed;
 	atomic_long_t		nr_reclaimed;
 	atomic_long_t		nr_passes;
+	atomic_long_t		nr_kill_passes;
+	atomic_long_t		nr_no_candidate;
 };
 
 extern struct taglmk_state taglmk;
