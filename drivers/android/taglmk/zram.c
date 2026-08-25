@@ -30,15 +30,24 @@
  * would systematically under-reclaim on exactly the devices that can least
  * afford it, because they are the ones where the walks come back short.
  *
+ * There is a fourth thing here, which is not a measurement but an action: when
+ * the three above agree that swap is as full as it should get, this file can
+ * ask zram to recompress what it is already holding.  That gives memory back
+ * without evicting a page or killing a task, so it is tried as soon as the anon
+ * pass has nothing left to gain.  See taglmk_ir_sweep().
+ *
  * Locking: the window and the scratch arrays are private to the pass work item,
  * which is serialised by taglmk.lock, so they need nothing of their own.  The
  * fitted yield is published with WRITE_ONCE() for sysfs and for the budget
- * path, on the same reasoning as the predictor's factor.
+ * path, on the same reasoning as the predictor's factor.  The sweep's scratch
+ * page and interval are private to the pass for the same reason.
  *
  * Copyright (C) 2026 iDeadXS <datarafi43@gmail.com>
  */
 
 #include <linux/compiler.h>
+#include <linux/gfp.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/string.h>
@@ -79,6 +88,24 @@
  * memory and the pass is holding a reference to the task while it works.
  */
 #define TAGLMK_ZRAM_MIN_ANON	64
+
+/*
+ * Candidate slots one recompression sweep may track.  zram allocates a small
+ * descriptor for every slot it decides is worth revisiting, so an unbounded
+ * sweep of a full device would allocate megabytes on its way to freeing some -
+ * exactly the wrong shape for something that runs because memory is short.
+ * Two thousand descriptors is a few tens of kilobytes and more candidates than
+ * one sweep's page budget can spend anyway.
+ */
+#define TAGLMK_IR_MAX_SLOTS	2048
+
+/*
+ * Huge pages below which there is nothing for a targeted sweep to aim at.  A
+ * huge page is one the primary algorithm gave up on and zram stored whole, so a
+ * scattering of them is normal and says nothing; a megabyte of them says a lot
+ * of anonymous memory went out shallow and a second algorithm has room to work.
+ */
+#define TAGLMK_IR_HUGE_FLOOR	256
 
 /* Oldest pass at [0], newest at [taglmk_nr_obs - 1]. */
 static u32 taglmk_asked[TAGLMK_ZRAM_WINDOW];
@@ -433,4 +460,183 @@ u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg)
 		/* System and critical tasks: no opinion worth forcing. */
 		return ZRAM_IR_DEPTH_DEFAULT;
 	}
+}
+
+/*
+ * The recompression rung
+ * ======================
+ *
+ * Everything above decides how much anonymous memory to push into swap.  This
+ * decides what else can be done when the answer is none: swap is as full as the
+ * profile wants it, so there is no trade left to make there.
+ *
+ * There is still something to be had from swap itself.  zram's store path stops
+ * at the first algorithm that gets an object under a page, so nearly everything
+ * in swap was compressed by the cheapest one available even where a better one
+ * was permitted - and on a full device the objects a second algorithm would
+ * shrink further are sitting there in the tens of thousands.  Asking zram to go
+ * back and try hands memory back without a page leaving anybody's working set
+ * and without a process dying, which makes it the one rung on this ladder that
+ * costs nobody anything.
+ *
+ * It does not replace the rung below it.  Ageing file pages moves the active
+ * file count that vmscan and lmkd read, and recompression moves none of that;
+ * what recompression buys is physical memory, which is what keeps a pass from
+ * being needed again so soon and the situation from reaching the kill band at
+ * all.
+ *
+ * It is not free.  A sweep walks slots under the per-slot lock and spends CPU
+ * compressing, both of which are the wrong things to be doing if there is
+ * nothing to find, so it is gated three ways: an interval, a page budget, and a
+ * precondition read from zram's own statistics.  Zeroing either tunable turns
+ * the rung off, which is how to find out whether it earns its keep on a
+ * particular device.
+ *
+ * Locking: the scratch page is written only by zram, under that device's slot
+ * lock, and only one sweep can be in flight because sweeps run from the pass
+ * work item and the pass is serialised by taglmk.lock.  The interval is private
+ * to the same work item.  Neither needs anything of its own.
+ */
+
+/*
+ * Somewhere for zram to decompress into before it can try a better algorithm.
+ * Allocated once at init, because a pass must never allocate: it runs because
+ * memory is short, and asking the allocator for a page in order to give pages
+ * back is the one shape of that request that can fail for the reason it exists.
+ */
+static struct page *taglmk_ir_page;
+
+/* Earliest jiffies at which another sweep may run; zero until the first. */
+static unsigned long taglmk_ir_next;
+
+/**
+ * taglmk_zram_init - claim what the recompression rung needs, once
+ *
+ * Return: 0, or -ENOMEM if the scratch page could not be had.
+ */
+int taglmk_zram_init(void)
+{
+	/*
+	 * With no in-kernel recompression to drive there is nothing to
+	 * decompress into either, so do not hold a page for it.  The whole rung
+	 * folds away with the same test.
+	 */
+	if (!ZRAM_IR_REACHABLE)
+		return 0;
+
+	taglmk_ir_page = alloc_page(GFP_KERNEL);
+	if (!taglmk_ir_page)
+		return -ENOMEM;
+
+	return 0;
+}
+
+/**
+ * taglmk_zram_exit - give the scratch page back
+ *
+ * Safe to call whether or not taglmk_zram_init() got as far as allocating, so
+ * that it can sit in the init unwind chain like the other exits.
+ */
+void taglmk_zram_exit(void)
+{
+	if (!taglmk_ir_page)
+		return;
+
+	__free_page(taglmk_ir_page);
+	taglmk_ir_page = NULL;
+}
+
+/**
+ * taglmk_ir_sweep - recompress part of what swap is already holding
+ *
+ * Runs only from the pass work item.  Cheap and silent when there is nothing to
+ * do: every reason to decline is a load of a counter zram maintains anyway.
+ * What it achieved goes to the counters rather than to the caller, because no
+ * other rung's decision depends on it - see the call site.
+ */
+void taglmk_ir_sweep(void)
+{
+	struct zram_ir_stats before, after;
+	struct zram_ir_req req = {};
+	unsigned long saved;
+	long ret;
+
+	if (!taglmk_ir_page || !taglmk.ir_interval_ms || !taglmk.ir_max_pages)
+		return;
+
+	/*
+	 * The interval is checked before anything else is read, so that a rung
+	 * which is not due costs one comparison.  Zero means no sweep has run
+	 * yet and must not be treated as a deadline, because jiffies starts
+	 * below zero on some architectures and would compare as still to come.
+	 */
+	if (taglmk_ir_next && time_before(jiffies, taglmk_ir_next))
+		return;
+
+	/*
+	 * -EAGAIN here means the device registry is momentarily contended,
+	 * which is not worth waiting for: the next pass will ask again.
+	 */
+	if (zram_ir_get_stats(&before))
+		return;
+
+	/* Nothing stored, or nowhere deeper for it to go. */
+	if (!before.stored_pages || before.nr_comps < 2)
+		return;
+
+	req.scratch = taglmk_ir_page;
+	req.max_pages = taglmk.ir_max_pages;
+	req.max_slots = TAGLMK_IR_MAX_SLOTS;
+
+	/*
+	 * No threshold of our own.  zram replaces an object only when the retry
+	 * lands in a strictly smaller size class, which is already exactly the
+	 * question "did this save memory", and it hands out its largest objects
+	 * first - so the page budget spends itself where there is most to win
+	 * without this file having to invent a watermark to describe that.
+	 */
+	req.threshold = 0;
+
+	/*
+	 * Huge pages are the largest win available, a whole page each, and the
+	 * clearest evidence of a store that gave up early: the depth hint this
+	 * file sets makes a store escalate rather than give up, so the pages
+	 * TAGLMK swapped out are the least likely to be among them and a large
+	 * count is mostly kswapd's and direct reclaim's, which carry no hint.
+	 * Aim at them alone while there are enough to be worth the narrower scan.
+	 */
+	if (before.huge_pages >= TAGLMK_IR_HUGE_FLOOR)
+		req.mode = ZRAM_IR_HUGE;
+
+	ret = zram_ir_recompress(&req);
+
+	/*
+	 * Re-arm on every outcome, including the failures.  A sweep that found
+	 * nothing, or that backed off because something else was already
+	 * post-processing the device, has still spent a walk; retrying it on the
+	 * next pass would spend another for the same reasons.
+	 */
+	taglmk_ir_next = jiffies + msecs_to_jiffies(taglmk.ir_interval_ms);
+
+	if (ret <= 0)
+		return;
+
+	atomic_long_add(ret, &taglmk.nr_ir_slots);
+
+	if (zram_ir_get_stats(&after) || after.compr_bytes >= before.compr_bytes)
+		return;
+
+	/*
+	 * Compressed size is the only honest measure of what a sweep achieved,
+	 * because zram counts a slot it looked at and decided to leave alone as
+	 * a success.  Swap traffic moves the same counter, though, so credit no
+	 * more than the sweep could possibly have caused: one page per slot it
+	 * was allowed to touch.  Under-reporting the rung is much less
+	 * misleading than letting a burst of swap-in make it look like a
+	 * miracle, and the cap is also what keeps the figure inside a long.
+	 */
+	saved = min_t(u64, before.compr_bytes - after.compr_bytes,
+		      (u64)req.max_pages << PAGE_SHIFT);
+
+	atomic_long_add(saved, &taglmk.nr_ir_saved);
 }

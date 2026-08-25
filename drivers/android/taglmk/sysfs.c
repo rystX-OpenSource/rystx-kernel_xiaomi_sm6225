@@ -41,6 +41,13 @@
  */
 #define TAGLMK_BUDGET_MAX	8192
 
+/*
+ * Upper bound on ir_interval_ms.  Ten minutes is already far past the point
+ * where a recompression sweep is part of reclaim rather than a cron job, and
+ * anything longer is better expressed by turning the rung off.
+ */
+#define TAGLMK_IR_INTERVAL_MAX	600000
+
 static struct kobject *taglmk_kobj;
 
 static const char * const taglmk_level_names[] = {
@@ -141,6 +148,19 @@ TAGLMK_ATTR_RW(free_file_limit, unsigned long, "%lu", kstrtoul,
  * to ask for.
  */
 TAGLMK_ATTR_RW(reclaim_budget, unsigned int, "%u", kstrtouint,
+	       val <= TAGLMK_BUDGET_MAX);
+
+/*
+ * The recompression rung.  Either of these at zero disables it, which is the
+ * point: the rung spends CPU to avoid an eviction, and whether that trade is
+ * worth making is a property of the device and its algorithms rather than
+ * something this driver can decide in advance.  ir_max_pages is bounded by the
+ * same ceiling as reclaim_budget because it is the same kind of quantity - how
+ * much work one pass may do - and there is no reason for the two to differ.
+ */
+TAGLMK_ATTR_RW(ir_interval_ms, unsigned int, "%u", kstrtouint,
+	       val <= TAGLMK_IR_INTERVAL_MAX);
+TAGLMK_ATTR_RW(ir_max_pages, unsigned int, "%u", kstrtouint,
 	       val <= TAGLMK_BUDGET_MAX);
 
 /*
@@ -255,6 +275,12 @@ static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
 			 "reclaimed:     %ld\n",
 			 atomic_long_read(&taglmk.nr_reclaimed));
 	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "ir_slots:      %ld\n",
+			 atomic_long_read(&taglmk.nr_ir_slots));
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "ir_saved_kb:   %ld\n",
+			 atomic_long_read(&taglmk.nr_ir_saved) >> 10);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "level:         %s\n", taglmk_level_names[level]);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "free_swap:     %lu\n", taglmk_free_swap_pages());
@@ -278,6 +304,8 @@ static struct attribute *taglmk_attrs[] = {
 	&free_swap_limit_attr.attr,
 	&free_file_limit_attr.attr,
 	&reclaim_budget_attr.attr,
+	&ir_interval_ms_attr.attr,
+	&ir_max_pages_attr.attr,
 	&scan_limit_attr.attr,
 	&kill_batch_attr.attr,
 	&kill_batch_crit_attr.attr,
