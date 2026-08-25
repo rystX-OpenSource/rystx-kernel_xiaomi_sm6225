@@ -2424,7 +2424,17 @@ long zram_ir_recompress(const struct zram_ir_req *req)
 	int nr_ok = 0;
 	int id;
 
+	/*
+	 * The mode reaches scan_slots_for_recompress() untranslated, so the
+	 * exported filter bits have to be the internal ones and nothing else.
+	 */
+	BUILD_BUG_ON(ZRAM_IR_IDLE != RECOMPRESS_IDLE);
+	BUILD_BUG_ON(ZRAM_IR_HUGE != RECOMPRESS_HUGE);
+
 	if (!req || !req->scratch)
+		return -EINVAL;
+
+	if (req->mode & ~(u32)(ZRAM_IR_IDLE | ZRAM_IR_HUGE))
 		return -EINVAL;
 
 	/* huge_class_size is only known once a device has been initialised. */

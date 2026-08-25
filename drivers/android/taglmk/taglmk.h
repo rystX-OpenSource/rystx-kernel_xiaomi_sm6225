@@ -200,6 +200,10 @@ struct taglmk_victim {
  * @free_swap_limit: Live copy of the profile field, writable through sysfs.
  * @free_file_limit: Live copy of the profile field, writable through sysfs.
  * @reclaim_budget: Live copy of the profile field, writable through sysfs.
+ * @ir_interval_ms: Shortest gap between two recompression sweeps.  Zero
+ *	disables the rung, as does a zero @ir_max_pages.
+ * @ir_max_pages: Slots one sweep may hand to zram for recompression.  This is
+ *	work, not yield: a slot zram decides to leave alone still spends one.
  * @scan_limit: Live copy of the profile field, writable through sysfs.  Never
  *	above %TAGLMK_MAX_VICTIMS, which is what @victims is sized for.
  * @kill_batch: Live copy of the profile field, writable through sysfs.
@@ -224,6 +228,10 @@ struct taglmk_victim {
  *	and could not", which are very different states to be in and look
  *	identical from a kill count alone.
  * @nr_no_candidate: Kill passes that came back with an empty candidate list.
+ * @nr_ir_slots: Slots handed to zram for recompression since boot.
+ * @nr_ir_saved: Bytes of compressed data those sweeps removed, differenced from
+ *	zram's own accounting.  Approximate by nature - swap traffic moves the
+ *	same counter - but the only figure that says whether the rung pays.
  *
  * The tunables above are plain naturally aligned words.  Passes read them
  * without holding anything and sysfs writes them without holding anything
@@ -240,6 +248,8 @@ struct taglmk_state {
 	unsigned long		free_swap_limit;
 	unsigned long		free_file_limit;
 	unsigned int		reclaim_budget;
+	unsigned int		ir_interval_ms;
+	unsigned int		ir_max_pages;
 	unsigned int		scan_limit;
 	unsigned int		kill_batch;
 	unsigned int		kill_batch_crit;
@@ -259,6 +269,8 @@ struct taglmk_state {
 	atomic_long_t		nr_passes;
 	atomic_long_t		nr_kill_passes;
 	atomic_long_t		nr_no_candidate;
+	atomic_long_t		nr_ir_slots;
+	atomic_long_t		nr_ir_saved;
 };
 
 extern struct taglmk_state taglmk;
@@ -315,6 +327,8 @@ u32 taglmk_predict_factor(void);
 unsigned int taglmk_predict_budget(unsigned int base);
 
 /* zram.c */
+int taglmk_zram_init(void);
+void taglmk_zram_exit(void);
 void taglmk_zram_observe(unsigned long asked, unsigned long got);
 unsigned int taglmk_zram_utilisation(void);
 u32 taglmk_zram_efficiency(void);
@@ -322,6 +336,7 @@ unsigned int taglmk_zram_budget(unsigned int base);
 void taglmk_zram_share(struct taglmk_victim *v, unsigned int nr,
 		       unsigned int budget);
 u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg);
+void taglmk_ir_sweep(void);
 
 /* sysfs.c */
 int taglmk_sysfs_init(void);

@@ -127,6 +127,16 @@ struct taglmk_state taglmk = {
 	.min_adj	= 200,
 	.min_adj_crit	= 50,
 	.enabled	= true,
+
+	/*
+	 * The recompression rung, on by default but deliberately timid: a
+	 * megabyte of slots at most, and no oftener than every two seconds even
+	 * under sustained pressure.  Both are visible in sysfs precisely because
+	 * whether this rung pays for itself is a question about a device, not
+	 * one this driver can answer in a header.
+	 */
+	.ir_interval_ms	= 2000,
+	.ir_max_pages	= 256,
 };
 
 /*
@@ -248,6 +258,21 @@ static void taglmk_reclaim_pass(void)
 	budget = total_swap_pages ? taglmk_zram_budget(budget) : 0;
 
 	if (!budget) {
+		/*
+		 * Swap is as full as the profile wants it, so there is no trade
+		 * left to make in anonymous memory.  Ask zram to compress what
+		 * it is already holding harder instead: that returns memory
+		 * without a page leaving anybody's working set, which nothing
+		 * else this driver does can claim.
+		 *
+		 * Purely additive, and deliberately so.  The file pass below
+		 * still runs, because what it moves is the active file count
+		 * that vmscan and lmkd read, and no amount of recompression
+		 * moves that.  The two rungs answer different questions and
+		 * neither stands in for the other.
+		 */
+		taglmk_ir_sweep();
+
 		/*
 		 * Nothing to gain from pushing more anon out, so spend the pass
 		 * ageing file pages instead.  The driver only deactivates them,
@@ -560,9 +585,17 @@ static int __init taglmk_init(void)
 	if (!taglmk.victims)
 		return -ENOMEM;
 
-	ret = taglmk_task_init();
+	/*
+	 * Before sysfs and before the notifier, so that the first pass anyone
+	 * can trigger already has every resource a pass is allowed to use.
+	 */
+	ret = taglmk_zram_init();
 	if (ret)
 		goto free_victims;
+
+	ret = taglmk_task_init();
+	if (ret)
+		goto zram_exit;
 
 	ret = taglmk_sysfs_init();
 	if (ret)
@@ -586,6 +619,8 @@ sysfs_exit:
 	taglmk_sysfs_exit();
 task_exit:
 	taglmk_task_exit();
+zram_exit:
+	taglmk_zram_exit();
 free_victims:
 	kfree(taglmk.victims);
 	taglmk.victims = NULL;
