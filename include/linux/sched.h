@@ -1431,6 +1431,17 @@ struct task_struct {
 	struct request_queue		*throttle_queue;
 #endif
 
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	/*
+	 * How many compression priorities zram may walk for stores made by
+	 * this task, 1 based, 0 for the system default.  Set by a reclaimer
+	 * that knows how valuable the pages it is swapping out are.  Lives
+	 * here rather than in a per-CPU slot because reclaim sleeps between
+	 * the hint and the store, so the task can migrate CPUs in between.
+	 */
+	u8				zram_ir_depth;
+#endif
+
 #ifdef CONFIG_UPROBES
 	struct uprobe_task		*utask;
 #endif
