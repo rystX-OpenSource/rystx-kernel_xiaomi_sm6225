@@ -243,6 +243,12 @@ static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
 			 "passes:        %ld\n",
 			 atomic_long_read(&taglmk.nr_passes));
 	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "kill_passes:   %ld\n",
+			 atomic_long_read(&taglmk.nr_kill_passes));
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "no_candidate:  %ld\n",
+			 atomic_long_read(&taglmk.nr_no_candidate));
+	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "killed:        %ld\n",
 			 atomic_long_read(&taglmk.nr_killed));
 	len += scnprintf(buf + len, PAGE_SIZE - len,

@@ -362,8 +362,11 @@ static void taglmk_kill_pass(enum taglmk_level level)
 {
 	unsigned int batch, killed = 0, i, nr;
 
+	atomic_long_inc(&taglmk.nr_kill_passes);
+
 	nr = taglmk_scan_tasks(level);
 	if (!nr) {
+		atomic_long_inc(&taglmk.nr_no_candidate);
 		pr_warn_ratelimited("no candidate left at level %u, %luK free swap, %luK active file\n",
 				    (unsigned int)level,
 				    TAGLMK_K(taglmk_free_swap_pages()),
