@@ -45,6 +45,7 @@
 #include <linux/swap.h>
 #include <linux/types.h>
 #include <linux/vmstat.h>
+#include <linux/zram_ir.h>
 
 #include "taglmk.h"
 
@@ -395,4 +396,41 @@ void taglmk_zram_share(struct taglmk_victim *v, unsigned int nr,
 
 	for (i = 0; i < nr; i++)
 		v[i].budget = taglmk_share_out[i];
+}
+
+/**
+ * taglmk_ir_depth - how hard zram should try to compress a victim's pages
+ * @v: Victim about to be walked.
+ * @cputime_avg: Mean cputime across the tasks in this pass, 0 if unknown.
+ *
+ * Compression depth is a coldness question, not an importance one.  Pages that
+ * will sit in swap for minutes repay a slower algorithm; pages that are about
+ * to be faulted straight back in do not, because the depth a page went out at
+ * is also the depth it has to be read back through.
+ *
+ * Return: a depth for zram_ir_set_depth(), %ZRAM_IR_DEPTH_DEFAULT to leave the
+ * decision to the zram_recomp_immediate sysctl.
+ */
+u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg)
+{
+	switch (v->type) {
+	case TAGLMK_TYPE_APP:
+		/*
+		 * A background app is the best candidate for spending CPU on a
+		 * better ratio - but a task that has been burning CPU is not
+		 * idle whatever its class says, so it keeps the cheap path.
+		 */
+		if (cputime_avg && v->cputime > cputime_avg)
+			return ZRAM_IR_DEPTH_DEFAULT;
+		return ZRAM_IR_DEPTH_FULL;
+	case TAGLMK_TYPE_PINNED:
+		/*
+		 * Pinned deliberately, so the intent is that it survives and
+		 * gets resumed.  Optimise for the fault back in.
+		 */
+		return ZRAM_IR_DEPTH_MIN;
+	default:
+		/* System and critical tasks: no opinion worth forcing. */
+		return ZRAM_IR_DEPTH_DEFAULT;
+	}
 }

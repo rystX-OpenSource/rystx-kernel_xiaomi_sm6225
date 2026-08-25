@@ -321,6 +321,7 @@ u32 taglmk_zram_efficiency(void);
 unsigned int taglmk_zram_budget(unsigned int base);
 void taglmk_zram_share(struct taglmk_victim *v, unsigned int nr,
 		       unsigned int budget);
+u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg);
 
 /* sysfs.c */
 int taglmk_sysfs_init(void);
