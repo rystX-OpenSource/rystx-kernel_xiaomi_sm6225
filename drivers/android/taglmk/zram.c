@@ -158,8 +158,16 @@ unsigned int taglmk_zram_utilisation(void)
  * an Android device those are the same thing - zram over zsmalloc is the only
  * swap and the only zsmalloc user - and reading two vmstat counters costs
  * nothing, where reaching into a block device from here would mean this file
- * knowing what zram is.  If the assumption is ever broken the term degrades to
- * a conservative taper, never to a larger budget.
+ * knowing what zram is.
+ *
+ * The two ways that assumption can break do not break the same way.  Another
+ * zsmalloc user inflates the footprint, which deflates the ratio and tapers
+ * harder than the truth warrants: conservative, and harmless.  Another swap
+ * device that is not backed by zsmalloc inflates the stored count instead,
+ * which flatters the ratio and can hide a taper that was deserved.  That is the
+ * direction worth knowing about, and it is bounded: the term is capped at one,
+ * so the worst it can do is leave the budget where it would have been with no
+ * density term at all.  It can never raise it above that.
  */
 static u32 taglmk_zram_density(void)
 {
