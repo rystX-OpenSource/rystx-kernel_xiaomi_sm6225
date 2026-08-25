@@ -40,6 +40,7 @@
 #include <linux/vmpressure.h>
 #include <linux/vmstat.h>
 #include <linux/workqueue.h>
+#include <linux/zram_ir.h>
 
 #include "taglmk.h"
 
@@ -235,6 +236,7 @@ static void taglmk_reclaim_pass(void)
 	enum taglmk_reclaim_type type = TAGLMK_RECLAIM_ANON;
 	unsigned long asked = 0, got = 0;
 	unsigned int budget, i, nr;
+	u64 cputime_avg = 0;
 
 	/*
 	 * Two corrections, in order.  The predictor says how urgent the coming
@@ -265,19 +267,49 @@ static void taglmk_reclaim_pass(void)
 	taglmk_sort_by_anon();
 	taglmk_share_budget(nr, budget, type);
 
+	/*
+	 * Reference point for "has this task been busy", used only to pick a
+	 * compression depth below.  A mean over the scanned set is enough: the
+	 * question is which of these tasks look idle relative to each other,
+	 * not what their absolute runtimes are.
+	 */
+	if (type == TAGLMK_RECLAIM_ANON) {
+		u64 sum = 0;
+
+		for (i = 0; i < nr; i++)
+			sum += taglmk.victims[i].cputime;
+
+		cputime_avg = div_u64(sum, nr);
+	}
+
 	for (i = 0; i < nr && got < budget; i++) {
 		struct taglmk_victim *v = &taglmk.victims[i];
 		struct taglmk_reclaim_stat stat;
+		int ret;
 
 		if (v->skip || !v->budget)
 			continue;
+
+		/*
+		 * zram is bio based, so the store path runs synchronously in
+		 * this worker's context: a hint set on current here reaches
+		 * zram_write_page() for every page this walk swaps out.  Only
+		 * an anon pass produces stores, and the hint is dropped again
+		 * immediately so nothing else this worker does inherits it.
+		 */
+		if (type == TAGLMK_RECLAIM_ANON)
+			zram_ir_set_depth(taglmk_ir_depth(v, cputime_avg));
 
 		/*
 		 * A failure here is ordinary: -EBUSY means the address space was
 		 * locked by someone else and -ESRCH that the task exited under
 		 * us.  Both mean "try the next one", never "give up".
 		 */
-		if (taglmk_reclaim_mm(v->tsk, type, v->budget, &stat))
+		ret = taglmk_reclaim_mm(v->tsk, type, v->budget, &stat);
+
+		zram_ir_reset_depth();
+
+		if (ret)
 			continue;
 
 		asked += v->budget;
