@@ -802,6 +802,11 @@ static int dsi_panel_update_backlight(struct dsi_panel *panel,
 	if (panel->bl_config.bl_inverted_dbv)
 		bl_lvl = (((bl_lvl & 0xff) << 8) | (bl_lvl >> 8));
 
+	DSI_INFO("bl dcs: writing 0x%04x (inverted_dbv=%d move_high_8b=%d subtype=0x%x)\n",
+			bl_lvl, panel->bl_config.bl_inverted_dbv,
+			panel->bl_config.bl_move_high_8b,
+			panel->bl_config.bl_dcs_subtype);
+
 	if (panel->bl_config.bl_dcs_subtype == 0xc2)
 		rc = dsi_panel_dcs_set_display_brightness_c2(dsi, bl_lvl);
 	else

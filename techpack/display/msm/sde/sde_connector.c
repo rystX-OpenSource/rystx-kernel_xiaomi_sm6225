@@ -103,6 +103,12 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 		bl_lvl = 0;
 	}
 
+	SDE_INFO("bl req: props.brightness=%d power=%d state=0x%x -> brightness=%d bl_lvl=%d\n",
+			bd->props.brightness, bd->props.power, bd->props.state,
+			brightness, bl_lvl);
+	SDE_INFO("bl req: allow_bl_update=%d unset_bl_level=%u\n",
+			c_conn->allow_bl_update, c_conn->unset_bl_level);
+
 	if (!c_conn->allow_bl_update) {
 		c_conn->unset_bl_level = bl_lvl;
 		return 0;
@@ -597,6 +603,8 @@ static int _sde_connector_update_bl_scale(struct sde_connector *c_conn)
 	bl_config = &dsi_display->panel->bl_config;
 
 	if (!c_conn->allow_bl_update) {
+		SDE_INFO("bl scale deferred: bl_update not allowed, unset_bl_level=%u\n",
+				bl_config->bl_level);
 		c_conn->unset_bl_level = bl_config->bl_level;
 		return 0;
 	}
@@ -609,8 +617,9 @@ static int _sde_connector_update_bl_scale(struct sde_connector *c_conn)
 	bl_config->bl_scale_sv = c_conn->bl_scale_sv > MAX_SV_BL_SCALE_LEVEL ?
 			MAX_SV_BL_SCALE_LEVEL : c_conn->bl_scale_sv;
 
-	SDE_DEBUG("bl_scale = %u, bl_scale_sv = %u, bl_level = %u\n",
-		bl_config->bl_scale, bl_config->bl_scale_sv,
+	SDE_INFO("bl scale: bl_scale=%u/%u bl_scale_sv=%u/%u bl_level=%u\n",
+		bl_config->bl_scale, (u32)MAX_BL_SCALE_LEVEL,
+		bl_config->bl_scale_sv, (u32)MAX_SV_BL_SCALE_LEVEL,
 		bl_config->bl_level);
 	rc = c_conn->ops.set_backlight(&c_conn->base,
 			dsi_display, bl_config->bl_level);
@@ -892,6 +901,7 @@ void sde_connector_helper_bridge_disable(struct drm_connector *connector)
 	}
 
 	c_conn->allow_bl_update = false;
+	SDE_INFO("bridge_disable: allow_bl_update=0\n");
 }
 
 void sde_connector_helper_bridge_enable(struct drm_connector *connector)
@@ -916,6 +926,8 @@ void sde_connector_helper_bridge_enable(struct drm_connector *connector)
 		sde_encoder_wait_for_event(c_conn->encoder,
 				MSM_ENC_TX_COMPLETE);
 	c_conn->allow_bl_update = true;
+	SDE_INFO("bridge_enable: allow_bl_update=1 unset_bl_level=%u bl_update=%d\n",
+			c_conn->unset_bl_level, display->panel->bl_config.bl_update);
 
 	if (c_conn->bl_device) {
 		c_conn->bl_device->props.power = FB_BLANK_UNBLANK;
