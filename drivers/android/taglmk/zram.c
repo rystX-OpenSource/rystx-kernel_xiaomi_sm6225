@@ -449,7 +449,7 @@ void taglmk_zram_share(struct taglmk_victim *v, unsigned int nr,
 u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg)
 {
 	switch (v->type) {
-	case TAGLMK_TASK_APP:
+	case TAGLMK_TYPE_APP:
 		/*
 		 * A background app is the best candidate for spending CPU on a
 		 * better ratio - but a task that has been burning CPU is not
@@ -458,7 +458,7 @@ u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg)
 		if (cputime_avg && v->cputime > cputime_avg)
 			return ZRAM_IR_DEPTH_DEFAULT;
 		return ZRAM_IR_DEPTH_FULL;
-	case TAGLMK_TASK_PINNED:
+	case TAGLMK_TYPE_PINNED:
 		/*
 		 * Pinned deliberately, so the intent is that it survives and
 		 * gets resumed.  Optimise for the fault back in.
