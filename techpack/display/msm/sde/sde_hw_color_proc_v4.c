@@ -211,7 +211,7 @@ void sde_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
 	}
 
 	if (!hw_cfg->payload) {
-		DRM_DEBUG_DRIVER("disable pcc feature\n");
+		pr_info("sde_cp: pcc dspp%d disabled\n", ctx->idx - DSPP_0);
 		SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->pcc.base, 0);
 		return;
 	}
@@ -223,6 +223,21 @@ void sde_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
 	}
 
 	pcc_cfg = hw_cfg->payload;
+
+	/*
+	 * A PCC matrix with (near-)zero diagonal coefficients scans out black
+	 * while every layer above still reports success, so log what userspace
+	 * actually programmed. AOSP leaves PCC alone; MIUI's DisplayFeature
+	 * stack drives it for every colour mode and for paper mode.
+	 */
+	pr_info("sde_cp: pcc dspp%d r=[c%u r%u g%u b%u] g=[c%u r%u g%u b%u]\n",
+			ctx->idx - DSPP_0,
+			pcc_cfg->r.c, pcc_cfg->r.r, pcc_cfg->r.g, pcc_cfg->r.b,
+			pcc_cfg->g.c, pcc_cfg->g.r, pcc_cfg->g.g, pcc_cfg->g.b);
+	pr_info("sde_cp: pcc dspp%d b=[c%u r%u g%u b%u] rr/gg/bb=[%u %u %u]\n",
+			ctx->idx - DSPP_0,
+			pcc_cfg->b.c, pcc_cfg->b.r, pcc_cfg->b.g, pcc_cfg->b.b,
+			pcc_cfg->r_rr, pcc_cfg->g_gg, pcc_cfg->b_bb);
 
 	for (i = 0; i < PCC_NUM_PLANES; i++) {
 		base = ctx->cap->sblk->pcc.base + (i * sizeof(u32));
