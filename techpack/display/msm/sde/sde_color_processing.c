@@ -176,6 +176,59 @@ enum sde_cp_crtc_features {
 	SDE_CP_CRTC_MAX_FEATURES,
 };
 
+/*
+ * Names for the feature ids above, so a dmesg census of what userspace
+ * programs into the colour pipeline is readable without a decoder ring.
+ * MIUI's DisplayFeature stack drives this path hard (colour modes, paper
+ * mode, DPPS/ABA/SVI); AOSP barely touches it.
+ */
+static const char * const sde_cp_crtc_feature_names[SDE_CP_CRTC_MAX_FEATURES] = {
+	[SDE_CP_CRTC_DSPP_IGC]			= "igc",
+	[SDE_CP_CRTC_DSPP_PCC]			= "pcc",
+	[SDE_CP_CRTC_DSPP_GC]			= "gc",
+	[SDE_CP_CRTC_DSPP_HSIC]			= "hsic",
+	[SDE_CP_CRTC_DSPP_MEMCOL_SKIN]		= "memcol_skin",
+	[SDE_CP_CRTC_DSPP_MEMCOL_SKY]		= "memcol_sky",
+	[SDE_CP_CRTC_DSPP_MEMCOL_FOLIAGE]	= "memcol_foliage",
+	[SDE_CP_CRTC_DSPP_MEMCOL_PROT]		= "memcol_prot",
+	[SDE_CP_CRTC_DSPP_SIXZONE]		= "sixzone",
+	[SDE_CP_CRTC_DSPP_GAMUT]		= "gamut",
+	[SDE_CP_CRTC_DSPP_DITHER]		= "dither",
+	[SDE_CP_CRTC_DSPP_HIST_CTRL]		= "hist_ctrl",
+	[SDE_CP_CRTC_DSPP_HIST_IRQ]		= "hist_irq",
+	[SDE_CP_CRTC_DSPP_AD]			= "ad",
+	[SDE_CP_CRTC_DSPP_VLUT]			= "vlut",
+	[SDE_CP_CRTC_DSPP_AD_MODE]		= "ad_mode",
+	[SDE_CP_CRTC_DSPP_AD_INIT]		= "ad_init",
+	[SDE_CP_CRTC_DSPP_AD_CFG]		= "ad_cfg",
+	[SDE_CP_CRTC_DSPP_AD_INPUT]		= "ad_input",
+	[SDE_CP_CRTC_DSPP_AD_ASSERTIVENESS]	= "ad_assertiveness",
+	[SDE_CP_CRTC_DSPP_AD_BACKLIGHT]		= "ad_backlight",
+	[SDE_CP_CRTC_DSPP_AD_STRENGTH]		= "ad_strength",
+	[SDE_CP_CRTC_DSPP_AD_ROI]		= "ad_roi",
+	[SDE_CP_CRTC_DSPP_LTM]			= "ltm",
+	[SDE_CP_CRTC_DSPP_LTM_INIT]		= "ltm_init",
+	[SDE_CP_CRTC_DSPP_LTM_ROI]		= "ltm_roi",
+	[SDE_CP_CRTC_DSPP_LTM_HIST_CTL]		= "ltm_hist_ctl",
+	[SDE_CP_CRTC_DSPP_LTM_HIST_THRESH]	= "ltm_hist_thresh",
+	[SDE_CP_CRTC_DSPP_LTM_SET_BUF]		= "ltm_set_buf",
+	[SDE_CP_CRTC_DSPP_LTM_QUEUE_BUF]	= "ltm_queue_buf",
+	[SDE_CP_CRTC_DSPP_LTM_QUEUE_BUF2]	= "ltm_queue_buf2",
+	[SDE_CP_CRTC_DSPP_LTM_QUEUE_BUF3]	= "ltm_queue_buf3",
+	[SDE_CP_CRTC_DSPP_LTM_VLUT]		= "ltm_vlut",
+	[SDE_CP_CRTC_DSPP_RC_MASK]		= "rc_mask",
+	[SDE_CP_CRTC_LM_GC]			= "lm_gc",
+};
+
+static const char *sde_cp_feature_name(u32 feature)
+{
+	if (feature >= SDE_CP_CRTC_MAX_FEATURES ||
+			!sde_cp_crtc_feature_names[feature])
+		return "?";
+
+	return sde_cp_crtc_feature_names[feature];
+}
+
 enum sde_cp_crtc_pu_features {
 	SDE_CP_CRTC_DSPP_RC_PU,
 	SDE_CP_CRTC_MAX_PU_FEATURES,
@@ -1448,6 +1501,13 @@ static void sde_cp_crtc_setfeature(struct sde_cp_node *prop_node,
 			continue;
 		hw_cfg.dspp[i] = hw_dspp;
 	}
+
+	pr_info("sde_cp: %s feature %u (%s) prop %u payload %s\n",
+			feature_enabled ? "set" : "clear",
+			prop_node->feature,
+			sde_cp_feature_name(prop_node->feature),
+			prop_node->property_id,
+			hw_cfg.payload ? "present" : "NULL");
 
 	if ((prop_node->feature >= SDE_CP_CRTC_MAX_FEATURES) ||
 			set_crtc_feature_wrappers[prop_node->feature] == NULL) {
