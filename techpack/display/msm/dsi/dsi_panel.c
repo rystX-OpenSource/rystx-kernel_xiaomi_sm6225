@@ -574,8 +574,9 @@ error_disable_lcm_gpio:
 	if (gpio_is_valid(panel->reset_config.lcm_enn_gpio))
 		gpio_set_value(panel->reset_config.lcm_enn_gpio, 0);
 #endif
+#ifdef CONFIG_TARGET_PROJECT_K7T /* HACK: disable for xiaomi C3Q device */
 	(void)dsi_panel_set_pinctrl_state(panel, false);
-#ifdef CONFIG_TARGET_PROJECT_K7T
+
 error_disable_vregs:
 	(void)dsi_pwr_enable_regulator(&panel->power_info, false);
 #endif /* end */
@@ -631,6 +632,7 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 				 rc);
 	}
 
+#ifdef CONFIG_TARGET_PROJECT_K7T /* HACK: disable for xiaomi C3Q device */
 	rc = dsi_panel_set_pinctrl_state(panel, false);
 	if (rc) {
 		DSI_ERR("[%s] failed set pinctrl state, rc=%d\n", panel->name,
@@ -641,6 +643,7 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to enable vregs, rc=%d\n",
 				panel->name, rc);
+#endif /* end */
 
 	return rc;
 }
