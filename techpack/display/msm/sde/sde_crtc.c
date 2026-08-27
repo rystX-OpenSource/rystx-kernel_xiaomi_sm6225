@@ -439,11 +439,139 @@ static ssize_t retire_frame_event_show(struct device *device,
 			ktime_to_ns(sde_crtc->retire_frame_event_time));
 }
 
+/*
+ * misr_data - sysfs mirror of the debugfs misr_data node.
+ *
+ * MISR is a CRC over the pixels the layer mixer emits, so it is the only
+ * way to tell "the DPU is scanning out black" apart from "the panel is not
+ * showing what the DPU sends" without a scope. The debugfs node is
+ * unreachable on production configs (CONFIG_DEBUG_FS=n), so expose the same
+ * control here:
+ *
+ *	echo "1 1" > misr_data	# enable, recompute every frame
+ *	cat misr_data		# one "lm idx:N" / "0x<crc>" pair per mixer
+ *	echo "0 0" > misr_data	# disable
+ *
+ * A CRC that changes between reads means real pixels are being scanned out.
+ * A constant CRC across a visibly animating screen means the mixer output is
+ * static (all-black included).
+ */
+static ssize_t misr_data_store(struct device *device,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct drm_crtc *crtc;
+	struct sde_crtc *sde_crtc;
+	struct sde_kms *sde_kms;
+	u32 frame_count, enable;
+	int rc;
+
+	if (!device || !buf) {
+		SDE_ERROR("invalid input param(s)\n");
+		return -EAGAIN;
+	}
+
+	crtc = dev_get_drvdata(device);
+	if (!crtc)
+		return -EINVAL;
+	sde_crtc = to_sde_crtc(crtc);
+
+	sde_kms = _sde_crtc_get_kms(crtc);
+	if (!sde_kms)
+		return -EINVAL;
+
+	if (sscanf(buf, "%u %u", &enable, &frame_count) != 2)
+		return -EINVAL;
+
+	if (sde_kms_is_secure_session_inprogress(sde_kms)) {
+		SDE_DEBUG("crtc:%d misr enable/disable not allowed\n",
+				DRMID(crtc));
+		return -EINVAL;
+	}
+
+	rc = pm_runtime_get_sync(crtc->dev->dev);
+	if (rc < 0)
+		return rc;
+
+	sde_crtc->misr_enable_debugfs = enable;
+	sde_crtc_misr_setup(crtc, enable, frame_count);
+	pm_runtime_put_sync(crtc->dev->dev);
+
+	return count;
+}
+
+static ssize_t misr_data_show(struct device *device,
+	struct device_attribute *attr, char *buf)
+{
+	struct drm_crtc *crtc;
+	struct sde_crtc *sde_crtc;
+	struct sde_kms *sde_kms;
+	struct sde_crtc_mixer *m;
+	ssize_t len = 0;
+	int i, rc;
+
+	if (!device || !buf) {
+		SDE_ERROR("invalid input param(s)\n");
+		return -EAGAIN;
+	}
+
+	crtc = dev_get_drvdata(device);
+	if (!crtc)
+		return -EINVAL;
+	sde_crtc = to_sde_crtc(crtc);
+
+	sde_kms = _sde_crtc_get_kms(crtc);
+	if (!sde_kms)
+		return -EINVAL;
+
+	rc = pm_runtime_get_sync(crtc->dev->dev);
+	if (rc < 0)
+		return rc;
+
+	if (sde_kms_is_secure_session_inprogress(sde_kms)) {
+		SDE_DEBUG("crtc:%d misr read not allowed\n", DRMID(crtc));
+		len = scnprintf(buf, PAGE_SIZE, "secure\n");
+		goto end;
+	}
+
+	if (!sde_crtc->misr_enable_debugfs) {
+		len = scnprintf(buf, PAGE_SIZE, "disabled\n");
+		goto end;
+	}
+
+	for (i = 0; i < sde_crtc->num_mixers; ++i) {
+		u32 misr_value = 0;
+
+		m = &sde_crtc->mixers[i];
+		if (!m->hw_lm || !m->hw_lm->ops.collect_misr) {
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					"invalid\n");
+			continue;
+		}
+
+		rc = m->hw_lm->ops.collect_misr(m->hw_lm, false, &misr_value);
+		if (rc) {
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					"invalid\n");
+			continue;
+		}
+
+		len += scnprintf(buf + len, PAGE_SIZE - len, "lm idx:%d\n",
+				m->hw_lm->idx - LM_0);
+		len += scnprintf(buf + len, PAGE_SIZE - len, "0x%x\n",
+				misr_value);
+	}
+
+end:
+	pm_runtime_put_sync(crtc->dev->dev);
+	return len;
+}
+
 static DEVICE_ATTR_RO(vsync_event);
 static DEVICE_ATTR_RO(measured_fps);
 static DEVICE_ATTR_RW(fps_periodicity_ms);
 static DEVICE_ATTR_RO(retire_frame_event);
 static DEVICE_ATTR_WO(early_wakeup);
+static DEVICE_ATTR_RW(misr_data);
 
 static struct attribute *sde_crtc_dev_attrs[] = {
 	&dev_attr_vsync_event.attr,
@@ -451,6 +579,7 @@ static struct attribute *sde_crtc_dev_attrs[] = {
 	&dev_attr_fps_periodicity_ms.attr,
 	&dev_attr_retire_frame_event.attr,
 	&dev_attr_early_wakeup.attr,
+	&dev_attr_misr_data.attr,
 	NULL
 };
 
