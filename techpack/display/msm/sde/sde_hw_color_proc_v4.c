@@ -197,6 +197,28 @@ void sde_setup_dspp_igcv3(struct sde_hw_dspp *ctx, void *cfg)
 	SDE_REG_WRITE(&ctx->hw, IGC_OPMODE_OFF, IGC_EN);
 }
 
+/*
+ * A PCC matrix with every coefficient at zero can only ever scan out black.
+ * Userspace that hands one down has failed to build a matrix rather than asked
+ * for a blank panel, so treat it the same way as a missing payload and bypass
+ * the block instead of blanking a display that is composing and lit correctly.
+ */
+static bool sde_pccv4_coeff_is_zero(const struct drm_msm_pcc_coeff *coeff)
+{
+	return !(coeff->c | coeff->r | coeff->g | coeff->b |
+			coeff->rg | coeff->gb | coeff->rb | coeff->rgb);
+}
+
+static bool sde_pccv4_is_zero_matrix(const struct drm_msm_pcc *pcc)
+{
+	return sde_pccv4_coeff_is_zero(&pcc->r) &&
+		sde_pccv4_coeff_is_zero(&pcc->g) &&
+		sde_pccv4_coeff_is_zero(&pcc->b) &&
+		!(pcc->r_rr | pcc->r_gg | pcc->r_bb |
+		  pcc->g_rr | pcc->g_gg | pcc->g_bb |
+		  pcc->b_rr | pcc->b_gg | pcc->b_bb);
+}
+
 void sde_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
 {
 	struct sde_hw_cp_cfg *hw_cfg = cfg;
@@ -238,6 +260,13 @@ void sde_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
 			ctx->idx - DSPP_0,
 			pcc_cfg->b.c, pcc_cfg->b.r, pcc_cfg->b.g, pcc_cfg->b.b,
 			pcc_cfg->r_rr, pcc_cfg->g_gg, pcc_cfg->b_bb);
+
+	if (sde_pccv4_is_zero_matrix(pcc_cfg)) {
+		pr_warn_ratelimited("sde_cp: pcc dspp%d all-zero matrix, bypassing\n",
+				ctx->idx - DSPP_0);
+		SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->pcc.base, 0);
+		return;
+	}
 
 	for (i = 0; i < PCC_NUM_PLANES; i++) {
 		base = ctx->cap->sblk->pcc.base + (i * sizeof(u32));
