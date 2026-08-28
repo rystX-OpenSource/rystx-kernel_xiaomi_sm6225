@@ -106,7 +106,7 @@ struct task_struct init_task
 	.sibling	= LIST_HEAD_INIT(init_task.sibling),
 	.group_leader	= &init_task,
 	.mlfq		= {
-		.ema		= 0,
+		.g		= 0,
 		.last_sleep_at	= 0,
 		.queued_at	= 0,
 		.last_boost_at	= 0,

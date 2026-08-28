@@ -1455,7 +1455,6 @@ static inline bool arch_has_hw_pte_young(void)
 	return true;
 }
 
-#include <asm-generic/pgtable.h>
 #endif	/* __ASSEMBLY__ */
 
 #endif /* _ASM_X86_PGTABLE_H */
