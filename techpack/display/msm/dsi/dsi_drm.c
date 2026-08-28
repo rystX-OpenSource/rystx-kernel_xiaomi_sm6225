@@ -352,6 +352,28 @@ int dsi_bridge_interface_enable(int timeout)
 }
 EXPORT_SYMBOL(dsi_bridge_interface_enable);
 #endif
+
+/*
+ * Xiaomi's DisplayFeature HAL reads the connector's panel_info attribute to
+ * learn which panel it drives. drm_sysfs.c strips the "qcom,mdss_" prefix off
+ * this string and appends "_display" to build the name of the calibration file
+ * it loads from /vendor/etc - for c3q that is
+ * dsi_panel_c3q_35_02_0a_fhdp_video_display_mi.xml, which carries the wpCalib
+ * and gabb PCC coefficients. Leave this op out and drm_get_panel_info() returns
+ * 0, panel_info reads back empty, and the HAL programs a zeroed PCC matrix.
+ */
+static int dsi_bridge_get_panel_info(struct drm_bridge *bridge, char *buf)
+{
+	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+
+	if (!c_bridge || !c_bridge->display || !c_bridge->display->name) {
+		DSI_ERR("Invalid params\n");
+		return 0;
+	}
+
+	return snprintf(buf, PAGE_SIZE, "%s", c_bridge->display->name);
+}
+
 static void dsi_bridge_enable(struct drm_bridge *bridge)
 {
 	int rc = 0;
@@ -696,6 +718,7 @@ static const struct drm_bridge_funcs dsi_bridge_ops = {
 	.disable      = dsi_bridge_disable,
 	.post_disable = dsi_bridge_post_disable,
 	.mode_set     = dsi_bridge_mode_set,
+	.disp_get_panel_info = dsi_bridge_get_panel_info,
 };
 
 int dsi_conn_set_info_blob(struct drm_connector *connector,
