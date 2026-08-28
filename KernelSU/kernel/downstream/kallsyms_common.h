@@ -51,7 +51,7 @@ static inline void *old_kvrealloc(const void *p, size_t oldsize, size_t newsize,
 	return newp;
 }
 
-static noinline void insert_to_kallsyms_array(const char *str, uintptr_t addr)
+static inline void insert_to_kallsyms_array(const char *str, uintptr_t addr)
 {
 	if (!str || !addr)
 		return;
@@ -139,7 +139,7 @@ static noinline void dotted_kallsyms_build_hash_array(void)
 	uintptr_t iter_count = 0;
 	uintptr_t curr;
 
-	might_sleep();
+	cond_resched();
 
 	char *membuf __zoffstack(KSYM_SYMBOL_LEN * 2);
 	if (!membuf)
@@ -363,13 +363,11 @@ skip_on_each_symbol:
 	if (!(current->flags & PF_KTHREAD))
 		return 0x0;
 
-	mutex_lock(&kallsyms_hash_array_mutex);
-	if (!kallsyms_hash_array_ready) {
+	if (guarded_mutex_lock(&kallsyms_hash_array_mutex) && !kallsyms_hash_array_ready) {
 		dotted_kallsyms_build_hash_array();
 		kallsyms_hash_array_ready = true;
 		smp_mb();
 	}
-	mutex_unlock(&kallsyms_hash_array_mutex);
 
 	return kallsyms_lookup_hashed_name(name);
 	

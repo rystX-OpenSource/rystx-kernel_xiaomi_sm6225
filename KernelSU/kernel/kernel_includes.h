@@ -54,6 +54,7 @@
 #include <linux/lockdep.h>
 #include <linux/lsm_audit.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/mount.h>
@@ -190,21 +191,85 @@
 #endif
 
 /**
+ * static_assert is C23
+ * this has an alternative available on C11 capable compilers.
+ * ref: https://elixir.bootlin.com/linux/v5.1/source/include/linux/build_bug.h
+ *
+ * static_assert(condition); - condition becomes the comment
+ * static_assert(condition, "comment");
+ */
+#ifndef static_assert
+#define __static_assert(expr, msg, ...) _Static_assert(expr, msg)
+#define static_assert(expr, ...) __static_assert(expr, ##__VA_ARGS__, #expr)
+#endif
+
+/**
  * we do NOT have memset_explicit on the linux kernel
  *
  * from: OPENSSL_cleanse, volatile function pointer prevents memset optimization
  * https://github.com/openssl/openssl/blob/master/crypto/mem_clr.c
  * 
  */
-static __nocfi void *memset_explicit(void *s, int c, size_t count)
+static __nocfi __always_inline void *memset_explicit(void *s, int c, size_t count)
 {
 	static typeof(memset) *volatile memset_fnptr = memset;
 	return memset_fnptr(s, c, count);
 }
 
-// pseudo-raii / defer on C via __attribute__((__cleanup__()))
+/**
+ * __attribute__((__cleanup__()))
+ * - pseudo-raii / defer / scoped cleanup on C 
+ *
+ * NOTE: passes address of variable attributed to fn()
+ */
 #ifndef __cleanup
 #define __cleanup(fn) __attribute__((__cleanup__(fn)))
+#endif
+
+// dummy variable generator
+#define __ksu_concat(a, b) a##b
+#define __ksu_generate_dummy(a, b) __ksu_concat(a, b)
+#define __ksu_dummy_var __ksu_generate_dummy(_ksu_dummy_, __COUNTER__)
+
+// scoped lock, mutex
+static inline void mutex_unlock_byref(struct mutex **m) { mutex_unlock(*m); }
+#define deferred_mutex_unlock(lock) struct mutex *__ksu_dummy_var __cleanup(mutex_unlock_byref) = (lock)
+#define guarded_mutex_lock(lock) ({ mutex_lock(lock); deferred_mutex_unlock(lock); 1; })
+
+// scoped lock, spinlock
+static inline void spin_unlock_byref(spinlock_t **lock) { spin_unlock(*lock); }
+#define deferred_spin_unlock(lock) spinlock_t *__ksu_dummy_var __cleanup(spin_unlock_byref) = (lock)
+#define guarded_spin_lock(lock) ({ spin_lock(lock); deferred_spin_unlock(lock); 1; })
+
+// basic stack offload.
+static inline void kfree_byref(void *buf) { kfree(*(void **)buf); }
+#define __offstack(size) __cleanup(kfree_byref) = kmalloc(size, GFP_KERNEL)
+#define __zoffstack(size) __cleanup(kfree_byref) = kzalloc(size, GFP_KERNEL)
+
+// check for guaranteed inline routines
+// if unavailable, use plain builtin
+#ifndef __has_builtin
+#define __has_builtin(x) (0)
+#endif
+
+// memcpy_inline IR generation tends to fail on older clang
+#if __has_builtin(__builtin_memcpy_inline) && defined(__clang__) && (__clang_major__ >= 17)
+#define memcpy_inline	__builtin_memcpy_inline
+#else
+#define memcpy_inline(to, from, sz) ({			\
+	static_assert(__builtin_constant_p(sz));	\
+	__builtin_memcpy((to), (from), (sz));		\
+})
+#endif
+
+// memset_inline IR generation tends to fail on older clang
+#if __has_builtin(__builtin_memset_inline) && defined(__clang__) && (__clang_major__ >= 17)
+#define memset_inline	__builtin_memset_inline
+#else
+#define memset_inline(dst, val, sz) ({			\
+	static_assert(__builtin_constant_p(sz));	\
+	__builtin_memset((dst), (val), (sz));		\
+})
 #endif
 
 /**

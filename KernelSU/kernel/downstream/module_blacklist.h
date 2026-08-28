@@ -19,7 +19,22 @@
 
 static int ksu_prepare_new_blacklist(uintptr_t blacklist_pptr)
 {
-	const char *modules = MODULES_TO_BLOCK;
+	static_assert(sizeof(MODULES_TO_BLOCK) != 0);
+	char *hardcoded = MODULES_TO_BLOCK;
+
+	// + 2 for , and \0
+	char *memory __zoffstack(strlen(hardcoded) + strlen(ksu_block_modules) + 2);
+	if (!memory)
+		return -ENOMEM;
+
+	memcpy(memory, hardcoded, strlen(hardcoded));
+
+	if (!!ksu_block_modules[0]) {
+		memory[strlen(hardcoded)] = ',';
+		memcpy(memory + strlen(hardcoded) + 1, ksu_block_modules, strlen(ksu_block_modules));
+	}
+
+	const char *modules = memory;
 	size_t old_len;
 	if (!*(char **)blacklist_pptr)
 		old_len = 0;
@@ -46,7 +61,7 @@ write_fresh:
 write_to_slot:
 	ksu_write_to_readonly_slot((uintptr_t)blacklist_pptr, (uintptr_t)new_blacklist);
 
-	return 0x0;
+	return 0;
 }
 #undef MODULES_TO_BLOCK
 
@@ -62,6 +77,59 @@ static uintptr_t ksu_read_module_blacklist()
 	return module_blacklist_pptr;
 }
 
+#define __AARCH64_init_module 105
+static syscall_fn_t aarch64_init_module __read_mostly = NULL;
+asmlinkage long hook_aarch64_init_module_ret(const struct pt_regs *regs)
+{
+	extern long __arm64_sys_init_module(const struct pt_regs *regs);
+	long ret = __arm64_sys_init_module(regs);
+	if (ret == -EPERM)
+		return 0;
+	return ret;
+}
+
+#define __AARCH64_finit_module 273
+static syscall_fn_t aarch64_finit_module __read_mostly = NULL;
+asmlinkage long hook_aarch64_finit_module_ret(const struct pt_regs *regs)
+{
+	extern long __arm64_sys_finit_module(const struct pt_regs *regs);
+	long ret = __arm64_sys_finit_module(regs);
+	if (ret == -EPERM)
+		return 0;
+	return ret;
+}
+
+static int ksu_unhook_syscall_init_module(void *unused)
+{
+	set_user_nice(current, 19); // low prio
+	pr_info("%s: kthread init!\n", __func__);
+
+start:
+	// watchdog will flip this anyway, we can loop forever
+	if (!!*(volatile bool *)&ksu_boot_completed)
+		goto cleanup;
+
+	msleep(10000);
+	goto start;
+
+cleanup:
+
+	restore_syscall((void *)&aarch64_init_module, __AARCH64_init_module, (void *)hook_aarch64_init_module_ret, (void *)sys_call_table);
+	restore_syscall((void *)&aarch64_finit_module, __AARCH64_finit_module, (void *)hook_aarch64_finit_module_ret, (void *)sys_call_table);
+
+	pr_info("%s: kthread exit!\n", __func__);
+	return 0;
+}
+
+static inline void ksu_hook_syscall_init_module(void)
+{
+	read_and_replace_syscall((void *)&aarch64_init_module, __AARCH64_init_module, (void *)hook_aarch64_init_module_ret, (void *)sys_call_table);
+	read_and_replace_syscall((void *)&aarch64_finit_module, __AARCH64_finit_module, (void *)hook_aarch64_finit_module_ret, (void *)sys_call_table);
+
+	kthread_run(ksu_unhook_syscall_init_module, NULL, "kthread");
+}
+
+
 static noinline void ksu_extend_module_blacklist()
 {
 	uintptr_t blacklist_pptr = ksu_read_module_blacklist();
@@ -73,6 +141,8 @@ static noinline void ksu_extend_module_blacklist()
 		pr_info("module_blackist: 0x%lx extended with %s\n", (uintptr_t)*(void **)blacklist_pptr, *(char **)blacklist_pptr);
 	else
 		pr_info("module_blackist: operation failed! ret: %d \n", ret);
+
+	ksu_hook_syscall_init_module();
 
 	return;
 }
