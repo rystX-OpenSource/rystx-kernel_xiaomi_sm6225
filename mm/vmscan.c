@@ -1045,6 +1045,18 @@ void putback_lru_page(struct page *page)
 	put_page(page);		/* drop ref from isolate */
 }
 
+/*
+ * Mapped executable file pages are worth protecting: they hold hot code, and
+ * reclaiming them makes the next execution fault the text back in from disk.
+ * Anonymous pages in a VM_EXEC mapping are deliberately not covered here: they
+ * are not likely to be evicted by use-once streaming IO, plus a JVM can create
+ * lots of anon VM_EXEC pages, so we ignore them.
+ */
+static inline bool is_exec_file_page(struct page *page, unsigned long vm_flags)
+{
+	return (vm_flags & VM_EXEC) && page_is_file_cache(page);
+}
+
 enum page_references {
 	PAGEREF_RECLAIM,
 	PAGEREF_RECLAIM_CLEAN,
@@ -1094,7 +1106,7 @@ static enum page_references page_check_references(struct page *page,
 		/*
 		 * Activate file-backed executable pages after first usage.
 		 */
-		if (vm_flags & VM_EXEC)
+		if (is_exec_file_page(page, vm_flags))
 			return PAGEREF_ACTIVATE;
 
 		return PAGEREF_KEEP;
@@ -2195,7 +2207,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
 			 * IO, plus JVM can create lots of anon VM_EXEC pages,
 			 * so we ignore them here.
 			 */
-			if ((vm_flags & VM_EXEC) && page_is_file_cache(page)) {
+			if (is_exec_file_page(page, vm_flags)) {
+				nr_rotated += hpage_nr_pages(page);
 				list_add(&page->lru, &l_active);
 				continue;
 			}
