@@ -1861,6 +1861,11 @@ const struct file_operations proc_pagemap_operations = {
  * those come from zygote, so swapping them out would penalise every application
  * at once instead of the one we were asked about.
  *
+ * Both halves answer to the same budget, and both answer to it as they go: an
+ * aged page is work finished the moment it is aged, an isolated one is work
+ * finished once the shrinker has been through it, and either can be the page
+ * that completes the request.  Nothing here walks further than it was asked to.
+ *
  * The walk only ever clears young bits, so it needs no per entry TLB
  * invalidation; a single flush_tlb_mm() once the walk is over is enough.  The
  * actual unmapping, and the invalidation that needs, happens later inside
@@ -1872,11 +1877,16 @@ const struct file_operations proc_pagemap_operations = {
  * @type: Which mappings the caller asked us to act upon.
  * @nr_to_reclaim: Stop once this many pages have been reclaimed.  Zero means
  *	walk the whole address space.
+ * @anon_ok: Whether anonymous pages have anywhere to go in this pass at all.
+ *	There has to be free swap to put them in, and the address space has to
+ *	have some of them; both are facts about the pass rather than about any
+ *	one mapping, so they are settled once when it starts.
  * @stat: Running tally, handed back to the caller when the walk ends.
  */
 struct taglmk_reclaim_walk {
 	enum taglmk_reclaim_type	type;
 	unsigned long			nr_to_reclaim;
+	bool				anon_ok;
 	struct taglmk_reclaim_stat	stat;
 };
 
@@ -1884,6 +1894,19 @@ struct taglmk_reclaim_walk {
 enum taglmk_pmd_result {
 	TAGLMK_PMD_HANDLED,	/* this pmd needs no further attention */
 	TAGLMK_PMD_WALK_PTES,	/* carry on at the pte level */
+};
+
+/*
+ * What a pass is willing to do with one page it is allowed to touch.  This is
+ * the whole of the difference between the two halves of the reclaimer, and both
+ * the pmd and the pte level ask for it in the same words, so neither can drift
+ * from the other.  The answer also tells the pte loop which of the two tallies
+ * has just moved, which is what lets a cold pass notice that it is done.
+ */
+enum taglmk_page_action {
+	TAGLMK_PAGE_LEAVE,	/* not the kind of page this pass is for */
+	TAGLMK_PAGE_DEACTIVATE,	/* cold: age it, never drop it */
+	TAGLMK_PAGE_ISOLATE,	/* anon: queue it for the shrinker */
 };
 
 static bool taglmk_budget_met(const struct taglmk_reclaim_walk *ctl)
@@ -1900,6 +1923,17 @@ static bool taglmk_budget_met(const struct taglmk_reclaim_walk *ctl)
 	 */
 	return ctl->stat.nr_reclaimed + ctl->stat.nr_deactivated >=
 	       ctl->nr_to_reclaim;
+}
+
+static enum taglmk_page_action
+taglmk_pick_action(const struct taglmk_reclaim_walk *ctl, struct page *page)
+{
+	if (page_is_file_cache(page))
+		return ctl->type == TAGLMK_RECLAIM_ANON ?
+		       TAGLMK_PAGE_LEAVE : TAGLMK_PAGE_DEACTIVATE;
+
+	return ctl->type == TAGLMK_RECLAIM_FILE ?
+	       TAGLMK_PAGE_LEAVE : TAGLMK_PAGE_ISOLATE;
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -1960,26 +1994,31 @@ static enum taglmk_pmd_result taglmk_handle_pmd(struct taglmk_reclaim_walk *ctl,
 		return err ? TAGLMK_PMD_HANDLED : TAGLMK_PMD_WALK_PTES;
 	}
 
-	if (page_is_file_cache(page)) {
-		if (ctl->type == TAGLMK_RECLAIM_ANON)
-			goto unlock;
-
+	switch (taglmk_pick_action(ctl, page)) {
+	case TAGLMK_PAGE_DEACTIVATE:
+		/*
+		 * All or nothing.  A huge page has one young bit and one place
+		 * on the LRU, so a pass with less budget left than this still
+		 * ages the whole of it; splitting it to age a part would cost
+		 * far more than the overshoot, and the walk stops directly
+		 * afterwards either way.
+		 */
 		pmdp_test_and_clear_young(vma, addr, pmd);
 		deactivate_page(page);
 		ctl->stat.nr_scanned += HPAGE_PMD_NR;
 		ctl->stat.nr_deactivated += HPAGE_PMD_NR;
-		goto unlock;
+		break;
+	case TAGLMK_PAGE_ISOLATE:
+		if (isolate_lru_page(page))
+			break;
+
+		ctl->stat.nr_scanned += HPAGE_PMD_NR;
+		list_add(&page->lru, isolated);
+		*nr_isolated += HPAGE_PMD_NR;
+		break;
+	case TAGLMK_PAGE_LEAVE:
+		break;
 	}
-
-	if (ctl->type == TAGLMK_RECLAIM_FILE)
-		goto unlock;
-
-	if (isolate_lru_page(page))
-		goto unlock;
-
-	ctl->stat.nr_scanned += HPAGE_PMD_NR;
-	list_add(&page->lru, isolated);
-	*nr_isolated += HPAGE_PMD_NR;
 unlock:
 	spin_unlock(ptl);
 	return TAGLMK_PMD_HANDLED;
@@ -2005,39 +2044,41 @@ static enum taglmk_pmd_result taglmk_handle_pmd(struct taglmk_reclaim_walk *ctl,
  * @page: Candidate page, already known to be mapped exclusively.
  * @isolated: List collecting anonymous pages for the shrink pass.
  *
- * Return: number of pages added to @isolated.
+ * Return: what was done to @page.  %TAGLMK_PAGE_LEAVE covers both a page this
+ * pass has no interest in and one it wanted but could not take off the LRU.
  */
-static unsigned int taglmk_handle_page(struct taglmk_reclaim_walk *ctl,
-				       struct vm_area_struct *vma,
-				       unsigned long addr, pte_t *pte,
-				       struct page *page,
-				       struct list_head *isolated)
+static enum taglmk_page_action
+taglmk_handle_page(struct taglmk_reclaim_walk *ctl, struct vm_area_struct *vma,
+		   unsigned long addr, pte_t *pte, struct page *page,
+		   struct list_head *isolated)
 {
-	if (page_is_file_cache(page)) {
-		if (ctl->type == TAGLMK_RECLAIM_ANON)
-			return 0;
+	enum taglmk_page_action action = taglmk_pick_action(ctl, page);
 
+	switch (action) {
+	case TAGLMK_PAGE_DEACTIVATE:
 		ptep_test_and_clear_young(vma, addr, pte);
 		deactivate_page(page);
 		ctl->stat.nr_scanned++;
 		ctl->stat.nr_deactivated++;
-		return 0;
+		break;
+	case TAGLMK_PAGE_ISOLATE:
+		/*
+		 * Leave the young bit alone here.  shrink_page_list() consults
+		 * it and will rotate a page that is genuinely still hot instead
+		 * of paying to compress it, which is exactly the behaviour we
+		 * want.
+		 */
+		if (isolate_lru_page(page))
+			return TAGLMK_PAGE_LEAVE;
+
+		ctl->stat.nr_scanned++;
+		list_add(&page->lru, isolated);
+		break;
+	case TAGLMK_PAGE_LEAVE:
+		break;
 	}
 
-	if (ctl->type == TAGLMK_RECLAIM_FILE)
-		return 0;
-
-	/*
-	 * Leave the young bit alone here.  shrink_page_list() consults it and
-	 * will rotate a page that is genuinely still hot instead of paying to
-	 * compress it, which is exactly the behaviour we want.
-	 */
-	if (isolate_lru_page(page))
-		return 0;
-
-	ctl->stat.nr_scanned++;
-	list_add(&page->lru, isolated);
-	return 1;
+	return action;
 }
 
 static int taglmk_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long end,
@@ -2046,6 +2087,7 @@ static int taglmk_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long end,
 	struct taglmk_reclaim_walk *ctl = walk->private;
 	struct vm_area_struct *vma = walk->vma;
 	struct mm_struct *mm = vma->vm_mm;
+	enum taglmk_page_action action;
 	unsigned int nr_isolated = 0;
 	pte_t *orig_pte, *pte;
 	spinlock_t *ptl;
@@ -2121,9 +2163,30 @@ static int taglmk_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long end,
 		if (page_mapcount(page) > 1)
 			continue;
 
-		nr_isolated += taglmk_handle_page(ctl, vma, addr, pte, page,
-						  &isolated);
-		if (nr_isolated < SWAP_CLUSTER_MAX)
+		action = taglmk_handle_page(ctl, vma, addr, pte, page,
+					    &isolated);
+		if (action == TAGLMK_PAGE_LEAVE)
+			continue;
+
+		if (action == TAGLMK_PAGE_DEACTIVATE) {
+			/*
+			 * An aged page is work finished the moment it is aged:
+			 * nothing was queued, the tally already counts it, and
+			 * so this is the only place at which a cold pass can
+			 * see that it has done what it was asked for.  Without
+			 * it the budget would be consulted once per pmd, and a
+			 * request for a handful of pages would age every page
+			 * the pmd maps - five hundred and twelve of them at a
+			 * four kilobyte page size.
+			 */
+			if (taglmk_budget_met(ctl))
+				break;
+
+			continue;
+		}
+
+		/* An isolated page counts only once the shrinker has had it. */
+		if (++nr_isolated < SWAP_CLUSTER_MAX)
 			continue;
 
 		/*
@@ -2183,14 +2246,19 @@ static bool taglmk_skip_vma(const struct taglmk_reclaim_walk *ctl,
 		 * With nowhere to put them, anonymous pages can be scanned but
 		 * never reclaimed.  Do not pay for the walk.
 		 */
-		if (get_nr_swap_pages() <= 0 ||
-		    get_mm_counter(vma->vm_mm, MM_ANONPAGES) == 0)
-			return true;
-	} else if (ctl->type == TAGLMK_RECLAIM_ANON) {
-		return true;
+		return !ctl->anon_ok;
 	}
 
-	return false;
+	/*
+	 * A private writable file mapping does hold anonymous pages - every
+	 * page the task wrote to was copied on write, and MM_ANONPAGES
+	 * counts it - but they sit among the file pages of the same mapping,
+	 * and mappings are walked in address order, so a bounded anon pass
+	 * turned loose here would spend its budget on whichever such mapping
+	 * happens to lie lowest rather than on the heap the budget was formed
+	 * from.  An "all" pass still reaches them.
+	 */
+	return ctl->type == TAGLMK_RECLAIM_ANON;
 }
 
 /**
@@ -2215,6 +2283,16 @@ static int taglmk_reclaim(struct mm_struct *mm,
 	 */
 	if (!mmap_read_trylock(mm))
 		return -EBUSY;
+
+	/*
+	 * Settle now, once, what every anonymous mapping would otherwise ask
+	 * again: is there swap left, and does this address space have anything
+	 * to put in it.  Free swap can of course run out midway through, but
+	 * this was only ever a shortcut to save a walk; shrink_page_list() is
+	 * the thing that has to cope with it, and does.
+	 */
+	ctl->anon_ok = get_nr_swap_pages() > 0 &&
+		       get_mm_counter(mm, MM_ANONPAGES) > 0;
 
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		if (taglmk_skip_vma(ctl, vma))
