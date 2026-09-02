@@ -158,6 +158,23 @@ int bench_read_u64(const char *path, uint64_t *out);
 bool bench_path_exists(const char *path);
 
 /*
+ * The kernel log, opened so that a refusal can be explained.  A sysfs store
+ * hands userspace one errno and writes its reasoning to the log, so an EINVAL
+ * from disksize says only that something in the compressor path failed and the
+ * log says which backend and why.  bench_kmsg_open() positions the reader at
+ * the present, bench_kmsg_drain() discards whatever has arrived since, and
+ * bench_kmsg_dump() prints it.  Every one of them is a no-op when the log could
+ * not be opened, so callers need no condition of their own, and neither the
+ * drain nor the dump disturbs errno, so either can sit next to the call whose
+ * errno is being reported.  What failed is already named by the error a dump
+ * follows, so the dump itself only has to say whose voice it is printing.
+ */
+void bench_kmsg_open(void);
+void bench_kmsg_close(void);
+void bench_kmsg_drain(void);
+void bench_kmsg_dump(void);
+
+/*
  * Strict conversions.  Both reject trailing rubbish, empty input and overflow.
  */
 bool bench_parse_u64(const char *s, uint64_t *out);

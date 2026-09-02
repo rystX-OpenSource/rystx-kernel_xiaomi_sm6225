@@ -224,9 +224,18 @@ static int bench_zram_set(const struct bench_zram *z, const char *attr,
 
 	bench_zram_attr(z, attr, path, sizeof(path));
 
+	/*
+	 * Drain first, so that anything the log holds afterwards belongs to
+	 * this store and not to the one before it.  A store that refuses a
+	 * value has already written down why by the time it returns, and the
+	 * errno userspace gets does not carry that reasoning.
+	 */
+	bench_kmsg_drain();
+
 	if (bench_write_file(path, value)) {
 		bench_err("zram%d: %s = '%s' refused: %s", z->id, attr, value,
 			  strerror(errno));
+		bench_kmsg_dump();
 		return -1;
 	}
 
@@ -246,11 +255,14 @@ static int bench_zram_set_busy(const char *path, const char *value,
 	unsigned int try;
 
 	for (try = 0; try < BENCH_ZRAM_BUSY_TRIES; try++) {
+		bench_kmsg_drain();
+
 		if (!bench_write_file(path, value))
 			return 0;
 
 		if (errno != EBUSY) {
 			bench_err("%s: %s", what, strerror(errno));
+			bench_kmsg_dump();
 			return -1;
 		}
 
@@ -259,6 +271,7 @@ static int bench_zram_set_busy(const char *path, const char *value,
 
 	bench_err("%s: still busy after %ums", what,
 		  BENCH_ZRAM_BUSY_TRIES * BENCH_ZRAM_BUSY_MS);
+	bench_kmsg_dump();
 
 	return -1;
 }
@@ -316,13 +329,19 @@ static int bench_zram_hot_add(void)
 	char buf[32];
 	uint64_t id;
 
+	bench_kmsg_drain();
+
 	if (bench_read_file(BENCH_ZRAM_CONTROL "/hot_add", buf, sizeof(buf))) {
-		bench_err("cannot add a zram device: %s", strerror(errno));
-		if (errno == EACCES || errno == EPERM)
+		/* Held, because everything below reports on it in turn. */
+		int err = errno;
+
+		bench_err("cannot add a zram device: %s", strerror(err));
+		if (err == EACCES || err == EPERM)
 			bench_err("the zram suite has to run as root");
-		else if (errno == ENOENT)
+		else if (err == ENOENT)
 			bench_err("this kernel has no zram, or it is a "
 				  "module that is not loaded");
+		bench_kmsg_dump();
 		return -1;
 	}
 
@@ -777,10 +796,12 @@ static int bench_zram_configure(struct bench_zram *z, unsigned int level)
 
 	if (z->have_sysctl) {
 		snprintf(val, sizeof(val), "%u", level);
+		bench_kmsg_drain();
 		if (bench_write_file(BENCH_ZRAM_IR_SYSCTL, val)) {
 			bench_err("cannot set %s to %u: %s",
 				  BENCH_ZRAM_IR_SYSCTL, level,
 				  strerror(errno));
+			bench_kmsg_dump();
 			return -1;
 		}
 		bench_info("%s = %u", BENCH_ZRAM_IR_SYSCTL, level);
@@ -970,10 +991,14 @@ static int bench_zram_sweep(struct bench_zram *z, const char *args,
 
 	bench_zram_attr(z, "recompress", path, sizeof(path));
 
+	/* Before the clock starts: draining is not part of what is measured. */
+	bench_kmsg_drain();
+
 	start = bench_now_ns();
 	if (bench_write_file(path, args)) {
 		bench_err("zram%d: recompress '%s' refused: %s", z->id, args,
 			  strerror(errno));
+		bench_kmsg_dump();
 		return -1;
 	}
 	*ns = bench_now_ns() - start;
@@ -1412,6 +1437,8 @@ static void bench_zram_teardown(struct bench_zram *z)
 	free(z->io);
 	z->ring = NULL;
 	z->io = NULL;
+
+	bench_kmsg_close();
 }
 
 /* ------------------------------------------------------------------- driver */
@@ -1465,6 +1492,13 @@ int bench_zram_suite(struct bench_report *rep, const struct bench_opts *o)
 	if (!installed)
 		bench_warn("cannot install signal handlers; an interrupt "
 			   "will leave the device behind");
+
+	/*
+	 * From here to the teardown every refusal can be explained, which
+	 * starts with the very first one: hot_add is a sysfs store like the
+	 * rest and fails for reasons it only writes to the log.
+	 */
+	bench_kmsg_open();
 
 	if (bench_zram_acquire(&z, o))
 		goto out;

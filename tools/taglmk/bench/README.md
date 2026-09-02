@@ -231,6 +231,16 @@ not do:
 - **`SIGINT` and `SIGTERM` set a flag** checked between requests; teardown is
   always on the main path. `SIGKILL` is the one signal that leaks a scratch
   device, which is why the device name is printed as soon as it exists.
+- **It quotes the kernel when a write is refused.** A sysfs store hands
+  userspace one errno and writes its actual reasoning to the kernel log, so an
+  `EINVAL` from `disksize` says only that something in the compressor path
+  failed, and the log says which backend and why. The suite reads `/dev/kmsg`
+  from the moment it starts, discards whatever arrived before each store, and
+  prints the tail when that store fails — unfiltered, because the cause of a
+  refusal often goes by a different name than the driver reporting it: a failed
+  allocation inside a compressor's setup arrives as `EINVAL` at the write and as
+  a page allocation warning in the log. Without root, or without `/dev/kmsg`, it
+  says so once and reports errnos alone.
 
 ## Saved file format
 

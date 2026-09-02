@@ -187,6 +187,171 @@ bool bench_path_exists(const char *path)
 	return access(path, F_OK) == 0;
 }
 
+/* ------------------------------------------------------------- kernel log */
+
+/*
+ * One record per read is the /dev/kmsg contract, so the buffer has to hold the
+ * largest of them whole: a short one truncates the record rather than handing
+ * back the rest of it next time.
+ *
+ * Both loops below are bounded, because both read a device that another writer
+ * feeds.  A drain that stops early leaves a few stale records for the next dump
+ * to print, which costs a line; an unbounded loop over a log that is being
+ * written faster than it is read costs the run.
+ */
+#define BENCH_KMSG_RECORD	8192
+#define BENCH_KMSG_SHOW		32u
+#define BENCH_KMSG_DRAIN	4096u
+#define BENCH_KMSG_RETRIES	64u
+
+static int bench_kmsg_fd = -1;
+
+void bench_kmsg_open(void)
+{
+	int fd;
+
+	if (bench_kmsg_fd >= 0)
+		return;
+
+	fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) {
+		bench_info("no kernel log (%s): a refusal will be reported "
+			   "with its errno and nothing else", strerror(errno));
+		return;
+	}
+
+	/*
+	 * An open starts at the oldest record the ring still holds, which is
+	 * most of the boot.  Seek past the end so that everything read from
+	 * here on was printed afterwards and belongs to what we did.
+	 */
+	if (lseek(fd, 0, SEEK_END) == (off_t)-1) {
+		bench_info("cannot seek the kernel log (%s)", strerror(errno));
+		close(fd);
+		return;
+	}
+
+	bench_kmsg_fd = fd;
+}
+
+void bench_kmsg_close(void)
+{
+	if (bench_kmsg_fd < 0)
+		return;
+
+	close(bench_kmsg_fd);
+	bench_kmsg_fd = -1;
+}
+
+/*
+ * The next record, or a refusal meaning there is none to be had.  EAGAIN is the
+ * ordinary end of the queue.  EPIPE says the ring wrapped past where we were
+ * sitting, which is not a failure to report: the kernel has already moved us to
+ * the oldest record it still holds, so the answer is to carry on from there.
+ * The retry count guards against spinning and nothing else - a wrap costs one.
+ */
+static int bench_kmsg_next(char *buf, size_t len)
+{
+	unsigned int retry;
+	ssize_t got;
+
+	for (retry = 0; retry < BENCH_KMSG_RETRIES; retry++) {
+		got = read(bench_kmsg_fd, buf, len - 1);
+		if (got >= 0) {
+			buf[got] = '\0';
+			return 0;
+		}
+
+		if (errno != EPIPE && errno != EINTR)
+			return -1;
+	}
+
+	return -1;
+}
+
+/*
+ * A record reads "prio,seq,usec,flag[,key=value];message", with any
+ * continuation lines following the message, so the text wanted is between the
+ * first semicolon and the first newline.  Anything not shaped like that is
+ * passed over rather than guessed at.
+ */
+static char *bench_kmsg_body(char *rec)
+{
+	char *body = strchr(rec, ';');
+	char *end;
+
+	if (!body)
+		return NULL;
+
+	body++;
+	end = strchr(body, '\n');
+	if (end)
+		*end = '\0';
+
+	return *body ? body : NULL;
+}
+
+void bench_kmsg_drain(void)
+{
+	char rec[BENCH_KMSG_RECORD];
+	unsigned int nr;
+	int err = errno;
+
+	if (bench_kmsg_fd < 0)
+		return;
+
+	for (nr = 0; nr < BENCH_KMSG_DRAIN; nr++)
+		if (bench_kmsg_next(rec, sizeof(rec)))
+			break;
+
+	/*
+	 * Draining ends on EAGAIN, and the caller is about to attempt the very
+	 * thing whose errno it will report.  Hand back what it had.
+	 */
+	errno = err;
+}
+
+/*
+ * Everything since the last drain, unfiltered.  Filtering on the driver name
+ * would be the obvious thing and it would hide the answer: an allocation that
+ * fails inside a compressor's setup reaches the sysfs write as EINVAL and the
+ * log as a page allocation warning, and the two share nothing but the moment
+ * they happened.  One unrelated line costs a line; one filtered out cause costs
+ * the diagnosis.
+ */
+void bench_kmsg_dump(void)
+{
+	char rec[BENCH_KMSG_RECORD];
+	unsigned int shown = 0;
+	unsigned int nr;
+	int err = errno;
+
+	if (bench_kmsg_fd < 0)
+		return;
+
+	for (nr = 0; nr < BENCH_KMSG_SHOW; nr++) {
+		char *body;
+
+		if (bench_kmsg_next(rec, sizeof(rec)))
+			break;
+
+		body = bench_kmsg_body(rec);
+		if (!body)
+			continue;
+
+		if (!shown++)
+			fprintf(stderr, "the kernel said:\n");
+
+		fprintf(stderr, "  %s\n", body);
+	}
+
+	if (nr == BENCH_KMSG_SHOW)
+		fprintf(stderr, "  (stopped after %u records; dmesg has the "
+			"rest)\n", BENCH_KMSG_SHOW);
+
+	errno = err;
+}
+
 bool bench_parse_u64(const char *s, uint64_t *out)
 {
 	unsigned long long v;
