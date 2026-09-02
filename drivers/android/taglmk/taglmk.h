@@ -337,6 +337,26 @@ void taglmk_sort_by_anon(void);
 ssize_t taglmk_pin_show(char *buf);
 int taglmk_pin_store(const char *buf, size_t len);
 
+/**
+ * struct taglmk_window - what one reduction pass over a sample window yields
+ * @sum: Sum of the samples.
+ * @absdiff: Sum of |x[i] - x[i-1]| across the n - 1 steps.
+ * @weighted: Sum of i * x[i].  This is the one cross term a least squares slope
+ *	against the sample index needs that @sum does not already give; the two
+ *	index sums it also needs are closed forms in n, so the data only has to
+ *	be walked once.
+ *
+ * Raw sums rather than the means and slopes built from them: the accelerated
+ * kernel produces these with softirqs off, where a division does not belong,
+ * and the three quotients the predictor wants of them do not share a
+ * denominator.
+ */
+struct taglmk_window {
+	u64	sum;
+	u64	absdiff;
+	u64	weighted;
+};
+
 /* predict.c */
 void taglmk_predict_sample(void);
 u8 taglmk_predict_burstiness(void);
@@ -369,8 +389,8 @@ void taglmk_sysfs_exit(void);
  */
 #ifdef CONFIG_ANDROID_TAGLMK_ARM64_NEON
 bool taglmk_neon_ok(void);
-void taglmk_neon_window_stats(const u32 *x, unsigned int n, u32 *out_mean,
-			      u32 *out_absdiff);
+void taglmk_neon_window_sums(const u32 *x, unsigned int n,
+			     struct taglmk_window *w);
 void taglmk_neon_regress(const u32 *x, const u32 *y, unsigned int n,
 			 u64 *out_sx, u64 *out_sy, u64 *out_sxx, u64 *out_sxy);
 void taglmk_neon_share(const u32 *anon, u32 *out, unsigned int n, u32 scale);
@@ -380,8 +400,8 @@ static inline bool taglmk_neon_ok(void)
 	return false;
 }
 
-static inline void taglmk_neon_window_stats(const u32 *x, unsigned int n,
-					    u32 *out_mean, u32 *out_absdiff)
+static inline void taglmk_neon_window_sums(const u32 *x, unsigned int n,
+					   struct taglmk_window *w)
 {
 }
 

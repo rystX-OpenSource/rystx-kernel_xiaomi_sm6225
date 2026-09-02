@@ -48,9 +48,9 @@
  */
 #include <asm/neon-intrinsics.h>
 
+#include <linux/build_bug.h>
 #include <linux/compiler.h>
 #include <linux/kernel.h>
-#include <linux/math64.h>
 #include <linux/types.h>
 
 #include <asm/neon.h>
@@ -118,6 +118,19 @@ static inline uint64x2_t taglmk_step_acc(uint64x2_t acc, const u32 *x)
 	return vpadalq_u32(acc, vabdq_u32(vld1q_u32(x), vld1q_u32(x - 1)));
 }
 
+/*
+ * The sample index in lane order, so a weighted sum can multiply by it without
+ * building the ramp on the stack.  Const and static, which is what makes it
+ * safe to load inside the NEON region: .rodata that is already resident cannot
+ * fault, and the Context rule above forbids anything that can.
+ */
+static const u32 taglmk_lane_index[TAGLMK_LANES_WIDE] = {
+	0, 1, 2, 3, 4, 5, 6, 7,
+};
+
+static_assert(TAGLMK_LANES_WIDE == 8,
+	      "the lane index ramp above is written out, not generated");
+
 /**
  * taglmk_neon_ok - may the accelerated kernels be used from here, right now?
  *
@@ -133,36 +146,64 @@ bool taglmk_neon_ok(void)
 }
 
 /*
- * Sum of @x, and sum of |x[i] - x[i-1]| across it.  Raw sums: the caller
- * divides, outside the NEON region.
+ * Sum of @x, sum of |x[i] - x[i-1]| across it, and sum of i * x[i].  Raw sums:
+ * the caller divides, outside the NEON region.
  *
- * Both reductions run two accumulators over eight lanes a step and fold them
- * together once at the end.  On a full sixteen element window that is two
+ * Every reduction here runs two accumulators over eight lanes a step and folds
+ * them together once at the end.  On a full sixteen element window that is two
  * iterations of two independent chains rather than four of one, and the fold
  * costs a single add.
+ *
+ * The weighted sum is the one that needs the sample index in every lane, which
+ * is what @vidx0 and @vidx1 carry.  They start as the two halves of the lane
+ * ramp and advance by a whole wide step per wide iteration, so @vidx0 arrives
+ * at the narrow loop already holding {i, i + 1, i + 2, i + 3} and no index has
+ * to be rebuilt when the step changes.
  */
 static noinline void __taglmk_window_sums(const u32 *x, unsigned int n,
-					  u64 *out_sum, u64 *out_absdiff)
+					  struct taglmk_window *w)
 {
+	const uint32x4_t vstep_wide = vdupq_n_u32(TAGLMK_LANES_WIDE);
+	const uint32x4_t vstep_narrow = vdupq_n_u32(TAGLMK_LANES);
+	uint32x4_t vidx0 = vld1q_u32(taglmk_lane_index);
+	uint32x4_t vidx1 = vld1q_u32(taglmk_lane_index + TAGLMK_LANES);
 	uint64x2_t vsum0 = vdupq_n_u64(0);
 	uint64x2_t vsum1 = vdupq_n_u64(0);
+	uint64x2_t vwgt0 = vdupq_n_u64(0);
+	uint64x2_t vwgt1 = vdupq_n_u64(0);
 	uint64x2_t vdiff0 = vdupq_n_u64(0);
 	uint64x2_t vdiff1 = vdupq_n_u64(0);
 	u64 sum;
+	u64 weighted;
 	u64 absdiff;
 	unsigned int i;
 
 	for (i = 0; i + TAGLMK_LANES_WIDE <= n; i += TAGLMK_LANES_WIDE) {
-		vsum0 = vpadalq_u32(vsum0, vld1q_u32(x + i));
-		vsum1 = vpadalq_u32(vsum1, vld1q_u32(x + i + TAGLMK_LANES));
+		uint32x4_t v0 = vld1q_u32(x + i);
+		uint32x4_t v1 = vld1q_u32(x + i + TAGLMK_LANES);
+
+		vsum0 = vpadalq_u32(vsum0, v0);
+		vsum1 = vpadalq_u32(vsum1, v1);
+		vwgt0 = taglmk_mla_widen(vwgt0, vidx0, v0);
+		vwgt1 = taglmk_mla_widen(vwgt1, vidx1, v1);
+		vidx0 = vaddq_u32(vidx0, vstep_wide);
+		vidx1 = vaddq_u32(vidx1, vstep_wide);
 	}
 
-	for (; i + TAGLMK_LANES <= n; i += TAGLMK_LANES)
-		vsum0 = vpadalq_u32(vsum0, vld1q_u32(x + i));
+	for (; i + TAGLMK_LANES <= n; i += TAGLMK_LANES) {
+		uint32x4_t v = vld1q_u32(x + i);
+
+		vsum0 = vpadalq_u32(vsum0, v);
+		vwgt0 = taglmk_mla_widen(vwgt0, vidx0, v);
+		vidx0 = vaddq_u32(vidx0, vstep_narrow);
+	}
 
 	sum = taglmk_reduce_u64(vaddq_u64(vsum0, vsum1));
-	for (; i < n; i++)
+	weighted = taglmk_reduce_u64(vaddq_u64(vwgt0, vwgt1));
+	for (; i < n; i++) {
 		sum += x[i];
+		weighted += (u64)i * x[i];
+	}
 
 	/*
 	 * Steps start at one, so the body works on the overlapping pair
@@ -183,36 +224,37 @@ static noinline void __taglmk_window_sums(const u32 *x, unsigned int n,
 		absdiff += x[i] > x[i - 1] ? x[i] - x[i - 1]
 					   : x[i - 1] - x[i];
 
-	*out_sum = sum;
-	*out_absdiff = absdiff;
+	w->sum = sum;
+	w->absdiff = absdiff;
+	w->weighted = weighted;
 }
 
 /**
- * taglmk_neon_window_stats - mean and mean absolute step of a sample window
+ * taglmk_neon_window_sums - the three sums that describe a sample window
  * @x: Samples, oldest first.
  * @n: How many.
- * @out_mean: Arithmetic mean of @x, or zero for an empty window.
- * @out_absdiff: Mean of |x[i] - x[i-1]| over the @n - 1 steps, or zero if
- *	there are no steps yet.
+ * @w: Filled in with the sums; all three are zero for an empty window.
+ *
+ * Sums only, because the three quotients the predictor forms from them do not
+ * share a denominator and none of the divisions belongs inside the NEON region.
+ *
+ * The widest sum is the weighted one, which can reach n squared times U32_MAX,
+ * so @n has to stay under 2^16 for it to be safe from wrapping.  The window
+ * this is called with is sixteen samples long.
  */
-void taglmk_neon_window_stats(const u32 *x, unsigned int n, u32 *out_mean,
-			      u32 *out_absdiff)
+void taglmk_neon_window_sums(const u32 *x, unsigned int n,
+			     struct taglmk_window *w)
 {
-	u64 sum;
-	u64 absdiff;
-
 	if (!n) {
-		*out_mean = 0;
-		*out_absdiff = 0;
+		w->sum = 0;
+		w->absdiff = 0;
+		w->weighted = 0;
 		return;
 	}
 
 	kernel_neon_begin();
-	__taglmk_window_sums(x, n, &sum, &absdiff);
+	__taglmk_window_sums(x, n, w);
 	kernel_neon_end();
-
-	*out_mean = (u32)div_u64(sum, n);
-	*out_absdiff = n > 1 ? (u32)div_u64(absdiff, n - 1) : 0;
 }
 
 /*
