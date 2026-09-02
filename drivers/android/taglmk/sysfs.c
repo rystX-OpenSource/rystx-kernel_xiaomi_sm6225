@@ -216,12 +216,12 @@ static ssize_t profile_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute profile_attr = __ATTR_RO(profile);
 
-/* How noisy the predictor thinks the cache load is, Q4.4. */
+/* How noisy the predictor thinks the cache load is, Q4.2. */
 static ssize_t burstiness_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
 	return taglmk_show_fixed(buf, taglmk_predict_burstiness(),
-				 TAGLMK_Q44_SHIFT);
+				 TAGLMK_Q42_SHIFT);
 }
 
 static struct kobj_attribute burstiness_attr = __ATTR_RO(burstiness);

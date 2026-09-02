@@ -10,7 +10,7 @@
  *
  * Two numbers come out of it.
  *
- * Burstiness (Q4.4) is how violently the cache load moves relative to how
+ * Burstiness (Q4.2) is how violently the cache load moves relative to how
  * large it is - the mean absolute step between samples over the mean sample.
  * A steady load sits near zero; a load that halves and doubles between passes
  * approaches and exceeds one.  It is a measure of how much the trend below can
@@ -155,8 +155,8 @@ static u32 taglmk_factor_from(u32 predicted, u8 burst)
 		return TAGLMK_FP_ONE;
 
 	urgency = taglmk_ratio_fp(limit - predicted, limit);
-	margin = TAGLMK_FP_ONE + taglmk_q44_to_fp(burst);
-	gain = taglmk_q44_to_fp(taglmk.profile->burst_gain);
+	margin = TAGLMK_FP_ONE + taglmk_q42_to_fp(burst);
+	gain = taglmk_q42_to_fp(taglmk.profile->burst_gain);
 
 	factor = TAGLMK_FP_ONE +
 		 taglmk_fp_mul(taglmk_fp_mul(urgency, margin), gain);
@@ -202,7 +202,7 @@ void taglmk_predict_sample(void)
 	 * with taglmk_ratio_fp(): converting either operand to intfp32 first
 	 * would saturate it and the answer would always be one.
 	 */
-	burst = taglmk_fp_to_q44(taglmk_ratio_fp(absdiff, mean));
+	burst = taglmk_fp_to_q42(taglmk_ratio_fp(absdiff, mean));
 
 	WRITE_ONCE(taglmk_burst, burst);
 	WRITE_ONCE(taglmk_factor,
@@ -212,7 +212,7 @@ void taglmk_predict_sample(void)
 }
 
 /**
- * taglmk_predict_burstiness - how noisy the cache load has been, Q4.4
+ * taglmk_predict_burstiness - how noisy the cache load has been, Q4.2
  *
  * Reported through sysfs so a device evaluation can see what the predictor
  * thinks it is looking at.
