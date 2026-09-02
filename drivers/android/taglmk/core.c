@@ -80,7 +80,7 @@ static const struct taglmk_profile taglmk_profiles[] = {
 		.scan_limit		= 64,
 		.kill_batch		= 2,
 		.kill_batch_crit	= 4,
-		.burst_gain		= TAGLMK_Q44_ONE * 3 / 2,
+		.burst_gain		= TAGLMK_Q42_ONE * 3 / 2,
 		.swap_target_pct	= 92,
 	},
 	{
@@ -92,7 +92,7 @@ static const struct taglmk_profile taglmk_profiles[] = {
 		.scan_limit		= 96,
 		.kill_batch		= 2,
 		.kill_batch_crit	= 3,
-		.burst_gain		= TAGLMK_Q44_ONE * 5 / 4,
+		.burst_gain		= TAGLMK_Q42_ONE * 5 / 4,
 		.swap_target_pct	= 90,
 	},
 	{
@@ -104,7 +104,7 @@ static const struct taglmk_profile taglmk_profiles[] = {
 		.scan_limit		= 128,
 		.kill_batch		= 1,
 		.kill_batch_crit	= 3,
-		.burst_gain		= TAGLMK_Q44_ONE,
+		.burst_gain		= TAGLMK_Q42_ONE,
 		.swap_target_pct	= 88,
 	},
 	{
@@ -117,7 +117,7 @@ static const struct taglmk_profile taglmk_profiles[] = {
 		.scan_limit		= 128,
 		.kill_batch		= 1,
 		.kill_batch_crit	= 2,
-		.burst_gain		= TAGLMK_Q44_ONE * 3 / 4,
+		.burst_gain		= TAGLMK_Q42_ONE * 3 / 4,
 		.swap_target_pct	= 85,
 	},
 };

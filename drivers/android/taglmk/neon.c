@@ -5,8 +5,15 @@
  * The predictor and the ZRAM balancer both boil a small array of per-pass or
  * per-task page counts down to a handful of sums.  The arrays are short, so
  * this is not about throughput; it is about how long a pass spends working
- * while the machine is already short of memory.  Four lanes at a time turns a
- * sixteen element reduction into four instructions.
+ * while the machine is already short of memory.
+ *
+ * Two things buy that back on such short arrays.  A reduction is turned into
+ * two independent accumulators over eight lanes a step, because a sixteen
+ * element window is otherwise only four accumulate instructions long and every
+ * one of them waits on the last - latency, not width, is what a short reduction
+ * spends its time on.  And every widening multiply is issued in place, low half
+ * and high half, so a loop body that needs two products issues four multiply
+ * longs back to back with no lane extracted and nothing to fold in between.
  *
  * Three rules hold everywhere in this file.
  *
@@ -52,11 +59,13 @@
 #include "taglmk.h"
 
 /*
- * Lanes per vector.  Every loop below is written as "while a whole vector still
- * fits", so the bound is the length itself and no rounding is needed; what is
- * left over is finished by a scalar tail.
+ * Lanes per vector, and the wide step the reductions run at.  Every loop below
+ * is written as "while a whole step still fits", so the bound is the length
+ * itself and no rounding is needed; a step that no longer fits falls through to
+ * the narrower one, and whatever is left is finished by a scalar tail.
  */
 #define TAGLMK_LANES		4
+#define TAGLMK_LANES_WIDE	(2 * TAGLMK_LANES)
 
 /* The two lanes of a 64 bit accumulator, added up. */
 static inline u64 taglmk_reduce_u64(uint64x2_t v)
@@ -68,14 +77,45 @@ static inline u64 taglmk_reduce_u64(uint64x2_t v)
  * acc += a * b, widening every lane to 64 bits first.  Two u32 factors need 64
  * bits to hold their product, so this is the only form that cannot overflow
  * however large the page counts get.
+ *
+ * UMULL reads the low half of both operands and UMULL2 the high half of both in
+ * place, so neither vector has to be pulled apart first.  The two products are
+ * then folded into each other before they reach @acc, which leaves one step of
+ * the carried dependency per call rather than two; unsigned 64 bit addition is
+ * associative modulo 2^64, so regrouping it costs no exactness.
  */
 static inline uint64x2_t taglmk_mla_widen(uint64x2_t acc, uint32x4_t a,
 					  uint32x4_t b)
 {
-	acc = vaddq_u64(acc, vmull_u32(vget_low_u32(a), vget_low_u32(b)));
-	acc = vaddq_u64(acc, vmull_u32(vget_high_u32(a), vget_high_u32(b)));
+	uint64x2_t lo = vmull_u32(vget_low_u32(a), vget_low_u32(b));
+	uint64x2_t hi = vmull_high_u32(a, b);
 
-	return acc;
+	return vaddq_u64(acc, vaddq_u64(lo, hi));
+}
+
+/*
+ * (v * scale) >> TAGLMK_FP_SHIFT across four lanes, each product formed in 64
+ * bits.  SHRN shifts and narrows to 32 bits in one instruction, which is the
+ * same truncation the scalar twin's cast performs and one instruction fewer
+ * than shifting and moving down separately.
+ */
+static inline uint32x4_t taglmk_scale_q(uint32x4_t v, u32 scale)
+{
+	uint64x2_t lo = vmull_n_u32(vget_low_u32(v), scale);
+	uint64x2_t hi = vmull_high_n_u32(v, scale);
+
+	return vcombine_u32(vshrn_n_u64(lo, TAGLMK_FP_SHIFT),
+			    vshrn_n_u64(hi, TAGLMK_FP_SHIFT));
+}
+
+/*
+ * acc += |x[i] - x[i-1]| across four lanes.  UABD is one instruction where the
+ * scalar twin needs a branch per element, and UADALP widens and accumulates
+ * without a separate add - which is the whole reason this kernel exists.
+ */
+static inline uint64x2_t taglmk_step_acc(uint64x2_t acc, const u32 *x)
+{
+	return vpadalq_u32(acc, vabdq_u32(vld1q_u32(x), vld1q_u32(x - 1)));
 }
 
 /**
@@ -96,37 +136,49 @@ bool taglmk_neon_ok(void)
  * Sum of @x, and sum of |x[i] - x[i-1]| across it.  Raw sums: the caller
  * divides, outside the NEON region.
  *
- * The unsigned absolute difference is a single instruction per vector, which is
- * the whole reason this kernel exists - the scalar twin needs a branch per
- * element to get the same answer.
+ * Both reductions run two accumulators over eight lanes a step and fold them
+ * together once at the end.  On a full sixteen element window that is two
+ * iterations of two independent chains rather than four of one, and the fold
+ * costs a single add.
  */
 static noinline void __taglmk_window_sums(const u32 *x, unsigned int n,
 					  u64 *out_sum, u64 *out_absdiff)
 {
-	uint64x2_t vsum = vdupq_n_u64(0);
-	uint64x2_t vdiff = vdupq_n_u64(0);
+	uint64x2_t vsum0 = vdupq_n_u64(0);
+	uint64x2_t vsum1 = vdupq_n_u64(0);
+	uint64x2_t vdiff0 = vdupq_n_u64(0);
+	uint64x2_t vdiff1 = vdupq_n_u64(0);
 	u64 sum;
 	u64 absdiff;
 	unsigned int i;
 
-	for (i = 0; i + TAGLMK_LANES <= n; i += TAGLMK_LANES)
-		vsum = vaddq_u64(vsum, vpaddlq_u32(vld1q_u32(x + i)));
+	for (i = 0; i + TAGLMK_LANES_WIDE <= n; i += TAGLMK_LANES_WIDE) {
+		vsum0 = vpadalq_u32(vsum0, vld1q_u32(x + i));
+		vsum1 = vpadalq_u32(vsum1, vld1q_u32(x + i + TAGLMK_LANES));
+	}
 
-	sum = taglmk_reduce_u64(vsum);
+	for (; i + TAGLMK_LANES <= n; i += TAGLMK_LANES)
+		vsum0 = vpadalq_u32(vsum0, vld1q_u32(x + i));
+
+	sum = taglmk_reduce_u64(vaddq_u64(vsum0, vsum1));
 	for (; i < n; i++)
 		sum += x[i];
 
 	/*
 	 * Steps start at one, so the body works on the overlapping pair
-	 * (x + i, x + i - 1); with n a multiple of four there is always a
-	 * three element tail, which is cheaper than realigning would be.
+	 * (x + i, x + i - 1).  On a full window that leaves eight steps to the
+	 * wide loop, four to the narrow one and three to the tail, which is
+	 * cheaper than realigning the loads would be.
 	 */
-	for (i = 1; i + TAGLMK_LANES <= n; i += TAGLMK_LANES)
-		vdiff = vaddq_u64(vdiff,
-				  vpaddlq_u32(vabdq_u32(vld1q_u32(x + i),
-							vld1q_u32(x + i - 1))));
+	for (i = 1; i + TAGLMK_LANES_WIDE <= n; i += TAGLMK_LANES_WIDE) {
+		vdiff0 = taglmk_step_acc(vdiff0, x + i);
+		vdiff1 = taglmk_step_acc(vdiff1, x + i + TAGLMK_LANES);
+	}
 
-	absdiff = taglmk_reduce_u64(vdiff);
+	for (; i + TAGLMK_LANES <= n; i += TAGLMK_LANES)
+		vdiff0 = taglmk_step_acc(vdiff0, x + i);
+
+	absdiff = taglmk_reduce_u64(vaddq_u64(vdiff0, vdiff1));
 	for (; i < n; i++)
 		absdiff += x[i] > x[i - 1] ? x[i] - x[i - 1]
 					   : x[i - 1] - x[i];
@@ -163,7 +215,14 @@ void taglmk_neon_window_stats(const u32 *x, unsigned int n, u32 *out_mean,
 	*out_absdiff = n > 1 ? (u32)div_u64(absdiff, n - 1) : 0;
 }
 
-/* The four sums, accumulated four elements at a time. */
+/*
+ * The four sums, accumulated four elements at a time.  Four elements rather
+ * than eight is deliberate here: each iteration already issues four multiply
+ * longs - the low and high halves of x*x and of x*y - which is as many as the
+ * two product accumulators can absorb before one of them has to wait, and the
+ * two plain sums ride along in a pairwise accumulate that needs no add of its
+ * own.
+ */
 static noinline void __taglmk_regress_sums(const u32 *x, const u32 *y,
 					   unsigned int n, u64 *out_sx,
 					   u64 *out_sy, u64 *out_sxx,
@@ -183,8 +242,8 @@ static noinline void __taglmk_regress_sums(const u32 *x, const u32 *y,
 		uint32x4_t vx = vld1q_u32(x + i);
 		uint32x4_t vy = vld1q_u32(y + i);
 
-		vsx = vaddq_u64(vsx, vpaddlq_u32(vx));
-		vsy = vaddq_u64(vsy, vpaddlq_u32(vy));
+		vsx = vpadalq_u32(vsx, vx);
+		vsy = vpadalq_u32(vsy, vy);
 		vsxx = taglmk_mla_widen(vsxx, vx, vx);
 		vsxy = taglmk_mla_widen(vsxy, vx, vy);
 	}
@@ -237,22 +296,26 @@ void taglmk_neon_regress(const u32 *x, const u32 *y, unsigned int n,
 	kernel_neon_end();
 }
 
-/* out[i] = (anon[i] * scale) >> 16, through a 64 bit product. */
+/*
+ * out[i] = (anon[i] * scale) >> 16, through a 64 bit product.  This is a map
+ * with no carried dependency at all, so the wide step is pure issue width: two
+ * vectors a time is four multiply longs and four narrowing shifts back to back.
+ */
 static noinline void __taglmk_share(const u32 *anon, u32 *out, unsigned int n,
 				    u32 scale)
 {
 	unsigned int i;
 
-	for (i = 0; i + TAGLMK_LANES <= n; i += TAGLMK_LANES) {
-		uint32x4_t v = vld1q_u32(anon + i);
-		uint64x2_t lo = vmull_n_u32(vget_low_u32(v), scale);
-		uint64x2_t hi = vmull_n_u32(vget_high_u32(v), scale);
+	for (i = 0; i + TAGLMK_LANES_WIDE <= n; i += TAGLMK_LANES_WIDE) {
+		uint32x4_t v0 = vld1q_u32(anon + i);
+		uint32x4_t v1 = vld1q_u32(anon + i + TAGLMK_LANES);
 
-		lo = vshrq_n_u64(lo, TAGLMK_FP_SHIFT);
-		hi = vshrq_n_u64(hi, TAGLMK_FP_SHIFT);
-
-		vst1q_u32(out + i, vcombine_u32(vmovn_u64(lo), vmovn_u64(hi)));
+		vst1q_u32(out + i, taglmk_scale_q(v0, scale));
+		vst1q_u32(out + i + TAGLMK_LANES, taglmk_scale_q(v1, scale));
 	}
+
+	for (; i + TAGLMK_LANES <= n; i += TAGLMK_LANES)
+		vst1q_u32(out + i, taglmk_scale_q(vld1q_u32(anon + i), scale));
 
 	for (; i < n; i++)
 		out[i] = (u32)(((u64)anon[i] * scale) >> TAGLMK_FP_SHIFT);

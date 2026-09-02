@@ -12,6 +12,8 @@
 #define _DRIVERS_ANDROID_TAGLMK_H
 
 #include <linux/atomic.h>
+#include <linux/build_bug.h>
+#include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/mmzone.h>
 #include <linux/sched.h>
@@ -29,10 +31,16 @@
  *
  * Two unsigned formats are used.
  *
- * Q4.4    One byte: four integer and four fractional bits, so [0, 15.9375] in
- *         steps of 1/16.  This is the burstiness factor.  It is small, read
- *         often, and staying in a single byte means a whole window of them
- *         fits in one NEON register.
+ * Q4.2    Four integer and two fractional bits, so [0, 15.75] in steps of a
+ *         quarter, carried in a byte with the top two bits spare.  This is the
+ *         burstiness and the per-profile gain: the two advisory terms, the ones
+ *         that get published through sysfs and multiplied by each other and by
+ *         nothing else.  A quarter is as fine as either needs to be.  Both feed
+ *         a factor that is clamped to [1, 4] long before anything acts on it,
+ *         and both are read by eye during a device evaluation far more often
+ *         than they are read by code.  The narrower format also keeps a margin
+ *         (one plus a burstiness, so Q5.2) times a gain inside sixteen bits,
+ *         which is a lane rather than a widening multiply.
  *
  * intfp32 Thirty-two bits: sixteen integer and sixteen fractional bits.  Used
  *         wherever range matters - the scalar factor, the predictor output and
@@ -40,12 +48,21 @@
  *         in.  Every operation below is integer only, so a NEON build and a
  *         fallback build agree bit for bit on the result.
  */
-#define TAGLMK_Q44_SHIFT	4
-#define TAGLMK_Q44_ONE		(1U << TAGLMK_Q44_SHIFT)
-#define TAGLMK_Q44_MAX		0xffU
+#define TAGLMK_Q42_SHIFT	2
+#define TAGLMK_Q42_ONE		(1U << TAGLMK_Q42_SHIFT)
+#define TAGLMK_Q42_MAX		0x3fU
 
 #define TAGLMK_FP_SHIFT		16
 #define TAGLMK_FP_ONE		(1U << TAGLMK_FP_SHIFT)
+
+/*
+ * The margin the predictor forms is one plus a burstiness and it is multiplied
+ * by a gain, so the widest product two Q4.2 terms can reach is 4221.  Widen the
+ * format and that stops fitting a sixteen bit lane: Q4.4 would put the same
+ * product at 69105.  Fail the build here rather than discover it downstream.
+ */
+static_assert((TAGLMK_Q42_ONE + TAGLMK_Q42_MAX) * TAGLMK_Q42_MAX <= U16_MAX,
+	      "a Q4.2 margin times a Q4.2 gain must fit sixteen bits");
 
 /* Plain integer to intfp32, saturating. */
 static inline u32 taglmk_fp(unsigned long v)
@@ -62,18 +79,18 @@ static inline unsigned long taglmk_fp_int(u32 fp)
 	return fp >> TAGLMK_FP_SHIFT;
 }
 
-/* Q4.4 to intfp32.  Exact: both are binary fractions. */
-static inline u32 taglmk_q44_to_fp(u8 q44)
+/* Q4.2 to intfp32.  Exact: both are binary fractions. */
+static inline u32 taglmk_q42_to_fp(u8 q42)
 {
-	return (u32)q44 << (TAGLMK_FP_SHIFT - TAGLMK_Q44_SHIFT);
+	return (u32)q42 << (TAGLMK_FP_SHIFT - TAGLMK_Q42_SHIFT);
 }
 
-/* intfp32 to Q4.4, truncating and saturating at 15.9375. */
-static inline u8 taglmk_fp_to_q44(u32 fp)
+/* intfp32 to Q4.2, truncating and saturating at 15.75. */
+static inline u8 taglmk_fp_to_q42(u32 fp)
 {
-	fp >>= TAGLMK_FP_SHIFT - TAGLMK_Q44_SHIFT;
+	fp >>= TAGLMK_FP_SHIFT - TAGLMK_Q42_SHIFT;
 
-	return fp > TAGLMK_Q44_MAX ? TAGLMK_Q44_MAX : (u8)fp;
+	return fp > TAGLMK_Q42_MAX ? TAGLMK_Q42_MAX : (u8)fp;
 }
 
 /* a * b in intfp32, saturating. */
@@ -149,7 +166,7 @@ enum taglmk_level {
  * @scan_limit: How many tasks a single scan will look at.
  * @kill_batch: Victims per pass at %TAGLMK_LEVEL_LOW.
  * @kill_batch_crit: Victims per pass at %TAGLMK_LEVEL_CRITICAL.
- * @burst_gain: Q4.4 compensation applied to the predictor on this class of
+ * @burst_gain: Q4.2 compensation applied to the predictor on this class of
  *	device.  Less RAM means less room to be wrong, so it reacts sooner.
  * @swap_target_pct: Swap utilisation the ZRAM balancer aims to hold.
  */
