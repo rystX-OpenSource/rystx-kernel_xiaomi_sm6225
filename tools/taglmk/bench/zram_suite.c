@@ -50,6 +50,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+
 #include "bench.h"
 
 #define BENCH_ZRAM_SUITE	"zram"
@@ -75,6 +78,15 @@
 #define BENCH_ZRAM_HEADROOM_KB	(256u * 1024u)
 #define BENCH_ZRAM_BUSY_TRIES	20u
 #define BENCH_ZRAM_BUSY_MS	50u
+
+/*
+ * How long to wait for the block device node to turn up.  Nothing in the
+ * kernel creates it: hot_add publishes a uevent and returns, and on Android it
+ * is ueventd that answers, so the node appears some milliseconds after the
+ * write completes.  Checking once, immediately, is a race that the tool loses.
+ */
+#define BENCH_ZRAM_NODE_TRIES	40u
+#define BENCH_ZRAM_NODE_MS	50u
 #define BENCH_ZRAM_MEMINFO_MAX	8192
 
 /**
@@ -96,6 +108,7 @@ struct bench_comp {
  * @added: We created it, so we are the ones who take it away.
  * @sys: /sys/block/zramN.
  * @node: The block device node.
+ * @node_made: We had to create @node ourselves, so we unlink it again.
  * @fd: Open handle, or -1.  Closed before every reset, because a device with an
  *	opener refuses to reset.
  * @probed: Whether the device was ever opened, so that @direct means anything.
@@ -121,6 +134,7 @@ struct bench_zram {
 	bool			added;
 	char			sys[BENCH_ZRAM_PATH];
 	char			node[BENCH_ZRAM_PATH];
+	bool			node_made;
 	int			fd;
 	bool			probed;
 	bool			direct;
@@ -385,21 +399,150 @@ static bool bench_zram_in_swap(int id)
 	return hit;
 }
 
-static int bench_zram_find_node(struct bench_zram *z)
-{
-	static const char * const shapes[] = {
-		"/dev/block/zram%d",
-		"/dev/zram%d",
-	};
+/* Where the node lives, in the order the platforms put it. */
+static const char * const bench_zram_node_shapes[] = {
+	"/dev/block/zram%d",
+	"/dev/zram%d",
+};
 
-	for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
-		snprintf(z->node, sizeof(z->node), shapes[i], z->id);
+/* One sweep of the candidates; sets @node and returns true on a hit. */
+static bool bench_zram_node_here(struct bench_zram *z)
+{
+	size_t n = sizeof(bench_zram_node_shapes) /
+		   sizeof(bench_zram_node_shapes[0]);
+
+	for (size_t i = 0; i < n; i++) {
+		snprintf(z->node, sizeof(z->node),
+			 bench_zram_node_shapes[i], z->id);
 		if (bench_path_exists(z->node))
-			return 0;
+			return true;
 	}
 
-	bench_err("zram%d exists but has no device node under /dev", z->id);
 	z->node[0] = '\0';
+
+	return false;
+}
+
+/*
+ * Say how the lookup failed.  A node that is absent and a directory the process
+ * may not search look identical through access(F_OK), and the difference
+ * decides whether the answer is to wait, to create, or to fix the caller's
+ * privileges - so print the errno for each candidate rather than a verdict.
+ */
+static void bench_zram_node_complain(const struct bench_zram *z)
+{
+	size_t n = sizeof(bench_zram_node_shapes) /
+		   sizeof(bench_zram_node_shapes[0]);
+	char path[BENCH_ZRAM_PATH];
+
+	for (size_t i = 0; i < n; i++) {
+		snprintf(path, sizeof(path), bench_zram_node_shapes[i], z->id);
+
+		if (access(path, F_OK))
+			bench_err("zram%d: %s: %s", z->id, path,
+				  strerror(errno));
+	}
+}
+
+/*
+ * Last resort: make the node.  /sys/block/zramN/dev holds the numbers, so this
+ * needs no guessing, and it is recorded so that teardown takes it away again.
+ * Reached on a system with no ueventd at all - a recovery ramdisk, a chroot -
+ * where waiting would only ever time out.
+ */
+static int bench_zram_make_node(struct bench_zram *z)
+{
+	char path[BENCH_ZRAM_PATH];
+	char buf[64];
+	unsigned long maj, min;
+	char *end;
+
+	bench_zram_attr(z, "dev", path, sizeof(path));
+	if (bench_read_file(path, buf, sizeof(buf))) {
+		bench_err("zram%d: cannot read %s: %s", z->id, path,
+			  strerror(errno));
+		return -1;
+	}
+
+	errno = 0;
+	maj = strtoul(buf, &end, 10);
+	if (errno || *end != ':')
+		goto malformed;
+
+	errno = 0;
+	min = strtoul(end + 1, &end, 10);
+	if (errno || (*end && *end != '\n'))
+		goto malformed;
+
+	/* The kernel's own split: twelve bits of major, twenty of minor. */
+	if (maj > 0xfff || min > 0xfffff)
+		goto malformed;
+
+	snprintf(z->node, sizeof(z->node), bench_zram_node_shapes[1], z->id);
+
+	if (mknod(z->node, S_IFBLK | 0600, makedev((unsigned int)maj,
+						   (unsigned int)min))) {
+		bench_err("zram%d: cannot create %s: %s", z->id, z->node,
+			  strerror(errno));
+		z->node[0] = '\0';
+		return -1;
+	}
+
+	z->node_made = true;
+	bench_info("created %s for %lu:%lu", z->node, maj, min);
+
+	return 0;
+
+malformed:
+	bench_err("zram%d: %s answered '%s', which is not major:minor", z->id,
+		  path, buf);
+
+	return -1;
+}
+
+/*
+ * Find the node, waiting for it if it is merely late.  hot_add returns as soon
+ * as the disk is registered, so on Android the node is still on its way: the
+ * uevent has to reach ueventd and be acted on.  The wait is what makes a
+ * freshly added device usable at all.
+ */
+static int bench_zram_find_node(struct bench_zram *z)
+{
+	unsigned int try;
+
+	for (try = 0; try < BENCH_ZRAM_NODE_TRIES; try++) {
+		if (bench_zram_node_here(z)) {
+			if (try)
+				bench_info("%s appeared after %ums", z->node,
+					   try * BENCH_ZRAM_NODE_MS);
+			return 0;
+		}
+
+		/*
+		 * A device we adopted is not being created right now, so there
+		 * is nothing to wait for; only a hot_add has a node in flight.
+		 */
+		if (!z->added)
+			break;
+
+		if (bench_zram_stop) {
+			bench_err("interrupted while waiting for the zram%d "
+				  "device node", z->id);
+			return -1;
+		}
+
+		bench_msleep(BENCH_ZRAM_NODE_MS);
+	}
+
+	if (z->added) {
+		bench_zram_node_complain(z);
+		bench_warn("zram%d has no device node after %ums; creating it",
+			   z->id, BENCH_ZRAM_NODE_TRIES * BENCH_ZRAM_NODE_MS);
+		return bench_zram_make_node(z);
+	}
+
+	bench_zram_node_complain(z);
+	bench_err("zram%d exists but has no usable device node", z->id);
 
 	return -1;
 }
@@ -1250,6 +1393,20 @@ static void bench_zram_teardown(struct bench_zram *z)
 
 	if (z->added)
 		bench_zram_hot_remove(z->id);
+
+	/*
+	 * Only ever our own: z->node_made is set nowhere else, so an unlink
+	 * here cannot reach a node that ueventd or the platform put there.
+	 */
+	if (z->node_made) {
+		if (unlink(z->node))
+			bench_warn("cannot remove %s: %s", z->node,
+				   strerror(errno));
+		else
+			bench_info("removed %s", z->node);
+
+		z->node_made = false;
+	}
 
 	free(z->ring);
 	free(z->io);

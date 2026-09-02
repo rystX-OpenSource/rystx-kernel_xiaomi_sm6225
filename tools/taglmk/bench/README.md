@@ -213,6 +213,12 @@ not do:
 
 - **By default it owns its device.** It reads `zram-control/hot_add` for a fresh
   one and removes it in teardown.
+- **It waits for the device node.** `hot_add` returns as soon as the disk is
+  registered; on Android it is `ueventd` that creates `/dev/block/zramN`, some
+  milliseconds later. The suite polls for up to two seconds, and only if the
+  node never arrives — no `ueventd` at all, as in a recovery ramdisk — does it
+  `mknod` one itself from `/sys/block/zramN/dev`, unlinking it again in
+  teardown. It never unlinks a node it did not create.
 - **It refuses a device in use as swap**, and `--force` does not override that.
   No amount of forcing makes resetting live swap safe. An unreadable
   `/proc/swaps` is treated as "in use".

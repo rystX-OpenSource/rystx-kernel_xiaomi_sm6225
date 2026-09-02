@@ -1,0 +1,3 @@
+# Build output: the binary is built with the NDK, never committed.
+build/
+taglmk_bench
