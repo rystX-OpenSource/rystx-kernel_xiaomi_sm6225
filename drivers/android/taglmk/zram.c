@@ -49,6 +49,7 @@
 #include <linux/gfp.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/string.h>
 #include <linux/swap.h>
@@ -106,6 +107,18 @@
  * of anonymous memory went out shallow and a second algorithm has room to work.
  */
 #define TAGLMK_IR_HUGE_FLOOR	256
+
+/*
+ * Doublings of the interval that a run of unproductive sweeps may accumulate.
+ * This is the one rung on the ladder that can be entirely pointless on a given
+ * device - swap full of data no other algorithm can improve on - and nothing
+ * else depends on its result, so without a back-off it would spend a walk every
+ * interval for the rest of the boot to keep learning the same thing.  Five
+ * doublings turn the default two seconds into roughly a minute, which is still
+ * often enough to notice the workload changing; any sweep that saves a byte
+ * resets it to the interval the profile asked for.
+ */
+#define TAGLMK_IR_BACKOFF_MAX	5
 
 /* Oldest pass at [0], newest at [taglmk_nr_obs - 1]. */
 static u32 taglmk_asked[TAGLMK_ZRAM_WINDOW];
@@ -500,6 +513,11 @@ u8 taglmk_ir_depth(const struct taglmk_victim *v, u64 cputime_avg)
  * the rung off, which is how to find out whether it earns its keep on a
  * particular device.
  *
+ * The interval is a floor rather than a period.  A run of sweeps that give
+ * nothing back widens it and the first one that gives something back puts it
+ * straight, so a device whose swap holds nothing a second algorithm can improve
+ * stops paying to be asked, without the rung having to be turned off by hand.
+ *
  * Locking: the scratch page is written only by zram, under that device's slot
  * lock, and only one sweep can be in flight because sweeps run from the pass
  * work item and the pass is serialised by taglmk.lock.  The interval is private
@@ -516,6 +534,12 @@ static struct page *taglmk_ir_page;
 
 /* Earliest jiffies at which another sweep may run; zero until the first. */
 static unsigned long taglmk_ir_next;
+
+/*
+ * Doublings currently applied to that interval, because the sweeps before this
+ * one gave nothing back.  Private to the pass work item, like the deadline.
+ */
+static unsigned int taglmk_ir_backoff;
 
 /**
  * taglmk_zram_init - claim what the recompression rung needs, once
@@ -566,11 +590,19 @@ void taglmk_ir_sweep(void)
 {
 	struct zram_ir_stats before, after;
 	struct zram_ir_req req = {};
-	unsigned long saved;
+	bool judged = false;
+	u64 saved = 0;
 	long ret;
 
-	if (!taglmk_ir_page || !taglmk.ir_interval_ms || !taglmk.ir_max_pages)
+	if (!taglmk_ir_page || !taglmk.ir_interval_ms || !taglmk.ir_max_pages) {
+		/*
+		 * A rung that is switched off cannot work off a deferral it
+		 * accumulated while it was running, so forget it here: turning
+		 * the rung back on should behave as though it were new.
+		 */
+		taglmk_ir_backoff = 0;
 		return;
+	}
 
 	/*
 	 * The interval is checked before anything else is read, so that a rung
@@ -599,52 +631,100 @@ void taglmk_ir_sweep(void)
 	/*
 	 * No threshold of our own.  zram replaces an object only when the retry
 	 * lands in a strictly smaller size class, which is already exactly the
-	 * question "did this save memory", and it hands out its largest objects
-	 * first - so the page budget spends itself where there is most to win
-	 * without this file having to invent a watermark to describe that.
+	 * question "did this save memory", and it works through the slots it
+	 * tracked largest first - so the page budget spends itself where there
+	 * is most to win without this file having to invent a watermark to
+	 * describe that.
 	 */
 	req.threshold = 0;
 
 	/*
-	 * Huge pages are the largest win available, a whole page each, and the
-	 * clearest evidence of a store that gave up early: the depth hint this
-	 * file sets makes a store escalate rather than give up, so the pages
-	 * TAGLMK swapped out are the least likely to be among them and a large
-	 * count is mostly kswapd's and direct reclaim's, which carry no hint.
-	 * Aim at them alone while there are enough to be worth the narrower scan.
+	 * A huge page is the largest single win there is, a whole page, so a
+	 * sweep aimed at nothing else would be the most valuable one there is -
+	 * but only while huge still means "stored shallow".
+	 *
+	 * Once the store path walks every algorithm by default, which is what
+	 * ir_depth having caught up with nr_comps says, a page that still came
+	 * out whole was refused by all of them.  zram marks it incompressible
+	 * and its own scan skips it from then on, so narrowing a sweep to huge
+	 * pages there selects nothing whatsoever and pays a walk of the device
+	 * to discover it - which is precisely the reading of huge_pages that
+	 * struct zram_ir_stats tells callers to check for themselves.
+	 *
+	 * The sweep is still worth running unnarrowed at any depth.  A store
+	 * stops at the first algorithm that gets the object under a page, so
+	 * everything that did compress went out at the shallowest depth that
+	 * worked, with every priority above it untried; that, rather than the
+	 * residue, is where the page budget belongs.
 	 */
-	if (before.huge_pages >= TAGLMK_IR_HUGE_FLOOR)
+	if (before.ir_depth < before.nr_comps &&
+	    before.huge_pages >= TAGLMK_IR_HUGE_FLOOR)
 		req.mode = ZRAM_IR_HUGE;
 
 	ret = zram_ir_recompress(&req);
 
 	/*
-	 * Re-arm on every outcome, including the failures.  A sweep that found
-	 * nothing, or that backed off because something else was already
-	 * post-processing the device, has still spent a walk; retrying it on the
-	 * next pass would spend another for the same reasons.
+	 * @judged records whether this sweep said anything about the rung at
+	 * all, which is not the same question as whether it saved anything.  A
+	 * sweep that reached no slot said the clearest thing there is - there
+	 * was nothing here to improve - whereas one that could not be measured,
+	 * or that never got as far as trying because the device was already
+	 * being post-processed, said nothing and must not count against the
+	 * rung.
 	 */
-	taglmk_ir_next = jiffies + msecs_to_jiffies(taglmk.ir_interval_ms);
+	if (!ret) {
+		judged = true;
+	} else if (ret > 0) {
+		atomic_long_add(ret, &taglmk.nr_ir_slots);
 
-	if (ret <= 0)
-		return;
+		/*
+		 * Compressed size is the only honest measure of what a sweep
+		 * achieved, because zram counts a slot it looked at and decided
+		 * to leave alone as a success.  Swap traffic moves the same
+		 * counter, though, so credit no more than this sweep could
+		 * possibly have caused: one page for each slot it actually
+		 * reached, which is what @ret counts and never more than the
+		 * budget it was allowed.  Under-reporting the rung is much less
+		 * misleading than letting a burst of swap-in make it look
+		 * like a miracle.
+		 */
+		if (!zram_ir_get_stats(&after)) {
+			u64 delta = 0;
 
-	atomic_long_add(ret, &taglmk.nr_ir_slots);
+			judged = true;
+			if (after.compr_bytes < before.compr_bytes)
+				delta = before.compr_bytes - after.compr_bytes;
 
-	if (zram_ir_get_stats(&after) || after.compr_bytes >= before.compr_bytes)
-		return;
+			saved = min_t(u64, delta, (u64)ret << PAGE_SHIFT);
+		}
+	}
 
 	/*
-	 * Compressed size is the only honest measure of what a sweep achieved,
-	 * because zram counts a slot it looked at and decided to leave alone as
-	 * a success.  Swap traffic moves the same counter, though, so credit no
-	 * more than the sweep could possibly have caused: one page per slot it
-	 * was allowed to touch.  Under-reporting the rung is much less
-	 * misleading than letting a burst of swap-in make it look like a
-	 * miracle, and the cap is also what keeps the figure inside a long.
+	 * A sweep that saved something proves the rung pays on this device and
+	 * clears the deferral; one that was judged and saved nothing adds to
+	 * it.
+	 *
+	 * The cap on the credit keeps the running total inside a long on trees
+	 * where that is narrower than the u64 the bytes were counted in.
 	 */
-	saved = min_t(u64, before.compr_bytes - after.compr_bytes,
-		      (u64)req.max_pages << PAGE_SHIFT);
+	if (saved) {
+		taglmk_ir_backoff = 0;
+		atomic_long_add(min_t(u64, saved, LONG_MAX),
+				&taglmk.nr_ir_saved);
+	} else if (judged && taglmk_ir_backoff < TAGLMK_IR_BACKOFF_MAX) {
+		taglmk_ir_backoff++;
+	}
 
-	atomic_long_add(saved, &taglmk.nr_ir_saved);
+	/*
+	 * Re-arm on every outcome, including the failures.  A sweep that found
+	 * nothing, or that backed off because something else was already
+	 * post-processing the device, has still spent a walk; retrying it on
+	 * the next pass would spend another for the same reasons.  Both the
+	 * doublings and the interval sysfs will accept are bounded, so the
+	 * deadline stays well inside the half of the jiffies range that
+	 * time_before() needs in order to keep answering correctly.
+	 */
+	taglmk_ir_next = jiffies +
+			 (msecs_to_jiffies(taglmk.ir_interval_ms) <<
+			  taglmk_ir_backoff);
 }
