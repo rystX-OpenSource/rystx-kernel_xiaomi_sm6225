@@ -197,10 +197,13 @@ EXPORT_SYMBOL(blk_pre_runtime_resume);
  * @err: return value of the device's runtime_resume function
  *
  * Description:
- *    Update the queue's runtime status according to the return value of the
- *    device's runtime_resume function. If it is successfully resumed, process
- *    the requests that are queued into the device's queue when it is resuming
- *    and then mark last busy and initiate autosuspend for it.
+ *    Restart the queue of the runtime resumed device. For blk-mq queues
+ *    this happens regardless of whether the device's runtime-resume
+ *    succeeded: the driver or the error handler will need to communicate
+ *    with the device to resolve a failed resume, and keeping the queue
+ *    suspended with the pm_only counter held can deadlock the rescan and
+ *    error handling paths. Legacy request queues keep the historical
+ *    behavior of staying suspended on a failed resume.
  *
  *    This function should be called near the end of the device's
  *    runtime_resume callback.
@@ -212,20 +215,23 @@ void blk_post_runtime_resume(struct request_queue *q, int err)
 	if (!q->dev)
 		return;
 
+	if (err && !q->mq_ops) {
+		spin_lock_irq(q->queue_lock);
+		q->rpm_status = RPM_SUSPENDED;
+		spin_unlock_irq(q->queue_lock);
+		return;
+	}
+
 	spin_lock_irq(q->queue_lock);
 	old_status = q->rpm_status;
-	if (!err) {
-		q->rpm_status = RPM_ACTIVE;
-		if (!q->mq_ops)
-			__blk_run_queue(q);
-		pm_runtime_mark_last_busy(q->dev);
-		pm_request_autosuspend(q->dev);
-	} else {
-		q->rpm_status = RPM_SUSPENDED;
-	}
+	q->rpm_status = RPM_ACTIVE;
+	if (!q->mq_ops)
+		__blk_run_queue(q);
+	pm_runtime_mark_last_busy(q->dev);
+	pm_request_autosuspend(q->dev);
 	spin_unlock_irq(q->queue_lock);
 
-	if (!err && old_status != RPM_ACTIVE)
+	if (old_status != RPM_ACTIVE)
 		blk_pm_clear_pm_only(q);
 }
 EXPORT_SYMBOL(blk_post_runtime_resume);
