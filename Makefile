@@ -710,6 +710,17 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning, address-of-packed-member)
 
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS   += -Os
+else ifeq ($(cc-name),clang)
+KBUILD_CFLAGS   += -O3 -mcpu=cortex-a53 -mtune=cortex-a73
+KBUILD_CFLAGS   += -mllvm -hot-cold-split=true
+KBUILD_CFLAGS   += -mllvm -enable-ml-inliner=release
+KBUILD_CFLAGS   += -mllvm -regalloc-enable-advisor=release
+KBUILD_AFLAGS   += -mcpu=cortex-a53
+
+KBUILD_LDFLAGS  += -mllvm -hot-cold-split=true
+KBUILD_LDFLAGS  += -mllvm -enable-ml-inliner=release
+KBUILD_LDFLAGS  += -mllvm -regalloc-enable-advisor=release
+KBUILD_LDFLAGS  += --lto-O3
 else
 KBUILD_CFLAGS   += -O2
 endif
