@@ -2696,7 +2696,14 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_retries2 = TCP_RETR2;
 	net->ipv4.sysctl_tcp_orphan_retries = 0;
 	net->ipv4.sysctl_tcp_fin_timeout = TCP_FIN_TIMEOUT;
-	net->ipv4.sysctl_tcp_notsent_lowat = UINT_MAX;
+	/*
+	 * Raise notsent_lowat so writers are woken once unsent data
+	 * drops below this threshold, reducing write-side latency
+	 * for high-throughput, low-latency workloads.
+	 * See: https://blog.cloudflare.com/optimizing-tcp-for-high-throughput-and-low-latency/
+	 * (net.ipv4.tcp_notsent_lowat = 131072)
+	 */
+	net->ipv4.sysctl_tcp_notsent_lowat = 131072;
 	net->ipv4.sysctl_tcp_tw_reuse = 2;
 
 	cnt = tcp_hashinfo.ehash_mask + 1;
@@ -2714,7 +2721,14 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_max_reordering = 300;
 	net->ipv4.sysctl_tcp_dsack = 1;
 	net->ipv4.sysctl_tcp_app_win = 31;
-	net->ipv4.sysctl_tcp_adv_win_scale = 1;
+	/*
+	 * Use a negative adv_win_scale: with large MTU/GRO segments,
+	 * the standard positive scale overestimates buffering overhead
+	 * and shrinks the usable receive window unnecessarily.
+	 * See: https://blog.cloudflare.com/optimizing-tcp-for-high-throughput-and-low-latency/
+	 * (net.ipv4.tcp_adv_win_scale = -2)
+	 */
+	net->ipv4.sysctl_tcp_adv_win_scale = -2;
 	net->ipv4.sysctl_tcp_frto = 2;
 	net->ipv4.sysctl_tcp_moderate_rcvbuf = 1;
 	/* This limits the percentage of the congestion window which we
@@ -2755,7 +2769,14 @@ static int __net_init tcp_sk_init(struct net *net)
 	else
 		net->ipv4.tcp_congestion_control = &tcp_reno;
 	
-	net->ipv4.sysctl_tcp_collapse_max_bytes = 0;
+	/*
+	 * Bound the amount of work tcp_collapse_ofo_queue() can do per
+	 * call, preventing long collapse operations from adding latency
+	 * on high-throughput connections.
+	 * See: https://blog.cloudflare.com/optimizing-tcp-for-high-throughput-and-low-latency/
+	 * (net.ipv4.tcp_collapse_max_bytes = 6291456)
+	 */
+	net->ipv4.sysctl_tcp_collapse_max_bytes = 6291456;
 
 	return 0;
 fail:
