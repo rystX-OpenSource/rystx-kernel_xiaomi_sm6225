@@ -1199,7 +1199,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			goto keep_locked;
 
 		/* page_update_gen() tried to promote this page? */
-		if (lru_gen_enabled() && !force_reclaim &&
+		if (lru_gen_enabled() && !ignore_references &&
 		    page_mapped(page) && PageReferenced(page))
 			goto keep_locked;
 
@@ -3667,11 +3667,11 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
 			break;
 
 		/* the caller might be holding the lock for write */
-		if (down_read_trylock(&mm->mmap_sem)) {
+		if (mmap_read_trylock(mm)) {
 			err = walk_page_range(mm, walk->next_addr, ULONG_MAX,
 					      &lru_gen_mm_walk_ops, walk);
 
-			up_read(&mm->mmap_sem);
+			mmap_read_unlock(mm);
 		}
 
 		mem_cgroup_unlock_pages();

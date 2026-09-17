@@ -446,6 +446,7 @@ int pagecache_write_end(struct file *, struct address_space *mapping,
  * @flags: Error bits and flags (AS_*).
  * @wb_err: The most recent error which has occurred.
  * @private_lock: For use by the owner of the address_space.
+ * @invalidate_lock: Protects the page cache against invalidation races.
  * @private_list: For use by the owner of the address_space.
  * @private_data: For use by the owner of the address_space.
  */
@@ -463,6 +464,7 @@ struct address_space {
 	unsigned long		flags;
 	errseq_t		wb_err;
 	spinlock_t		private_lock;
+	struct rw_semaphore	invalidate_lock;
 	struct list_head	private_list;
 	void			*private_data;
 

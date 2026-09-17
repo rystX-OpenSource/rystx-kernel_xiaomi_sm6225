@@ -909,7 +909,7 @@ static void binder_transaction_priority(struct binder_thread *thread,
 		binder_do_set_priority(thread, &desired, false);
 	else
 		binder_set_priority(thread, &desired);
-		trace_android_vh_binder_set_priority(t, task);
+	trace_android_vh_binder_set_priority(t, task);
 }
 
 static struct binder_node *binder_get_node_ilocked(struct binder_proc *proc,
