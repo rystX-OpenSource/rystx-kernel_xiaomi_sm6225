@@ -79,7 +79,8 @@
 /*
  * Ceiling of the burst gauge. A task that has run for this long without
  * being refunded for a sleep is as CPU-bound as the gauge can express. It is
- * four times the CPU-bound edge, so a saturated gauge sits well past it.
+ * the batch level's request twice over, and a little over twice the CPU-bound
+ * edge, so a saturated gauge sits past that edge rather than on it.
  */
 #define MLFQ_GAUGE_MAX_NS		(1ULL << 23)
 
@@ -88,8 +89,9 @@
  * task is interactive, at or above the high threshold it is CPU-bound, and in
  * between it is left in the default queue.
  *
- * The high edge is the batch request size, which is what makes the gauge and
- * the edges commensurable: a task is CPU-bound once it has accumulated a
+ * The high edge is the batch request rounded down to a whole millisecond, 4ms
+ * against the level's 4.194ms, which is what makes the gauge and the edges
+ * commensurable: a task is CPU-bound once it has accumulated very nearly a
  * whole batch-level request of unrefunded running time.
  */
 #define MLFQ_THRESH_LOW_NS		250000ULL
@@ -101,6 +103,48 @@
  * and the period is a power of two because the request size is.
  */
 #define MLFQ_CBS_PERIOD_MULT		2
+
+/*
+ * The relations the constants above have to keep. Every one of them is relied
+ * on somewhere below and none of them survives a careless edit of a number, so
+ * they are checked at build time rather than only described. They are grouped
+ * here rather than each beside its own constant so that they can be read
+ * together, and each one names the code that would break.
+ *
+ * The block sits after MLFQ_CBS_PERIOD_MULT because three of the checks are
+ * about a level's period, and that is the constant the period is named from.
+ */
+#define MLFQ_ASSERT_POW2(v)						\
+	static_assert((v) != 0 && ((v) & ((v) - 1)) == 0,		\
+		      #v " is not a power of two, so "			\
+		      "mlfq_gauge_decay() cannot divide by its period "	\
+		      "with a shift")
+
+static_assert(MLFQ_SLICE_Q1_NS < MLFQ_SLICE_Q2_NS &&
+	      MLFQ_SLICE_Q2_NS < MLFQ_SLICE_Q3_NS,
+	      "the levels are not ordered by request size, which inverts "
+	      "the classifier they exist to drive");
+
+/* The three periods, which are the values the decay shifts by. */
+MLFQ_ASSERT_POW2(MLFQ_SLICE_Q1_NS * MLFQ_CBS_PERIOD_MULT);
+MLFQ_ASSERT_POW2(MLFQ_SLICE_Q2_NS * MLFQ_CBS_PERIOD_MULT);
+MLFQ_ASSERT_POW2(MLFQ_SLICE_Q3_NS * MLFQ_CBS_PERIOD_MULT);
+
+static_assert(MLFQ_THRESH_LOW_NS < MLFQ_THRESH_HIGH_NS,
+	      "the interactive edge is not below the CPU-bound edge, so "
+	      "the band between them is empty and the hysteresis gates cross");
+
+static_assert(MLFQ_THRESH_HIGH_NS < MLFQ_GAUGE_MAX_NS,
+	      "the CPU-bound edge is not below the gauge ceiling, so the "
+	      "gauge can never exceed it and the demotion to Q3 cannot fire");
+
+static_assert(MLFQ_GAUGE_MAX_NS % MLFQ_SLICE_Q1_NS == 0 &&
+	      MLFQ_GAUGE_MAX_NS % MLFQ_SLICE_Q2_NS == 0 &&
+	      MLFQ_GAUGE_MAX_NS % MLFQ_SLICE_Q3_NS == 0,
+	      "the gauge ceiling is not a whole number of the levels' "
+	      "requests, so a refund would leave a residue no sleep clears");
+
+#undef MLFQ_ASSERT_POW2
 
 /*
  * A sleep shorter than this is taken as a task waiting on something
