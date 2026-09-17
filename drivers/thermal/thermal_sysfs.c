@@ -1051,17 +1051,32 @@ static const struct attribute_group cooling_device_stats_attr_group = {
 	.name = "stats"
 };
 
+/*
+ * trans_table is a states x states transition matrix, so the statistics grow
+ * quadratically with the number of states a cooling device exposes.  A
+ * backlight, for instance, reports every brightness level as a state, which
+ * for a 12 bit backlight would need a 64 MiB table: far more than the page
+ * allocator can serve, and since the request is larger than MAX_ORDER it is
+ * also what makes __alloc_pages_nodemask() warn.  Only track statistics while
+ * the table stays small enough to be sensible; cdev->stats simply stays NULL
+ * otherwise, which the update and show paths already handle.
+ */
+#define COOLING_STATS_MAX_STATES	256
+
 static void cooling_device_stats_setup(struct thermal_cooling_device *cdev)
 {
 	const struct attribute_group *stats_attr_group = NULL;
 	struct cooling_dev_stats *stats;
 	unsigned long states;
-	int var;
+	size_t var;
 
 	if (cdev->ops->get_max_state(cdev, &states))
 		goto out;
 
 	states++; /* Total number of states is highest state + 1 */
+
+	if (states > COOLING_STATS_MAX_STATES)
+		goto out;
 
 	var = sizeof(*stats);
 	var += sizeof(*stats->time_in_state) * states;

@@ -818,25 +818,20 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
  */
 static u64 ineligible_vruntime(struct cfs_rq *cfs_rq)
 {
-	struct sched_entity *curr = cfs_rq->curr;
 	long weight = cfs_rq->sum_weight;
 	s64 delta = 0;
 
-	if (curr && !curr->on_rq)
-		curr = NULL;
-
 	/*
 	 * This is called from set_next_task_fair(.first=true) /
-	 * set_protect_slice() so curr had better be set and on_rq.
+	 * set_protect_slice(), i.e. before cfs_rq->curr is set to the entity
+	 * being picked, so @curr can legitimately be NULL (or off the rq) here
+	 * - the first pick on a fresh cfs_rq always is.  @curr is deliberately
+	 * not part of the estimate anyway, since v_j being curr is what makes
+	 * '\Sum_i!=j (v_i - v0)*w_i' equal cfs_rq->sum_w_vruntime and
+	 * 'W - w_j' equal cfs_rq->sum_weight.
 	 */
-	WARN_ON_ONCE(!curr);
-
 	if (weight) {
 		s64 runtime = cfs_rq->sum_w_vruntime;
-
-		/*
-		 * Do not add @curr to obtain the effective '- w_j' terms.
-		 */
 
 		/* sign flips effective floor / ceiling */
 		if (runtime < 0)
