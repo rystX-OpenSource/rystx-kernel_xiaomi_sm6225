@@ -203,5 +203,14 @@
  * order still bounds how long any of them waits.
  *
  * See kernel/sched/mlfq.h.
+ *
+ * The feature only exists when the port is built. Its call sites in the fair
+ * class are compiled either way, so the switch has to be a compile-time zero
+ * rather than an absent name: sched_feat() is a constant here, which is what
+ * lets the compiler drop every one of them.
  */
+#ifdef CONFIG_SCHED_EEVDF_MLFQ
 #define SCHED_FEAT_MLFQ 1
+#else
+#define SCHED_FEAT_MLFQ 0
+#endif

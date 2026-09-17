@@ -105,15 +105,11 @@ struct task_struct init_task
 	.children	= LIST_HEAD_INIT(init_task.children),
 	.sibling	= LIST_HEAD_INIT(init_task.sibling),
 	.group_leader	= &init_task,
+#ifdef CONFIG_SCHED_EEVDF_MLFQ
 	.mlfq		= {
-		.g		= 0,
-		.last_sleep_at	= 0,
-		.queued_at	= 0,
-		.last_boost_at	= 0,
 		.queue		= MLFQ_Q_DEFAULT,
-		.reenq_cnt	= 0,
-		.wake_cnt	= 0,
 	},
+#endif
 	RCU_POINTER_INITIALIZER(real_cred, &init_cred),
 	RCU_POINTER_INITIALIZER(cred, &init_cred),
 	.comm		= INIT_TASK_COMM,

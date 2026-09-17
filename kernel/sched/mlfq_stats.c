@@ -27,7 +27,8 @@
  * not under CONFIG_SCHED_DEBUG, because none of this is debugging output: it
  * is the scheduler reporting what it is doing, which is as useful on a shipped
  * kernel as on a development one. The one thing all of it does depend on is
- * procfs, so that is what the Makefile gates the object on.
+ * procfs, which is why CONFIG_SCHED_EEVDF_MLFQ is the symbol that builds it
+ * and that symbol depends on PROC_FS.
  *
  * Two things are printed differently from the way the browser printed them.
  * Counters are exact rather than abbreviated -- the dashboard wrote 1.2M
