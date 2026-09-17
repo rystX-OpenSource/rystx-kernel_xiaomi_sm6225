@@ -90,6 +90,10 @@ void on_boot_completed(void)
 	ksu_boot_completed = true;
 	pr_info("on_boot_completed!\n");
 	track_throne(true);
+
+#ifdef CONFIG_KSU_HOSTSREDIRECT
+	ksu_hostsredirect_init();
+#endif
 }
 
 static ssize_t (*orig_read)(struct file *, char __user *, size_t, loff_t *);
@@ -476,7 +480,7 @@ static inline void ksu_common_newfstat_ret(unsigned int fd_int, void **statbuf_p
 	
 	struct stat64 k_stat64 = { 0 };
 
-	if (ksu_copy_from_user_retry(&k_stat64, statbuf, sizeof(struct stat64))) {
+	if (copy_from_user_retry(&k_stat64, statbuf, sizeof(struct stat64))) {
 		pr_info("%s: read statbuf 0x%lx failed \n", syscall_name, (uintptr_t)statbuf);
 		goto out;
 	}
@@ -501,7 +505,7 @@ stat_native:
 
 	struct stat k_stat = { 0 };
 
-	if (ksu_copy_from_user_retry(&k_stat, statbuf, sizeof(struct stat))) {
+	if (copy_from_user_retry(&k_stat, statbuf, sizeof(struct stat))) {
 		pr_info("%s: read statbuf 0x%lx failed \n", syscall_name, (uintptr_t)statbuf);
 		goto out;
 	}
@@ -683,10 +687,12 @@ static int vol_detector_exit()
 	return 0;
 }
 
-// we do this so that if theres no ksud to call on_post_fs_data/ksu_is_safe_mode/on_boot_completed
-// there will be no input handler / extra execve branch that stays around
-// 60s is more than enough time from second_stage to decrypt/post_fs_data
-// if theres no ksud that does that, we trigger the closing of hooks ourselves
+/**
+ * we do this so that if theres no ksud to call on_post_fs_data/ksu_is_safe_mode/on_boot_completed
+ * there will be no input handler / extra execve branch that stays around
+ * 60s is more than enough time from second_stage to decrypt/post_fs_data
+ * if theres no ksud that does that, we trigger the closing of hooks ourselves
+ */
 static int ksu_hook_watchdog(void *data)
 {
 	unsigned int i = 0;
