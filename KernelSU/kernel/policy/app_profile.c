@@ -48,13 +48,13 @@ static void setup_groups(struct root_profile *profile, struct cred *cred)
 	put_group_info(group_info);
 }
 
-/*
+/**
  * lets just have kernel do cleanup for us (put_seccomp_filter/seccomp_filter_release)
  * this is how the kernel does it and we dont have to do all this refcounting shit that
- * upstream does due to current->seccomp.filter = NULL;
+ * upstream does due to 'current->seccomp.filter = NULL;' which is unnecessary
  *
- * see: seccomp_assign_mode();
- * - if this has repercussions, then we can just restore all those refcounting shit
+ * see: seccomp_assign_mode, secure_computing
+ * - if this has repercussions, then we just restore all those refcounting shit
  */
 static void disable_seccomp(void)
 {
@@ -141,6 +141,10 @@ static int escape_to_root(bool is_forced)
 	memcpy(&cred->cap_effective, &profile->capabilities.effective, sizeof(cred->cap_effective));
 	memcpy(&cred->cap_permitted, &profile->capabilities.effective, sizeof(cred->cap_permitted));
 	memcpy(&cred->cap_bset, &profile->capabilities.effective, sizeof(cred->cap_bset));
+	if (profile->uid != 0) {
+		memcpy(&cred->cap_inheritable, &profile->capabilities.effective, sizeof(cred->cap_inheritable));
+		memcpy(&cred->cap_ambient, &profile->capabilities.effective, sizeof(cred->cap_ambient));
+	}
 
 	setup_groups(profile, cred);
 	setup_selinux(profile->selinux_domain, cred);
@@ -177,3 +181,5 @@ void escape_to_root_forced(void)
 	// which we likely already have on contexts where this will be used.
 	escape_to_root(true);
 }
+
+void __init ksu_app_profile_init(void) { }
