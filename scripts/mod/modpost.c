@@ -1734,7 +1734,7 @@ static const struct sectioncheck
 }
 
 static const struct sectioncheck *get_section_mismatch(const char *fromsec,
-		const struct elf_info *elf, unsigned int secndx)
+		struct elf_info *elf, unsigned int secndx)
 {
 	int cached;
 

@@ -607,7 +607,7 @@ static void build_initial_tok_table(void)
 
 	/* For every symbol, index every token -> symbol it is present in. */
 	for (i = 0; i < table_cnt; i++)
-		symbol_index_all_tokens(table[i]->sym, table[i]->len, i);
+		symbol_index_all_tokens(table[i].sym, table[i].len, i);
 }
 
 static void *find_token(unsigned char *str, int len, unsigned char *token)
@@ -635,7 +635,7 @@ static void compress_symbols(unsigned char *str, int compressed_chr)
 		sym_idx = arr->sym_indexes[j];
 
 		len = table[sym_idx].len;
-		p1 = table[isym_idx].sym;
+		p1 = table[sym_idx].sym;
 
 		p2 = find_token(p1, len, str);
 		if (!p2) continue;
@@ -660,11 +660,11 @@ static void compress_symbols(unsigned char *str, int compressed_chr)
 
 		} while (p2);
 
-		table[isym_idx].len = len;
+		table[sym_idx].len = len;
 
 		/* increase the counts for this symbol's new tokens */
 		learn_symbol(table[sym_idx].sym, len);
-		symbol_index_new_tokens(table[sym_idx]->sym, len, sym_idx,
+		symbol_index_new_tokens(table[sym_idx].sym, len, sym_idx,
 					compressed_chr);
 	}
 

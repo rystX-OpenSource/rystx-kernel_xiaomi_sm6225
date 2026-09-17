@@ -6,6 +6,7 @@
 #endif
 #include <ctype.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <string.h>
 #include <limits.h>
 #include "modpost.h"
@@ -271,8 +272,7 @@ static int parse_file(const char *fname, struct md4_ctx *md)
 	file = grab_file(fname, &len);
 	if (!file)
 		return 0;
-	if (!strlen(file))
-		goto out_file;
+	/* grab_file() mmaps len bytes, so use len rather than strlen(). */
 	init_stop_chars();
 	buf = NOFAIL(malloc(len)); /* File output buffer. */
 
@@ -318,8 +318,6 @@ static int parse_file(const char *fname, struct md4_ctx *md)
 	release_file(file, len);
 	md4_update(md, buf, (unsigned int)n);
 	free(buf);
-out_file:
-	free(file);
 	return 1;
 }
 
