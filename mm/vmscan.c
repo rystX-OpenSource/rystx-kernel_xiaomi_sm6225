@@ -198,6 +198,8 @@ static u64 sysctl_clean_low_ratio_kb __read_mostly = 0;
 static u64 sysctl_clean_min_ratio_kb __read_mostly = 0;
 static u64 workingset_protection_prev_totalram __read_mostly = 0;
 
+static void prepare_workingset_protection(pg_data_t *pgdat, struct scan_control *sc);
+
 /*
  * From 0 .. 100.  Higher means more swappy.
  */
@@ -2643,7 +2645,7 @@ out:
 	}
 }
 
-int vm_workingset_protection_update_handler(const struct ctl_table *table, int write,
+int vm_workingset_protection_update_handler(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
