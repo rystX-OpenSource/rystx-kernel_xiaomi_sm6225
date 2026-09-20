@@ -334,25 +334,21 @@ enum {
 #endif
 
 /*
- * The youngest generation number is stored in max_seq for both anon and file
- * types as they are aged on an equal footing. The oldest generation numbers are
- * stored in min_seq[] separately for anon and file types as clean file pages
- * can be evicted regardless of swap constraints.
- *
- * Normally anon and file min_seq are in sync. But if swapping is constrained,
- * e.g., out of swap space, file min_seq is allowed to advance and leave anon
- * min_seq behind.
+ * The youngest generation numbers are stored in max_seq[] for anon and file
+ * types so that they can be aged independently. The oldest generation numbers
+ * are stored in min_seq[] separately for anon and file types so that they can
+ * be incremented independently.
  *
  * The number of pages in each generation is eventually consistent and therefore
  * can be transiently negative when reset_batch_size() is pending.
  */
 struct lru_gen_struct {
-	/* the aging increments the youngest generation number */
-	unsigned long max_seq;
+	/* the aging increments the youngest generation numbers */
+	unsigned long max_seq[ANON_AND_FILE];
 	/* the eviction increments the oldest generation numbers */
 	unsigned long min_seq[ANON_AND_FILE];
 	/* the birth time of each generation in jiffies */
-	unsigned long timestamps[MAX_NR_GENS];
+	unsigned long timestamps[ANON_AND_FILE][MAX_NR_GENS];
 	/* the multi-gen LRU lists, lazily sorted on eviction */
 	struct list_head lists[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 	/* the multi-gen LRU sizes, eventually consistent */
@@ -384,12 +380,12 @@ enum {
 #define NR_BLOOM_FILTERS	2
 
 struct lru_gen_mm_state {
-	/* set to max_seq after each iteration */
-	unsigned long seq;
+	/* set to max_seq[type] after each iteration of the corresponding type */
+	unsigned long seq[ANON_AND_FILE];
 	/* where the current iteration continues after */
-	struct list_head *head;
+	struct list_head *head[ANON_AND_FILE];
 	/* where the last iteration ended before */
-	struct list_head *tail;
+	struct list_head *tail[ANON_AND_FILE];
 	/* Unused - keep for ABI compatiiblity */
 	struct wait_queue_head wait;
 	/* Bloom filters flip after each iteration */
@@ -404,7 +400,9 @@ struct lru_gen_mm_walk {
 	/* the lruvec under reclaim */
 	struct lruvec *lruvec;
 	/* unstable max_seq from lru_gen_struct */
-	unsigned long max_seq;
+	unsigned long max_seq[ANON_AND_FILE];
+	/* which type is being aged, i.e., LRU_GEN_ANON or LRU_GEN_FILE */
+	int aging_type;
 	/* the next address within an mm to scan */
 	unsigned long next_addr;
 	/* to batch promoted pages */

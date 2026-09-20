@@ -78,6 +78,34 @@ kills.
 
 The default value ``0`` means disabled.
 
+``N`` is measured from the birth time of the oldest generation among the
+eviction candidates. Anon and file can hold windows of different depth, so
+the older of the two is used.
+
+Anon and file aging
+-------------------
+Anon and file generations are aged independently. Each type has its own
+``max_seq``/``min_seq`` window, and a type is aged only once it has run out
+of eviction candidates; a page table walk visits only the memory of the type
+being aged, with shmem counted as anon.
+
+``swappiness`` is therefore no longer a global aging clock. It still decides
+which types are eviction candidates at all -- ``0`` excludes anon, leaving
+only clean file pages -- and the existing feedback loop still uses it to
+weigh anon against file when both are candidates. What changed is that one
+type's aging no longer advances the other type's oldest generation. Before,
+whenever swapping was allowed, ``min_seq`` of anon was pulled down to the
+smaller of the two, so file pressure widened the anon window whether or not
+the anon working set needed it, and a single aging pass moved both types at
+the same rate. Now each type's generations retire on their own schedule, and
+reclaim pressure follows whichever type is running out of candidates.
+
+In practice, a low but non-zero ``swappiness`` no longer makes anon age at
+the file type's rate. If the anon working set has enough generations of its
+own to keep anon's eviction supplied, its cold pages retire on anon's
+schedule rather than the file type's, and the converse holds for file pages
+under a high ``swappiness``.
+
 Experimental features
 =====================
 ``/sys/kernel/debug/lru_gen`` accepts commands described in the
