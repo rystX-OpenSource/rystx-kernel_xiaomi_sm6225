@@ -21,6 +21,10 @@
 #include "../workqueue_internal.h"
 #include "../smpboot.h"
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE */
+
 #include "pelt.h"
 
 #define CREATE_TRACE_POINTS
@@ -725,7 +729,11 @@ int tg_nop(struct task_group *tg, void *data)
 
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
+#ifdef CONFIG_SCHED_BORE
+	int prio = effective_prio_bore(p);
+#else /* !CONFIG_SCHED_BORE */
 	int prio = p->static_prio - MAX_RT_PRIO;
+#endif /* CONFIG_SCHED_BORE */
 	struct load_weight lw;
 
 	if (task_has_idle_policy(p)) {
@@ -7305,6 +7313,10 @@ void __init sched_init(void)
 {
 	unsigned long ptr = 0;
 	int i;
+
+#ifdef CONFIG_SCHED_BORE
+	sched_init_bore();
+#endif /* CONFIG_SCHED_BORE */
 
 	wait_bit_init();
 
