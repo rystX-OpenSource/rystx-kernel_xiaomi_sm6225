@@ -123,6 +123,32 @@ config MQ_IOSCHED_SSG_CGROUP
 # already driven by ufshcd devfreq clock scaling in this tree.
 #
 
+config MQ_IOSCHED_ADIOS
+	tristate "Adaptive Deadline I/O scheduler"
+	default n
+	help
+	  The Adaptive Deadline I/O Scheduler (ADIOS) is a multi-queue I/O
+	  scheduler that sorts requests into a deadline rbtree plus a pair of
+	  batch queues, and learns a per-operation-type latency model from
+	  completion timings in order to predict how long an I/O will take and
+	  reorder asynchronous requests against that prediction.
+
+	  Requests are classified into three tiers: at_head requests go to a
+	  dedicated priority queue, synchronous requests are given a deadline
+	  of their own start time, and asynchronous requests a deadline derived
+	  from their latency target plus the predicted latency.  The
+	  asynchronous tier's ordering can be switched from per-operation-type
+	  FIFO to a single-queue elevator sweep through the "batch_order" sysfs
+	  attribute, which is only writable on rotational devices.
+
+	  Selecting this makes the scheduler available; it does not make it the
+	  default.  On Android, switch a device to it by writing "adios" to
+	  /sys/block/<dev>/queue/scheduler.
+
+	  Note: this scheduler needs rq->io_start_time_ns for its latency
+	  model, so it calls blk_stat_enable_accounting() and depends on that
+	  symbol being exported for the =m case.
+
 endmenu
 
 endif
