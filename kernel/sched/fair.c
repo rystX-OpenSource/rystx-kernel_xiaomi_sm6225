@@ -164,7 +164,8 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
 #ifdef CONFIG_SCHED_BORE
 static void update_sysctl(void) {
 	sysctl_sched_base_slice = nsecs_per_tick *
-		max(1UL, DIV_ROUND_UP(sysctl_sched_min_base_slice, nsecs_per_tick));
+		max(1UL, (unsigned long)DIV_ROUND_UP(sysctl_sched_min_base_slice,
+							 nsecs_per_tick));
 }
 void sched_update_min_base_slice(void) { update_sysctl(); }
 #else /* !CONFIG_SCHED_BORE */
@@ -1525,12 +1526,12 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	resched = update_deadline(cfs_rq, curr);
 
 	if (entity_is_task(curr)) {
+		struct task_struct *curtask = task_of(curr);
+		
 #ifdef CONFIG_SCHED_BORE
 		struct task_struct *p = task_of(curr);
 		update_curr_bore(p, delta_exec);
 #endif /* CONFIG_SCHED_BORE */
-
-		struct task_struct *curtask = task_of(curr);
 
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
@@ -5092,6 +5093,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	u64 vslice = 0, vruntime = avg_vruntime(cfs_rq);
 	bool update_zero = false;
 	s64 lag = 0;
+	u64 place_from;
 
 	if (!se->custom_slice)
 		se->slice = sysctl_sched_base_slice;
@@ -5201,7 +5203,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if (update_zero)
 		update_zero_vruntime(cfs_rq, -lag);
 
-	u64 place_from = se->vruntime;
+	place_from = se->vruntime;
 
 	if (sched_feat(PLACE_REL_DEADLINE) && se->rel_deadline) {
 		se->deadline += place_from;
@@ -6589,7 +6591,7 @@ static int choose_idle_cpu(int cpu, struct task_struct *p)
 }
 
 static void
-requeue_delayed_entity(struct sched_entity *se, int flags);
+requeue_delayed_entity(struct sched_entity *se, int flags)
 {
 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
 

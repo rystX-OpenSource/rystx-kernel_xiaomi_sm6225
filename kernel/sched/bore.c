@@ -43,11 +43,27 @@ DEFINE_STATIC_KEY_TRUE (sched_burst_protect_slice_cond_key);
 DEFINE_STATIC_KEY_FALSE(sched_burst_protect_slice_prefer_key);
 DEFINE_STATIC_KEY_FALSE(sched_credit_key);
 
+/*
+ * Runqueue an entity is queued on.  4.19 keeps cfs_rq_of() (and the task_of()
+ * it needs) local to fair.c, so look it up here the same way for the task
+ * entities BORE works with.
+ */
+static inline struct cfs_rq *bore_cfs_rq_of(struct task_struct *p) {
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	return p->se.cfs_rq;
+#else
+	return &task_rq(p)->cfs;
+#endif
+}
+
 static inline u32 log2p1_u64_u32fp(u64 v, u8 fp) {
+	int clz, exponent;
+	u32 mantissa;
+
 	if (unlikely(!v)) return 0;
-	int clz = __builtin_clzll(v);
-	int exponent = 64 - clz;
-	u32 mantissa = (u32)((v << clz) << 1 >> (64 - fp));
+	clz = __builtin_clzll(v);
+	exponent = 64 - clz;
+	mantissa = (u32)((v << clz) << 1 >> (64 - fp));
 	return exponent << fp | mantissa;
 }
 
@@ -101,13 +117,13 @@ static inline u32 binary_smooth(u32 new, u32 old) {
 
 static void reweight_task_by_prio(struct task_struct *p, int prio) {
 	if (task_has_idle_policy(p)) return;
-
+	
 	struct sched_entity *se = &p->se;
 	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
 
 	if (se->on_rq) {
 		p->bore.stop_update = true;
-		reweight_entity(cfs_rq_of(se), se, weight);
+		reweight_entity(bore_cfs_rq_of(p), se, weight);
 		p->bore.stop_update = false;
 	} else
 		se->load.weight = weight;
@@ -116,35 +132,43 @@ static void reweight_task_by_prio(struct task_struct *p, int prio) {
 
 u8 effective_prio_bore(struct task_struct *p) {
 	int prio = p->static_prio - MAX_RT_PRIO;
+	s32 diff;
+
 	if (static_branch_likely(&sched_bore_key))
 		prio += bore_score(p);
 	prio &= ~(prio >> 31);
-	s32 diff = prio - maxval_prio;
+	diff = prio - maxval_prio;
 	prio -= (diff & ~(diff >> 31));
 	return (u8)prio;
 }
 
 static void update_penalty(struct task_struct *p) {
 	struct bore_ctx *ctx = &p->bore;
+	u8  prev_prio, new_prio;
+	s32 diff;
+	u16 max_val;
+	u32 is_kthread;
 
-	u8  prev_prio = effective_prio_bore(p);
+	prev_prio = effective_prio_bore(p);
 
-	s32 diff = (s32)ctx->curr_penalty - (s32)ctx->prev_penalty;
-	u16 max_val = ctx->curr_penalty - (diff & (diff >> 31));
-	u32 is_kthread = !!(p->flags & PF_KTHREAD);
+	diff = (s32)ctx->curr_penalty - (s32)ctx->prev_penalty;
+	max_val = ctx->curr_penalty - (diff & (diff >> 31));
+	is_kthread = !!(p->flags & PF_KTHREAD);
 	ctx->penalty = max_val & -(s32)(!is_kthread);
 
-	u8 new_prio = effective_prio_bore(p);
+	new_prio = effective_prio_bore(p);
 	if (new_prio != prev_prio)
 		reweight_task_by_prio(p, new_prio);
 }
 
 void update_curr_bore(struct task_struct *p, u64 delta_exec) {
 	struct bore_ctx *ctx = &p->bore;
+	u32 curr_penalty;
+
 	if (ctx->stop_update) return;
 
 	ctx->burst_time += delta_exec;
-	u32 curr_penalty = ctx->curr_penalty = calc_burst_penalty(ctx->burst_time);
+	curr_penalty = ctx->curr_penalty = calc_burst_penalty(ctx->burst_time);
 
 	if (curr_penalty <= ctx->prev_penalty) return;
 	update_penalty(p);
@@ -162,10 +186,11 @@ void restart_burst_bore(struct task_struct *p) {
 void restart_burst_rescale_deadline_bore(struct task_struct *p) {
 	struct sched_entity *se = &p->se;
 	s64 vscaled, vremain = se->deadline - se->vruntime;
+	u8 old_prio, new_prio;
 
-	u8 old_prio = effective_prio_bore(p);
+	old_prio = effective_prio_bore(p);
 	restart_burst_bore(p);
-	u8 new_prio = effective_prio_bore(p);
+	new_prio = effective_prio_bore(p);
 
 	if (old_prio > new_prio) {
 		vscaled = rescale_slice(abs(vremain), old_prio, new_prio);
@@ -202,7 +227,7 @@ static void update_burst_cache(struct bore_bc *bc,
 		(u32)(((u64)total * bore_reciprocal_lut[count]) >> 32);
 
 	struct bore_bc new_bc = {
-		.penalty = max(average, p->bore.penalty),
+		.penalty = max(average, (u32)p->bore.penalty),
 		.timestamp = now >> BORE_BC_TIMESTAMP_SHIFT
 	};
 	WRITE_ONCE(bc->value, new_bc.value);
@@ -211,11 +236,12 @@ static void update_burst_cache(struct bore_bc *bc,
 static u32 inherit_from_parent(struct task_struct *parent,
 									u64 clone_flags, u64 now) {
 	struct bore_bc bc_val;
+	struct bore_bc *bc;
 
 	if (clone_flags & CLONE_PARENT)
 		parent = rcu_dereference(parent->real_parent);
 
-	struct bore_bc *bc = &parent->bore.subtree;
+	bc = &parent->bore.subtree;
 
 	if (burst_cache_expired(bc, now)) {
 		struct task_struct *child;
@@ -240,6 +266,8 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent,
 										u64 clone_flags, u64 now) {
 	struct bore_bc bc_val;
 	struct task_struct *ancestor = parent;
+	struct task_struct *next;
+	struct bore_bc *bc;
 	u32 sole_child_count = 0;
 
 	if (clone_flags & CLONE_PARENT) {
@@ -247,21 +275,20 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent,
 		sole_child_count = 1;
 	}
 
-	for (struct task_struct *next;
-			(next = rcu_dereference(ancestor->real_parent)) != ancestor &&
+	for (; (next = rcu_dereference(ancestor->real_parent)) != ancestor &&
 			count_children_upto2(ancestor) <= sole_child_count;
 			ancestor = next, sole_child_count = 1) {}
 
-	struct bore_bc *bc = &ancestor->bore.subtree;
+	bc = &ancestor->bore.subtree;
 
 	if (burst_cache_expired(bc, now)) {
-		struct task_struct *direct_child;
+		struct task_struct *direct_child, *descendant;
 		u32 count = 0, total = 0, scan_count = 0;
 		for_each_child_task(ancestor, direct_child) {
 			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
 			if (scan_count++ >= BURST_CACHE_SCAN_LIMIT) break;
 
-			struct task_struct *descendant = direct_child;
+			descendant = direct_child;
 			while (count_children_upto2(descendant) == 1) {
 				struct task_struct *next_descendant =
 					list_first_or_null_rcu(&descendant->children,
@@ -353,10 +380,12 @@ static void update_inherit_type(void) {
 }
 
 void __init sched_init_bore(void) {
+	int i;
+
 	printk(KERN_INFO "%s %s by %s\n",
 		SCHED_BORE_PROGNAME, SCHED_BORE_VERSION, SCHED_BORE_AUTHOR);
 
-	for (int i = 1; i <= BURST_CACHE_SAMPLE_LIMIT; i++)
+	for (i = 1; i <= BURST_CACHE_SAMPLE_LIMIT; i++)
 		bore_reciprocal_lut[i] = (u32)div64_u64(0xffffffffULL + i, i);
 
 	reset_task_bore(&init_task);
