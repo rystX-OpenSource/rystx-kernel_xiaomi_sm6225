@@ -1273,23 +1273,22 @@ config SCHED_CASS
 	  their lowest P-state necessary to satisfy the overall load at any
 	  given moment.
 
-config SCHED_EEVDF_MLFQ
-	bool "Multi-level feedback queue classification for EEVDF"
-	depends on PROC_FS
+config SCHED_BORE
+	bool "Burst-Oriented Response Enhancer"
+	default y
 	help
-	  This enables a port of scx_mlfq, a sched_ext scheduler by galpt, to
-	  the fair class of this kernel. Tasks are classified into three
-	  multi-level feedback queues and the queue selects the task's EEVDF
-	  request size, so an interactive task asks for a shorter request than
-	  a CPU-bound one and is picked sooner and more often for shorter
-	  turns. The share each task receives still follows its weight, and
-	  the virtual deadline order still bounds how long any of them waits.
+	  In Desktop and Mobile computing, one might prefer interactive
+	  tasks to keep responsive no matter what they run in the background.
 
-	  The classifier is self-contained: it needs no userspace daemon and
-	  no tunables, and it lives entirely in kernel/sched. Its dashboard is
-	  /proc/sched_eevdf_mlfq_stats, which is why procfs is required.
+	  Enabling this kernel feature modifies the scheduler to discriminate
+	  tasks by their burst time (runtime since it last went sleeping or
+	  yielding state) and prioritize those that run less bursty.
+	  Such tasks usually include window compositor, widgets backend,
+	  terminal emulator, video playback, games and so on.
+	  With a little impact to scheduling fairness, it may improve
+	  responsiveness especially under heavy background workload.
 
-	  If unsure, say N here.
+	  If unsure, say Y here.
 
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"

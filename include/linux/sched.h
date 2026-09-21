@@ -743,60 +743,31 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
-#ifdef CONFIG_SCHED_EEVDF_MLFQ
-/*
- * Multi-level feedback queue levels. Q1 holds tasks classified as
- * interactive, Q2 the ones the classifier cannot place yet, and Q3 the
- * CPU-bound ones. A lower level means a shorter EEVDF request, hence an
- * earlier virtual deadline and lower wakeup latency; see
- * kernel/sched/mlfq.h for the request sizes and the classifier.
- */
-#define MLFQ_Q_INTERACTIVE	1
-#define MLFQ_Q_DEFAULT		2
-#define MLFQ_Q_BATCH		3
-#define MLFQ_NR_QUEUES		3
+#ifdef CONFIG_SCHED_BORE
+#define BORE_BC_TIMESTAMP_SHIFT 16
 
-/**
- * struct mlfq_ctx - per-task multi-level feedback queue classification state
- * @ema:		interactivity gauge, in nanoseconds of saturating
- *			exponentially-weighted running time. Climbs while the
- *			task runs and decays while it sleeps.
- * @last_sleep_at:	rq clock at the last voluntary sleep, used to size the
- *			decay and to recognise a short sleep.
- * @queued_at:		rq clock at which the current stay in a non-interactive
- *			queue began; zero while the task is in Q1.
- * @last_boost_at:	rq clock at the last short-sleep boost, used to
- *			rate limit it.
- * @wake_enq_at:	rq clock at which the task was enqueued by a wakeup, or
- *			zero when no wakeup is in flight. Non-zero doubles as
- *			scx_mlfq's MLFQ_TF_ENQ_WAKEUP: it says that the wait
- *			ending at the task's next switch-in is a wakeup latency
- *			and should be fed to the system gauge.
- * @queue:		the queue the task currently belongs to, 1..3, where
- *			1 is the interactive queue and 3 the batch queue.
- * @reenq_cnt:		consecutive request exhaustions at the current level.
- * @wake_cnt:		consecutive short sleeps at the current level.
- * @last_qid:		the level this task was counted into on the runqueue it
- *			is queued on, or 0 when it is not counted. Owned by
- *			mlfq_runnable_enter() and mlfq_runnable_exit() alone, so
- *			that a task reclassified while it waits is taken back out
- *			of the level it was actually placed in.
- *
- * The gauge and the counters together decide the queue, and the queue in turn
- * selects the EEVDF request size for the task. See kernel/sched/mlfq.h.
- */
-struct mlfq_ctx {
-	u64		ema;
-	u64		last_sleep_at;
-	u64		queued_at;
-	u64		last_boost_at;
-	u64		wake_enq_at;
-	u8		queue;
-	u8		reenq_cnt;
-	u8		wake_cnt;
-	u8		last_qid;
+struct bore_bc {
+	union {
+		struct {
+			u64		timestamp:	48;
+			u64		penalty:	16;
+		};
+		u64			value;
+	};
 };
-#endif /* CONFIG_SCHED_EEVDF_MLFQ */
+
+struct bore_ctx {
+	u64				burst_time;
+	u64				credit_sleep;
+	u16				prev_penalty;
+	u16				curr_penalty;
+	u16				penalty;
+	bool			stop_update;
+	bool			futex_waiting;
+	struct bore_bc	subtree;
+	struct bore_bc	group;
+};
+#endif /* CONFIG_SCHED_BORE */
 
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
@@ -850,12 +821,12 @@ struct task_struct {
 	int				normal_prio;
 	unsigned int			rt_priority;
 
+#ifdef CONFIG_SCHED_BORE
+	struct bore_ctx			bore;
+#endif /* CONFIG_SCHED_BORE */
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
-#ifdef CONFIG_SCHED_EEVDF_MLFQ
-	struct mlfq_ctx			mlfq;
-#endif
 	u64				last_sleep_ts;
 
 	int				boost;

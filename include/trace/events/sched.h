@@ -1033,11 +1033,11 @@ TRACE_EVENT(sched_cpu_util,
 		__entry->capacity_curr      = capacity_curr_of(cpu);
 		__entry->capacity           = capacity_of(cpu);
 		__entry->capacity_orig      = capacity_orig_of(cpu);
-		__entry->irqload            = sched_irqload(cpu);
+		__entry->irqload            = 0;
 		__entry->online             = cpu_online(cpu);
 		__entry->reserved           = is_reserved(cpu);
-		__entry->high_irq_load      = sched_cpu_high_irqload(cpu);
-		__entry->nr_rtg_high_prio_tasks = walt_nr_rtg_high_prio(cpu);
+		__entry->high_irq_load      = 0;
+		__entry->nr_rtg_high_prio_tasks = 0;
 	),
 
 	TP_printk("cpu=%d nr_running=%d cpu_util=%ld cpu_util_cum=%ld capacity_curr=%u capacity=%u capacity_orig=%u idle_state=%d irqload=%llu online=%u, isolated=%u, reserved=%u, high_irq_load=%u nr_rtg_hp=%u",
@@ -1141,10 +1141,10 @@ TRACE_EVENT(sched_task_util,
 		__entry->rtg_skip_min		= rtg_skip_min;
 		__entry->start_cpu		= start_cpu;
 		__entry->unfilter		= 0;
-		__entr>low_latency		= 0;
+		__entry->low_latency		= 0;
 		__entry->cpus_allowed           = cpumask_bits(&p->cpus_allowed)[0];
 	),
-y-
+
 	TP_printk("pid=%d comm=%s util=%lu prev_cpu=%d candidates=%#lx best_energy_cpu=%d sync=%d need_idle=%d fastpath=%d placement_boost=%d latency=%llu stune_boosted=%d is_rtg=%d rtg_skip_min=%d start_cpu=%d unfilter=%u affine=%#lx low_latency=%d",
 		__entry->pid, __entry->comm, __entry->util, __entry->prev_cpu,
 		__entry->candidates, __entry->best_energy_cpu, __entry->sync,
@@ -1267,7 +1267,7 @@ TRACE_EVENT(core_ctl_set_busy,
 		__entry->busy = busy;
 		__entry->old_is_busy = old_is_busy;
 		__entry->is_busy = is_busy;
-		__entry->high_irqload = sched_cpu_high_irqload(cpu);
+		__entry->high_irqload = 0;
 	),
 	TP_printk("cpu=%u, busy=%u, old_is_busy=%u, new_is_busy=%u high_irqload=%d",
 		__entry->cpu, __entry->busy, __entry->old_is_busy,

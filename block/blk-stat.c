@@ -190,6 +190,14 @@ void blk_stat_enable_accounting(struct request_queue *q)
 	blk_queue_flag_set(QUEUE_FLAG_STATS, q);
 	spin_unlock(&q->stats->lock);
 }
+/*
+ * Exported for the MQ I/O schedulers that build a timing model from
+ * rq->io_start_time_ns, which blk_mq_start_request() only records while
+ * QUEUE_FLAG_STATS is set, i.e. only after this has been called.  adios and
+ * ssg both call it, and both are tristate, so without the export neither can
+ * be built as a module.
+ */
+EXPORT_SYMBOL_GPL(blk_stat_enable_accounting);
 
 struct blk_queue_stats *blk_alloc_queue_stats(void)
 {

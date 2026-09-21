@@ -21,10 +21,11 @@
 #include "../workqueue_internal.h"
 #include "../smpboot.h"
 
+#ifdef CONFIG_SCHED_BORE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE */
+
 #include "pelt.h"
-#ifdef CONFIG_SCHED_EEVDF_MLFQ
-#include "mlfq.h"
-#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
@@ -728,7 +729,11 @@ int tg_nop(struct task_group *tg, void *data)
 
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
+#ifdef CONFIG_SCHED_BORE
+	int prio = effective_prio_bore(p);
+#else /* !CONFIG_SCHED_BORE */
 	int prio = p->static_prio - MAX_RT_PRIO;
+#endif /* CONFIG_SCHED_BORE */
 	struct load_weight lw;
 
 	if (task_has_idle_policy(p)) {
@@ -3180,16 +3185,6 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.vruntime			= 0;
 	p->se.vlag			= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
-
-#ifdef CONFIG_SCHED_EEVDF_MLFQ
-	/*
-	 * A new task carries no interactivity history, so it starts in the
-	 * default queue with an empty gauge and its first few stretches of
-	 * running time decide where it belongs. init_idle() comes through here
-	 * too, which is harmless: the idle task is never classified.
-	 */
-	mlfq_reset_classification(&p->mlfq);
-#endif
 
 	/* A delayed task cannot be in clone(). */
 	SCHED_WARN_ON(p->se.sched_delayed);
@@ -7318,6 +7313,10 @@ void __init sched_init(void)
 {
 	unsigned long ptr = 0;
 	int i;
+
+#ifdef CONFIG_SCHED_BORE
+	sched_init_bore();
+#endif /* CONFIG_SCHED_BORE */
 
 	wait_bit_init();
 
