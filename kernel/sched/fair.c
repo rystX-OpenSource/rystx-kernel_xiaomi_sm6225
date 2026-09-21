@@ -1480,6 +1480,9 @@ static inline bool do_preempt_weight(struct cfs_rq *cfs_rq,
 	 * the slice protection (vprot) exists regardless of RUN_TO_PARITY, so
 	 * the weight bypass must apply either way.
 	 */
+	if (!static_branch_likely(&sched_bore_key))
+		return false;
+
 	if (!static_branch_likely(&sched_burst_protect_slice_cond_key))
 		return false;
 
@@ -5236,7 +5239,8 @@ vslice_found:
 	se->deadline = place_from + vslice;
 
 #ifdef CONFIG_SCHED_BORE
-	if (static_branch_unlikely(&sched_credit_key) &&
+	if (static_branch_likely(&sched_bore_key) &&
+		static_branch_unlikely(&sched_credit_key) &&
 	    entity_is_task(se) && (flags & ENQUEUE_WAKEUP)) {
 		u64 credit = bore_credit_ns(task_of(se));
 

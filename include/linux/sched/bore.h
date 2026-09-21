@@ -11,7 +11,7 @@
 #define SCHED_BORE_AUTHOR   "Masahito Suzuki"
 #define SCHED_BORE_PROGNAME "BORE CPU Scheduler modification"
 
-#define SCHED_BORE_VERSION  "7.0.0-rc1"
+#define SCHED_BORE_VERSION  "7.0.0"
 
 extern u8   __read_mostly sched_bore;
 DECLARE_STATIC_KEY_TRUE(sched_bore_key);
@@ -39,17 +39,17 @@ extern void update_curr_bore(struct task_struct *p, u64 delta_exec);
 extern void restart_burst_bore(struct task_struct *p);
 extern void restart_burst_rescale_deadline_bore(struct task_struct *p);
 extern void task_fork_bore(struct task_struct *p, struct task_struct *parent,
-													u64 clone_flags, u64 now);
+						u64 clone_flags, u64 now);
 extern void sched_init_bore(void);
 extern void reset_task_bore(struct task_struct *p);
 
-extern int  sched_bore_update_handler(const struct ctl_table *table,
+extern int  sched_bore_update_handler(struct ctl_table *table,
 	int write, void __user *buffer, size_t *lenp, loff_t *ppos);
-extern int  sched_burst_inherit_type_update_handler(const struct ctl_table *table,
+extern int  sched_burst_inherit_type_update_handler(struct ctl_table *table,
 	int write, void __user *buffer, size_t *lenp, loff_t *ppos);
-extern int  sched_burst_protect_slice_lv_update_handler(const struct ctl_table *table,
+extern int  sched_burst_protect_slice_lv_update_handler(struct ctl_table *table,
 	int write, void __user *buffer, size_t *lenp, loff_t *ppos);
-extern int  sched_credit_cap_us_update_handler(const struct ctl_table *table,
+extern int  sched_credit_cap_us_update_handler(struct ctl_table *table,
 	int write, void __user *buffer, size_t *lenp, loff_t *ppos);
 
 extern void reweight_entity(

@@ -1,6 +1,6 @@
 /*
- * Burst-Oriented Response Enhancer (BORE) CPU Scheduler
- * Copyright (C) 2021-2025 Masahito Suzuki <firelzrd@gmail.com>
+ *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
+ *  Copyright (C) 2021-2025 Masahito Suzuki <firelzrd@gmail.com>
  */
 #include <linux/cpuset.h>
 #include <linux/sched/task.h>
@@ -11,11 +11,11 @@
 DEFINE_STATIC_KEY_TRUE(sched_bore_key);
 u8   __read_mostly sched_bore                    = 1;
 u8   __read_mostly sched_burst_inherit_type      = 2;
-u8   __read_mostly sched_burst_protect_slice_lv = 1;
+u8   __read_mostly sched_burst_protect_slice_lv  = 1;
 u8   __read_mostly sched_burst_smoothness        = 1;
 u8   __read_mostly sched_burst_penalty_offset    = 24;
-uint __read_mostly sched_burst_penalty_scale    = 1536;
-uint __read_mostly sched_burst_cache_lifetime   = 75000000;
+uint __read_mostly sched_burst_penalty_scale     = 1536;
+uint __read_mostly sched_burst_cache_lifetime    = 75000000;
 
 uint __read_mostly sched_credit_cap_us = 16000;
 
@@ -308,7 +308,7 @@ static u32 inherit_from_thread_group(struct task_struct *p, u64 now) {
 }
 
 void task_fork_bore(struct task_struct *p,
-	               struct task_struct *parent, u64 clone_flags, u64 now) {
+                   struct task_struct *parent, u64 clone_flags, u64 now) {
 	if (!static_branch_likely(&sched_bore_key) || !task_is_bore_eligible(p)) return;
 
 	rcu_read_lock();
@@ -379,7 +379,7 @@ static void readjust_all_task_weights(void) {
 		reweight_task_by_prio(task, effective_prio_bore(task));
 		task_rq_unlock(rq, task, &rf);
 	}
-    write_unlock_irq(&tasklist_lock);
+	write_unlock_irq(&tasklist_lock);
 }
 
 int sched_bore_update_handler(struct ctl_table *table,
