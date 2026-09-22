@@ -2763,6 +2763,11 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
  *                          shorthand helpers
  ******************************************************************************/
 
+#define RESWAPPINESS_PROGNAME	"Re-swappiness: MGLRU anon/file independent aging"
+#define RESWAPPINESS_AUTHOR		"Masahito Suzuki"
+
+#define RESWAPPINESS_VERSION	"1.3"
+
 #define DEFINE_MAX_SEQ(lruvec)						\
 	unsigned long max_seq[ANON_AND_FILE] = {			\
 		READ_ONCE((lruvec)->lrugen.max_seq[LRU_GEN_ANON]),	\
@@ -5656,6 +5661,10 @@ static int __init init_lru_gen(void)
 {
 	BUILD_BUG_ON(MIN_NR_GENS + 1 >= MAX_NR_GENS);
 	BUILD_BUG_ON(BIT(LRU_GEN_WIDTH) <= MAX_NR_GENS);
+
+	printk(KERN_INFO "%s %s by %s\n",
+		RESWAPPINESS_PROGNAME, RESWAPPINESS_VERSION, RESWAPPINESS_AUTHOR);
+
 	if (sysfs_create_group(mm_kobj, &lru_gen_attr_group))
 		pr_err("lru_gen: failed to create sysfs group\n");
 
