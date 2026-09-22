@@ -3,6 +3,7 @@ menu "CPU Idle"
 config CPU_IDLE
 	bool "CPU idle PM support"
 	default y if ACPI || PPC_PSERIES
+	select CPU_IDLE_GOV_NAP if ARM64 && KERNEL_MODE_NEON
 	help
 	  CPU idle is a generic framework for supporting software-controlled
 	  idle processor power management.  It includes modular cross-platform
@@ -41,10 +42,16 @@ config CPU_IDLE_GOV_NAP
 	  integer fixed-point (no FPU/NEON); the float backprop runs later
 	  from ->reflect() using NEON, which is a mandatory AArch64 baseline.
 
-	  This is experimental.  It registers with a higher rating than the
-	  menu/ladder governors, so it becomes the active governor at boot
-	  when built in; it can also be selected at runtime via
-	  /sys/devices/system/cpu/cpuidle/current_governor.
+	  This is experimental.  It registers at rating 31, above the menu
+	  (20), ladder (10/25) and Qualcomm LPM ("qcom", 30) governors, so it
+	  becomes the active governor at boot when built in.  Runtime switching
+	  via /sys/devices/system/cpu/cpuidle/current_governor requires booting
+	  with the cpuidle_sysfs_switch flag (otherwise only current_governor_ro
+	  is exposed).
+
+	  Note: on Qualcomm platforms the qcom LPM governor is purpose-built for
+	  the SoC's low-power modes; replacing it with NAP may change idle power
+	  behaviour.
 
 	  If unsure, say N.
 

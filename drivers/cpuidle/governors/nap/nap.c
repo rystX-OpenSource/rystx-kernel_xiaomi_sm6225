@@ -634,7 +634,16 @@ void nap_sysfs_exit(void)
 
 static struct cpuidle_governor nap_governor = {
 	.name    = "nap",
-	.rating  = 26,
+	/*
+	 * Rating drives auto-selection at registration (highest wins).
+	 * Qualcomm's LPM governor ("qcom", drivers/cpuidle/lpm-levels.c)
+	 * registers at 30; menu is 20, ladder 10/25.  Use 31 so NAP wins and
+	 * becomes the active governor at boot on Qualcomm platforms too.
+	 * Lower this below 30 to keep the qcom LPM governor as the default and
+	 * opt into NAP only at runtime (which needs the cpuidle_sysfs_switch
+	 * boot flag to expose a writable current_governor node).
+	 */
+	.rating  = 31,
 	.enable  = nap_enable,
 	.disable = nap_disable,
 	.select  = nap_select,
