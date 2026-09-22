@@ -90,7 +90,7 @@
 			device_type = "cpu";
 			compatible = "arm,armv8";
 			reg = <0x0 0x2>;
-			capacity-dmips-mhz = <1024>;
+			capacity-dmips-mhz = <448>;
 			dynamic-power-coefficient = <150>;
 			enable-method = "psci";
 			next-level-cache = <&L2_0>;
