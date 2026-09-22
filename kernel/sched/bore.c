@@ -116,10 +116,10 @@ static inline u32 binary_smooth(u32 new, u32 old) {
 }
 
 static void reweight_task_by_prio(struct task_struct *p, int prio) {
-	if (task_has_idle_policy(p)) return;
-	
 	struct sched_entity *se = &p->se;
 	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
+
+	if (task_has_idle_policy(p)) return;
 
 	if (se->on_rq) {
 		p->bore.stop_update = true;
@@ -336,11 +336,12 @@ static u32 inherit_from_thread_group(struct task_struct *p, u64 now) {
 
 void task_fork_bore(struct task_struct *p,
                    struct task_struct *parent, u64 clone_flags, u64 now) {
+	struct bore_ctx *ctx = &p->bore;
+	u32 inherited_penalty;
+
 	if (!static_branch_likely(&sched_bore_key) || !task_is_bore_eligible(p)) return;
 
 	rcu_read_lock();
-	struct bore_ctx *ctx = &p->bore;
-	u32 inherited_penalty;
 	if (clone_flags & CLONE_THREAD)
 		inherited_penalty = inherit_from_thread_group(parent, now);
 	else if (static_branch_likely(&sched_burst_inherit_key))
@@ -544,6 +545,7 @@ static struct ctl_table sched_bore_sysctls[] = {
 		.extra1		= &zero,
 		.extra2		= &maxval_1_million,
 	},
+	{ }
 };
 
 static int __init sched_bore_sysctl_init(void) {
