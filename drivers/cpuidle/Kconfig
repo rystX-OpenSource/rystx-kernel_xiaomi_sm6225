@@ -21,6 +21,33 @@ config CPU_IDLE_GOV_LADDER
 config CPU_IDLE_GOV_MENU
 	bool "Menu governor (for tickless system)"
 
+config CPU_IDLE_GOV_NAP
+	bool "Neural Adaptive Predictor (NAP) governor"
+	depends on X86_64 || ARM64
+	default n
+	help
+	  A machine-learning-based cpuidle governor that uses a small
+	  neural network (MLP 8->8 trunk + ordinal survival head) to
+	  predict the optimal idle state.  Weights are initialized from
+	  hardware idle-state parameters and refined via online learning
+	  (deferred backpropagation with SGD).
+
+	  On x86_64 the whole network runs under kernel_fpu_begin() in the
+	  governor's ->select() path (SSE2 at minimum, AVX2+FMA when the
+	  CPU supports them).
+
+	  On arm64 the ->select() path runs with interrupts disabled, where
+	  kernel_neon_begin() is not usable, so inference is evaluated in
+	  integer fixed-point (no FPU/NEON); the float backprop runs later
+	  from ->reflect() using NEON, which is a mandatory AArch64 baseline.
+
+	  This is experimental.  It registers with a higher rating than the
+	  menu/ladder governors, so it becomes the active governor at boot
+	  when built in; it can also be selected at runtime via
+	  /sys/devices/system/cpu/cpuidle/current_governor.
+
+	  If unsure, say N.
+
 config DT_IDLE_STATES
 	bool
 
