@@ -30,3 +30,4 @@ obj-$(CONFIG_MEMBARRIER) += membarrier.o
 obj-$(CONFIG_CPU_ISOLATION) += isolation.o
 obj-$(CONFIG_PSI) += psi.o
 obj-$(CONFIG_SCHED_TUNE_DUMMY) += tune_dummy.o
+obj-$(CONFIG_SCHED_BORE_LITE) += bore.o

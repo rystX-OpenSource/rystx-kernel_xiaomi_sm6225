@@ -25,6 +25,10 @@
 
 #include <trace/events/sched.h>
 
+#ifdef CONFIG_SCHED_BORE_LITE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE_LITE */
+
 #ifdef CONFIG_SCHED_EEVDF_MLFQ
 #include "mlfq.h"
 #endif
@@ -5288,6 +5292,16 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	se->deadline = se->vruntime + vslice;
 
+#ifdef CONFIG_SCHED_BORE_LITE
+	if (static_branch_likely(&sched_credit_key) &&
+			entity_is_task(se) && (flags & ENQUEUE_WAKEUP)) {
+		u64 credit = bore_credit_ns(task_of(se));
+
+		if (credit && se->deadline > credit)
+			se->deadline -= credit;
+	}
+#endif /* CONFIG_SCHED_BORE_LITE */
+
 #ifdef CONFIG_SCHED_EEVDF_MLFQ
 	mlfq_preempt_burst(cfs_rq, se);
 #endif
@@ -6948,6 +6962,18 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
+
+#ifdef CONFIG_SCHED_BORE_LITE
+	if (flags & DEQUEUE_SLEEP) {
+		struct sched_entity *se = &p->se;
+		if (entity_is_task(se)) {
+			struct cfs_rq *cfs_rq = cfs_rq_of(se);
+			if (cfs_rq->curr == se)
+				update_curr(cfs_rq);
+			bore_note_sleep(p, rq_clock(rq));
+		}
+	}
+#endif /* CONFIG_SCHED_BORE_LITE */
 
 	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
 	if (dequeue_entities(rq, &p->se, flags) < 0)

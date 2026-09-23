@@ -798,6 +798,12 @@ struct mlfq_ctx {
 };
 #endif /* CONFIG_SCHED_EEVDF_MLFQ */
 
+#ifdef CONFIG_SCHED_BORE_LITE
+struct bore_ctx {
+	u64		credit_sleep;
+};
+#endif /* CONFIG_SCHED_BORE_LITE */
+
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -849,6 +855,10 @@ struct task_struct {
 	int				static_prio;
 	int				normal_prio;
 	unsigned int			rt_priority;
+
+#ifdef CONFIG_SCHED_BORE_LITE
+	struct bore_ctx			bore;
+#endif /* CONFIG_SCHED_BORE_LITE */
 
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
