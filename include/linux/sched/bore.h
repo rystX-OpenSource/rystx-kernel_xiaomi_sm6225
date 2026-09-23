@@ -17,7 +17,7 @@ extern u64  bore_credit_ns(struct task_struct *p);
 
 extern void sched_init_bore(void);
 
-extern int  sched_credit_cap_us_update_handler(const struct ctl_table *table,
+extern int  sched_credit_cap_us_update_handler(struct ctl_table *table,
 	int write, void __user *buffer, size_t *lenp, loff_t *ppos);
 
 #endif /* _KERNEL_SCHED_BORE_H */
