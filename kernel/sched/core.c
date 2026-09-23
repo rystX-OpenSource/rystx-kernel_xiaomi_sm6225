@@ -21,6 +21,10 @@
 #include "../workqueue_internal.h"
 #include "../smpboot.h"
 
+#ifdef CONFIG_SCHED_BORE_LITE
+#include <linux/sched/bore.h>
+#endif /* CONFIG_SCHED_BORE_LITE */
+
 #include "pelt.h"
 #ifdef CONFIG_SCHED_EEVDF_MLFQ
 #include "mlfq.h"
@@ -7318,6 +7322,10 @@ void __init sched_init(void)
 {
 	unsigned long ptr = 0;
 	int i;
+
+#ifdef CONFIG_SCHED_BORE_LITE
+	sched_init_bore();
+#endif /* CONFIG_SCHED_BORE_LITE */
 
 	wait_bit_init();
 

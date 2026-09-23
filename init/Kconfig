@@ -1325,6 +1325,26 @@ config SCHED_EEVDF_MLFQ
 
 	  If unsure, say N here.
 
+config SCHED_BORE_LITE
+	bool "BORE-Lite: credit-sleep scheduler bonus"
+	default y
+	help
+	  Enable the credit-sleep feature extracted from Masahito Suzuki's
+	  BORE (Burst-Oriented Response Enhancer) CPU Scheduler, version 7.0.0.
+
+	  When a task wakes up after sleeping, it is granted a small credit
+	  (capped by /proc/sys/kernel/sched_credit_cap_us, default 20ms) that
+	  reduces its EEVDF deadline, improving the responsiveness of
+	  interactive/latency-sensitive tasks without the full BORE patchset.
+
+	  Patch source (Mario Roy, CachyMod):
+	  https://github.com/marioroy/cachymod/blob/main/linux-cachymod-7.3/0350-bore-credit-sleep-7.0.0.patch
+
+	  Patch base (Masahito Suzuki, BORE Scheduler):
+	  https://github.com/firelzrd/bore-scheduler/blob/main/patches/testing/0001-linux7.1.5-bore-7.0.0.patch
+
+	  If unsure, say Y.
+
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"
 	select CGROUPS
