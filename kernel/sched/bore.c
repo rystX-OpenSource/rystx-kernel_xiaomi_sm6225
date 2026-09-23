@@ -11,6 +11,7 @@
 #ifdef CONFIG_SCHED_BORE_LITE
 uint __read_mostly sched_credit_cap_us	= 20000;
 
+static int zero;
 static int __maybe_unused maxval_1_million = 1000000;
 
 DEFINE_STATIC_KEY_TRUE(sched_credit_key);
@@ -46,7 +47,7 @@ void __init sched_init_bore(void) {
 		static_branch_enable(&sched_credit_key);
 }
 
-int sched_credit_cap_us_update_handler(const struct ctl_table *table,
+int sched_credit_cap_us_update_handler(struct ctl_table *table,
 		int write, void __user *buffer, size_t *lenp, loff_t *ppos) {
 	int ret = proc_douintvec_minmax(table, write, buffer, lenp, ppos);
 	if (ret || !write)
@@ -68,7 +69,7 @@ static struct ctl_table sched_bore_sysctls[] = {
 		.maxlen		= sizeof(uint),
 		.mode		= 0644,
 		.proc_handler	= sched_credit_cap_us_update_handler,
-		.extra1		= SYSCTL_ZERO,
+		.extra1		= &zero,
 		.extra2		= &maxval_1_million,
 	},
     { }
