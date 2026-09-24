@@ -373,6 +373,13 @@ extern int remove_mapping(struct address_space *mapping, struct page *page);
 extern unsigned long vm_total_pages;
 
 extern unsigned long reclaim_pages(struct list_head *page_list);
+/*
+ * LRU isolation primitives, otherwise private to mm/.  Exposed so the Android
+ * guided reclaim driver (TAGLMK) can isolate a task's cold anon pages from
+ * fs/proc/task_mmu.c and hand them to reclaim_pages().
+ */
+extern int isolate_lru_page(struct page *page);
+extern void putback_lru_page(struct page *page);
 #ifdef CONFIG_NUMA
 extern int node_reclaim_mode;
 extern int sysctl_min_unmapped_ratio;
