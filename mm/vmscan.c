@@ -62,6 +62,7 @@
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
 #include <linux/sched/signal.h>
+#include <linux/taglmk.h>
 
 #include "internal.h"
 
@@ -5739,6 +5740,15 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 
 	} while (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
 					 sc->nr_scanned - nr_scanned, sc));
+
+	/*
+	 * Hand off a pressure notification to the TAGLMK reclaim daemon once
+	 * reclaim has had to dig deep (priority dropped past halfway).  This
+	 * only latches state and wakes the kthread; it never sleeps or reclaims
+	 * on this path.
+	 */
+	if (sc->priority < DEF_PRIORITY / 2)
+		taglmk_note_pressure(sc->order, !current_is_kswapd());
 
 	/*
 	 * Kswapd gives up on balancing particular nodes after too

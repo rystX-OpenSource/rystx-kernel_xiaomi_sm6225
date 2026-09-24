@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0
+config ANDROID_TAGLMK
+	bool "Task-aware Android Guided Low Memory Killer (TAGLMK)"
+	depends on ANDROID && MMU && SWAP
+	help
+	  TAGLMK is an independent, task-aware low-memory management driver for
+	  Android.  Rather than only killing under pressure, it continuously
+	  reclaims cold anonymous pages of background apps while free swap stays
+	  above a configurable limit, and only begins killing once swap runs low.
+
+	  Tasks are classified into CRITICAL, SYSTEM_APP, PINNED and APP phases.
+	  Android system core processes are never killed.  App kills are biased
+	  by cumulative CPU usage time so that lightly used apps are reclaimed
+	  first and heavily used apps are preserved.  Packages may be pinned by
+	  name to grant them materially longer survivability.
+
+	  This is not simple_lmk and does not depend on it.  If unsure, say N.
+
+config ANDROID_TAGLMK_ARM64_NEON
+	bool "TAGLMK ARM64 NEON prediction accelerator"
+	depends on ANDROID_TAGLMK && ARM64 && KERNEL_MODE_NEON
+	default y
+	help
+	  Use an ARM64 NEON accelerator for TAGLMK's memory-cache-load and
+	  burstiness prediction, computed in Q4.4 fixed point combined with an
+	  integer/float (intfp) scalar factor.
+
+	  When this option is disabled, or when NEON is unavailable at runtime,
+	  TAGLMK falls back to an equivalent basic 32-bit integer/float
+	  (intfp-32) implementation of the same algorithm.  The fallback yields
+	  the same decisions; it is only slower.
+
+	  If unsure, say Y.
