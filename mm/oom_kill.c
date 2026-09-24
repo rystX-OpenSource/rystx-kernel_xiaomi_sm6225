@@ -44,6 +44,7 @@
 #include <linux/memory_hotplug.h>
 #include <linux/show_mem_notifier.h>
 #include <linux/cred.h>
+#include <linux/taglmk.h>
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -1098,6 +1099,15 @@ bool out_of_memory(struct oom_control *oc)
 {
 	unsigned long freed = 0;
 	enum oom_constraint constraint = CONSTRAINT_NONE;
+
+	/*
+	 * When TAGLMK is the active LMK it reclaims and kills in the background
+	 * under its own core-safe policy, so defer to it instead of letting the
+	 * in-kernel OOM killer pick a victim by badness score.  Returning true
+	 * tells the allocator to retry while TAGLMK frees memory.
+	 */
+	if (taglmk_oom_active())
+		return true;
 
 	if (oom_killer_disabled)
 		return false;

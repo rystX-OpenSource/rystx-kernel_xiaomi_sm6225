@@ -17,6 +17,8 @@
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
+#include <linux/taglmk.h>
+#include <linux/sched/signal.h>
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
 
@@ -2104,3 +2106,144 @@ const struct file_operations proc_pid_numa_maps_operations = {
 };
 
 #endif /* CONFIG_NUMA */
+
+#ifdef CONFIG_ANDROID_TAGLMK
+/*
+ * TAGLMK per-task memory inspection and guided reclaim.
+ *
+ * These are the driver's per-task memory-usage inspection and page-out
+ * helpers.  They live here because they walk a task's page tables using the
+ * same idioms as the smaps/clear_refs machinery above.  Both are called from
+ * the TAGLMK kthread (process context) with a pinned task reference.
+ */
+int taglmk_mm_inspect(struct task_struct *tsk, struct taglmk_mm_stat *stat)
+{
+	struct mm_struct *mm;
+
+	memset(stat, 0, sizeof(*stat));
+	mm = get_task_mm(tsk);
+	if (!mm)
+		return -ESRCH;
+
+	stat->rss_anon = get_mm_counter(mm, MM_ANONPAGES);
+	stat->rss_file = get_mm_counter(mm, MM_FILEPAGES) +
+			 get_mm_counter(mm, MM_SHMEMPAGES);
+	stat->swap_ents = get_mm_counter(mm, MM_SWAPENTS);
+	mmput(mm);
+	return 0;
+}
+
+struct taglmk_reclaim_walk {
+	unsigned long nr_target;	/* stop after isolating this many */
+	unsigned long nr_isolated;
+	unsigned long nr_reclaimed;
+};
+
+static int taglmk_pageout_pmd(pmd_t *pmd, unsigned long addr,
+			      unsigned long end, struct mm_walk *walk)
+{
+	struct taglmk_reclaim_walk *priv = walk->private;
+	struct vm_area_struct *vma = walk->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	pte_t *orig_pte, *pte, ptent;
+	spinlock_t *ptl;
+	struct page *page;
+	LIST_HEAD(page_list);
+
+	if (fatal_signal_pending(current))
+		return -EINTR;
+	if (priv->nr_isolated >= priv->nr_target)
+		return 0;
+	if (pmd_trans_unstable(pmd))
+		return 0;
+
+	orig_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	for (; addr < end; pte++, addr += PAGE_SIZE) {
+		ptent = *pte;
+
+		if (pte_none(ptent) || !pte_present(ptent))
+			continue;
+
+		page = vm_normal_page(vma, addr, ptent);
+		if (!page || PageTransCompound(page))
+			continue;
+		if (!PageLRU(page) || !PageAnon(page))
+			continue;
+		/* Do not disturb pages shared with other mm's. */
+		if (page_mapcount(page) != 1)
+			continue;
+
+		/*
+		 * Second-chance cold detection: a page whose access bit is
+		 * still set was touched since our last pass, so leave it be.
+		 * Only pages that have gone cold are isolated for reclaim.
+		 */
+		if (ptep_test_and_clear_young(vma, addr, pte))
+			continue;
+
+		ClearPageReferenced(page);
+		test_and_clear_page_young(page);
+		if (!isolate_lru_page(page)) {
+			if (PageUnevictable(page)) {
+				putback_lru_page(page);
+			} else {
+				list_add(&page->lru, &page_list);
+				priv->nr_isolated++;
+			}
+		}
+		if (priv->nr_isolated >= priv->nr_target)
+			break;
+	}
+	pte_unmap_unlock(orig_pte, ptl);
+
+	priv->nr_reclaimed += reclaim_pages(&page_list);
+	cond_resched();
+	return 0;
+}
+
+static const struct mm_walk_ops taglmk_pageout_ops = {
+	.pmd_entry = taglmk_pageout_pmd,
+};
+
+unsigned long taglmk_reclaim_task_anon(struct task_struct *tsk,
+				       unsigned long nr_to_reclaim)
+{
+	struct taglmk_reclaim_walk priv = {
+		.nr_target = nr_to_reclaim,
+	};
+	struct vm_area_struct *vma;
+	struct mm_struct *mm;
+
+	if (!nr_to_reclaim)
+		return 0;
+
+	mm = get_task_mm(tsk);
+	if (!mm)
+		return 0;
+
+	lru_add_drain();
+	if (!mmap_read_trylock(mm)) {
+		mmput(mm);
+		return 0;
+	}
+
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (!vma_is_anonymous(vma))
+			continue;
+		if (vma->vm_flags & (VM_LOCKED | VM_HUGETLB | VM_PFNMAP | VM_IO))
+			continue;
+
+		walk_page_range(mm, vma->vm_start, vma->vm_end,
+				&taglmk_pageout_ops, &priv);
+
+		if (priv.nr_isolated >= priv.nr_target)
+			break;
+		if (fatal_signal_pending(current))
+			break;
+	}
+
+	mmap_read_unlock(mm);
+	mmput(mm);
+	return priv.nr_reclaimed;
+}
+#endif /* CONFIG_ANDROID_TAGLMK */
