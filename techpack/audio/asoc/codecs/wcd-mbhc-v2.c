@@ -25,6 +25,12 @@
 #include "wcd-mbhc-legacy.h"
 #include "wcd-mbhc-adc.h"
 #include <asoc/wcd-mbhc-v2-api.h>
+#include <asoc/wcd-mbhc-v2.h>
+
+/* ASUS_BSP: state shared with the AudioWizard calibration ioctls */
+int g_jack_det_invert;
+uint32_t g_ZL;
+uint32_t g_ZR;
 
 void wcd_mbhc_jack_report(struct wcd_mbhc *mbhc,
 			  struct snd_soc_jack *jack, int status, int mask)
@@ -690,6 +696,10 @@ void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 			WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_FSM_EN, 1);
 			mbhc->mbhc_cb->compute_impedance(mbhc,
 					&mbhc->zl, &mbhc->zr);
+			g_ZL = mbhc->zl;
+			g_ZR = mbhc->zr;
+			pr_debug("%s: hs_imp_val: ZL = %d, ZR = %d\n",
+				 __func__, g_ZL, g_ZR);
 			WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_FSM_EN,
 						 fsm_en);
 			if ((mbhc->zl > mbhc->mbhc_cfg->linein_th) &&
@@ -932,6 +942,10 @@ static void wcd_mbhc_swch_irq_handler(struct wcd_mbhc *mbhc)
 	if (mbhc->mbhc_cb->mbhc_micb_ramp_control)
 		mbhc->mbhc_cb->mbhc_micb_ramp_control(component, true);
 
+	/* ASUS_BSP: skip normal detection while AudioWizard debug mode is on */
+	if (g_DebugMode)
+		goto done;
+
 	if (mbhc->mbhc_cb->micbias_enable_status)
 		micbias1 = mbhc->mbhc_cb->micbias_enable_status(mbhc,
 						MIC_BIAS_1);
@@ -1081,6 +1095,70 @@ static irqreturn_t wcd_mbhc_mech_plug_detect_irq(int irq, void *data)
 	pr_debug("%s: leave %d\n", __func__, r);
 	return r;
 }
+
+/*
+ * ASUS_BSP: AudioWizard debug-mode jack detection control. While
+ * debug_mode is set the normal mechanical-plug handling is skipped
+ * (see wcd_mbhc_swch_irq_handler) and button/OCP interrupts are
+ * disabled so the wizard lib can run its own measurements. Clearing
+ * debug mode re-enables the interrupts and retriggers detection.
+ */
+void wcd_mbhc_plug_detect_for_debug_mode(struct wcd_mbhc *mbhc, int debug_mode)
+{
+	if (debug_mode) {
+		if (mbhc->current_plug != MBHC_PLUG_TYPE_NONE) {
+			pr_debug("%s: current_plug != MBHC_PLUG_TYPE_NONE, force removal\n",
+				 __func__);
+			mbhc->mbhc_cb->lock_sleep(mbhc, true);
+			wcd_mbhc_swch_irq_handler(mbhc);
+			mbhc->mbhc_cb->lock_sleep(mbhc, false);
+			g_jack_det_invert = 1;
+		}
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->mbhc_btn_press_intr, false);
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->mbhc_btn_release_intr, false);
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->hph_left_ocp, false);
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->hph_right_ocp, false);
+	} else {
+		bool detection_type;
+
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->mbhc_btn_press_intr, true);
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->mbhc_btn_release_intr, true);
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->hph_left_ocp, true);
+		mbhc->mbhc_cb->irq_control(mbhc->component,
+				mbhc->intr_ids->hph_right_ocp, true);
+		WCD_MBHC_REG_READ(WCD_MBHC_MECH_DETECTION_TYPE,
+				  detection_type);
+		if (!g_jack_det_invert && !detection_type) {
+			pr_debug("%s: g_jack_det_invert == 0, detect plug type\n",
+				 __func__);
+			WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_MECH_DETECTION_TYPE,
+					!detection_type);
+			mbhc->mbhc_cb->lock_sleep(mbhc, true);
+			wcd_mbhc_swch_irq_handler(mbhc);
+			mbhc->mbhc_cb->lock_sleep(mbhc, false);
+		} else if (g_jack_det_invert && !detection_type) {
+			pr_debug("%s: current_plug == MBHC_PLUG_TYPE_NONE\n",
+				 __func__);
+			WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_MECH_DETECTION_TYPE,
+					!detection_type);
+		} else if (g_jack_det_invert && detection_type) {
+			pr_debug("%s: g_jack_det_invert == 1, detect plug type\n",
+				 __func__);
+			mbhc->mbhc_cb->lock_sleep(mbhc, true);
+			wcd_mbhc_swch_irq_handler(mbhc);
+			mbhc->mbhc_cb->lock_sleep(mbhc, false);
+		}
+		g_jack_det_invert = 0;
+	}
+}
+EXPORT_SYMBOL(wcd_mbhc_plug_detect_for_debug_mode);
 
 int wcd_mbhc_get_button_mask(struct wcd_mbhc *mbhc)
 {

@@ -13,6 +13,8 @@
 #include <linux/component.h>
 #include <linux/regmap.h>
 #include <linux/pm_runtime.h>
+#include <linux/extcon.h>
+#include <linux/extcon-provider.h>
 #include <sound/soc.h>
 #include <sound/tlv.h>
 #include <soc/soundwire.h>
@@ -20,6 +22,7 @@
 #include <sound/soc-dapm.h>
 #include "internal.h"
 #include "wcd937x.h"
+#include <asoc/wcd-mbhc-v2.h>
 #include <asoc/wcdcal-hwdep.h>
 #include "wcd937x-registers.h"
 #include <asoc/msm-cdc-pinctrl.h>
@@ -56,6 +59,18 @@ enum {
 
 static const DECLARE_TLV_DB_SCALE(line_gain, 0, 7, 1);
 static const DECLARE_TLV_DB_SCALE(analog_gain, 0, 25, 1);
+
+/*
+ * ASUS_BSP: AudioWizard hook state. g_DebugMode gates the normal
+ * MBHC plug handling (see wcd-mbhc-v2.c); the extcon device exposes
+ * the forced-preset flag as a virtual EXTCON_JACK_HEADPHONE state
+ * for the AudioWizard userspace (replaces the legacy switch_dev).
+ */
+int g_DebugMode; /* stays 0: normal MBHC detection unless debug tools set it */
+struct extcon_dev *g_audiowizard_force_preset_edev;
+static const unsigned int audiowizard_force_preset_cable[] = {
+	EXTCON_JACK_HEADPHONE, EXTCON_NONE,
+};
 
 static int wcd937x_handle_post_irq(void *data);
 static int wcd937x_reset(struct device *dev);
@@ -2960,6 +2975,32 @@ static int wcd937x_soc_codec_probe(struct snd_soc_component *component)
 		snd_soc_dapm_sync(dapm);
 	}
 	wcd937x->version = WCD937X_VERSION_1_0;
+
+	/* ASUS_BSP: audiowizard_force_preset extcon device */
+	if (!g_audiowizard_force_preset_edev) {
+		g_audiowizard_force_preset_edev =
+			devm_extcon_dev_allocate(component->dev,
+					audiowizard_force_preset_cable);
+		if (IS_ERR(g_audiowizard_force_preset_edev)) {
+			dev_err(component->dev,
+				"%s: failed to allocate extcon device\n",
+				__func__);
+			ret = PTR_ERR(g_audiowizard_force_preset_edev);
+			g_audiowizard_force_preset_edev = NULL;
+			goto err;
+		}
+		/* Name shows up as dev_name(parent), i.e. the codec dev */
+		ret = devm_extcon_dev_register(component->dev,
+					g_audiowizard_force_preset_edev);
+		if (ret < 0) {
+			dev_err(component->dev,
+				"%s: failed to register extcon device\n",
+				__func__);
+			g_audiowizard_force_preset_edev = NULL;
+			goto err;
+		}
+	}
+
        /* Register event notifier */
 	wcd937x->nblock.notifier_call = wcd937x_event_notify;
 	if (wcd937x->register_notifier) {
@@ -2988,6 +3029,8 @@ static void wcd937x_soc_codec_remove(struct snd_soc_component *component)
 
 	if (!wcd937x)
 		return;
+
+	g_audiowizard_force_preset_edev = NULL;
 
 	if (wcd937x->register_notifier)
 		wcd937x->register_notifier(wcd937x->handle,

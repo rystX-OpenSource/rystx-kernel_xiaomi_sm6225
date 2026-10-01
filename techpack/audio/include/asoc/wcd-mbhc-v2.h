@@ -620,6 +620,17 @@ struct wcd_mbhc {
 	struct notifier_block fsa_nb;
 };
 
+/*
+ * ASUS_BSP: AudioWizard state shared between the wcd937x codec,
+ * the MBHC plug handling and dsp/audio_calibration.c.
+ */
+struct extcon_dev;
+extern int g_DebugMode;
+extern struct extcon_dev *g_audiowizard_force_preset_edev;
+extern uint32_t g_ZL;
+extern uint32_t g_ZR;
+void wcd_mbhc_plug_detect_for_debug_mode(struct wcd_mbhc *mbhc, int debug_mode);
+
 void wcd_mbhc_find_plug_and_report(struct wcd_mbhc *mbhc,
 				   enum wcd_mbhc_plug_type plug_type);
 void wcd_mbhc_hs_elec_irq(struct wcd_mbhc *mbhc, int irq_type, bool enable);
