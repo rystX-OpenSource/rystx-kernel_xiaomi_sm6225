@@ -7,6 +7,7 @@
 #include <linux/ratelimit.h>
 #include <sound/compress_params.h>
 #include <sound/devdep_params.h>
+#include <dsp/msm-dts-eagle.h>
 #include <dsp/apr_audio-v2.h>
 #include <dsp/q6asm-v2.h>
 #include <dsp/msm-audio-effects-q6-v2.h>
@@ -50,6 +51,26 @@ bool msm_audio_effects_is_effmodule_supp_in_top(int effect_module,
 	case EQ_MODULE:
 		switch (topology) {
 		case ASM_STREAM_POSTPROC_TOPO_ID_SA_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER:
+			return true;
+		default:
+			return false;
+		}
+	case DTS_EAGLE_MODULE:
+		switch (topology) {
+		case ASM_STREAM_POSTPROC_TOPO_ID_DTS_HPX:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER:
+			return true;
+		default:
+			return false;
+		}
+	case SOFT_VOLUME2_MODULE:
+	case DTS_EAGLE_MODULE_ENABLE:
+		switch (topology) {
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS:
+		case ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER:
 			return true;
 		default:
 			return false;
@@ -266,7 +287,7 @@ int msm_audio_effects_virtualizer_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 	else
 		pr_debug("%s: did not send pp params\n", __func__);
@@ -701,7 +722,7 @@ int msm_audio_effects_reverb_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 	else
 		pr_debug("%s: did not send pp params\n", __func__);
@@ -855,7 +876,7 @@ int msm_audio_effects_bass_boost_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 	else
 		pr_debug("%s: did not send pp params\n", __func__);
@@ -1055,7 +1076,7 @@ int msm_audio_effects_pbe_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 invalid_config:
 	kfree(params);
@@ -1314,7 +1335,7 @@ int msm_audio_effects_popless_eq_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 	else
 		pr_debug("%s: did not send pp params\n", __func__);
@@ -1456,7 +1477,7 @@ static int __msm_audio_effects_volume_handler(struct audio_client *ac,
 		updt_params += packed_data_size;
 		params_length += packed_data_size;
 	}
-	if (params_length && (rc == 0))
+	if (params_length && !msm_dts_eagle_is_hpx_on() && (rc == 0))
 		q6asm_set_pp_params(ac, NULL, params, params_length);
 invalid_config:
 	kfree(params);

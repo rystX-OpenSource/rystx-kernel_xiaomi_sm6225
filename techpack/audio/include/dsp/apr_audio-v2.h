@@ -11609,6 +11609,16 @@ struct srs_trumedia_params {
 #define ASM_STREAM_POSTPROC_TOPO_ID_DTS_HPX 0x00010DED
 #define ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS  0x10015000
 #define ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER  0x10015001
+struct asm_dts_eagle_param {
+	struct apr_hdr	hdr;
+	struct asm_stream_cmd_set_pp_params param;
+	struct param_hdr_v1 data;
+} __packed;
+
+struct asm_dts_eagle_param_get {
+	struct apr_hdr	hdr;
+	struct asm_stream_cmd_get_pp_params_v2 param;
+} __packed;
 
 /* Opcode to set BT address and license for aptx decoder */
 #define APTX_DECODER_BT_ADDRESS 0x00013201
