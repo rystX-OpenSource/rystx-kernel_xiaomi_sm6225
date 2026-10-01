@@ -9,6 +9,9 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/msm_ion.h>
+#include <linux/extcon-provider.h>
+#include <sound/soc.h>
+#include <asoc/wcd-mbhc-v2.h>
 #include <dsp/msm_audio_ion.h>
 #include <dsp/audio_calibration.h>
 #include <dsp/audio_cal_utils.h>
@@ -27,6 +30,10 @@ struct audio_cal_info {
 
 static struct audio_cal_info	audio_cal;
 
+/* ASUS_BSP: AudioWizard state (set from userspace via cal ioctls) */
+int g_audiowizard_force_preset_state;
+static int audio_mode = -1;
+static int audio_24bit;
 
 static bool callbacks_are_equal(struct audio_cal_callbacks *callback1,
 				struct audio_cal_callbacks *callback2)
@@ -403,6 +410,67 @@ static long audio_cal_shared_ioctl(struct file *file, unsigned int cmd,
 	case AUDIO_GET_CALIBRATION:
 	case AUDIO_POST_CALIBRATION:
 		break;
+	/* ASUS_BSP */
+	case AUDIO_SET_AUDIOWIZARD_FORCE_PRESET:
+		mutex_lock(&audio_cal.cal_mutex[AUDIOWIZARD_FORCE_PRESET_TYPE]);
+		if (copy_from_user(&g_audiowizard_force_preset_state,
+				   (void __user *)arg,
+				   sizeof(g_audiowizard_force_preset_state))) {
+			pr_err("%s: Could not copy force preset state from user\n",
+				__func__);
+			ret = -EFAULT;
+		} else if (g_audiowizard_force_preset_edev) {
+			extcon_set_state_sync(g_audiowizard_force_preset_edev,
+				EXTCON_JACK_HEADPHONE,
+				g_audiowizard_force_preset_state != 0);
+			pr_debug("%s: force preset state %d\n", __func__,
+				 g_audiowizard_force_preset_state);
+		}
+		mutex_unlock(&audio_cal.cal_mutex[AUDIOWIZARD_FORCE_PRESET_TYPE]);
+		goto done;
+	case AUDIO_GET_HS_IMP: {
+		struct headset_imp_val imp_val;
+
+		mutex_lock(&audio_cal.cal_mutex[GET_IMP_TYPE]);
+		imp_val.ZL = g_ZL;
+		imp_val.ZR = g_ZR;
+		pr_debug("%s: hs_imp_val: ZL = %d, ZR = %d\n", __func__,
+			 imp_val.ZL, imp_val.ZR);
+		if (copy_to_user((void __user *)arg, &imp_val,
+				 sizeof(imp_val))) {
+			pr_err("%s: Could not copy imp_val to user\n",
+				__func__);
+			ret = -EFAULT;
+		}
+		mutex_unlock(&audio_cal.cal_mutex[GET_IMP_TYPE]);
+		goto done;
+	}
+	case AUDIO_SET_MODE:
+		mutex_lock(&audio_cal.cal_mutex[SET_MODE_TYPE]);
+		if (copy_from_user(&audio_mode, (void __user *)arg,
+				   sizeof(audio_mode))) {
+			pr_err("%s: Could not copy audio mode from user\n",
+				__func__);
+			ret = -EFAULT;
+		} else {
+			pr_debug("%s: audio mode %d\n", __func__,
+				 audio_mode);
+		}
+		mutex_unlock(&audio_cal.cal_mutex[SET_MODE_TYPE]);
+		goto done;
+	case AUDIO_SET_FORMAT:
+		mutex_lock(&audio_cal.cal_mutex[SET_FORMAT_TYPE]);
+		if (copy_from_user(&audio_24bit, (void __user *)arg,
+				   sizeof(audio_24bit))) {
+			pr_err("%s: Could not copy audio format from user\n",
+				__func__);
+			ret = -EFAULT;
+		} else {
+			pr_debug("%s: audio_24bit %d\n", __func__,
+				 audio_24bit);
+		}
+		mutex_unlock(&audio_cal.cal_mutex[SET_FORMAT_TYPE]);
+		goto done;
 	default:
 		pr_err("%s: ioctl not found!\n", __func__);
 		ret = -EFAULT;
@@ -511,6 +579,13 @@ done:
 	return ret;
 }
 
+/* ASUS_BSP */
+int get_audiomode(void)
+{
+	return audio_mode;
+}
+EXPORT_SYMBOL(get_audiomode);
+
 static long audio_cal_ioctl(struct file *f,
 		unsigned int cmd, unsigned long arg)
 {
@@ -531,6 +606,16 @@ static long audio_cal_ioctl(struct file *f,
 							204, compat_uptr_t)
 #define AUDIO_POST_CALIBRATION32	_IOWR(CAL_IOCTL_MAGIC, \
 							205, compat_uptr_t)
+
+/* ASUS_BSP */
+#define AUDIO_SET_AUDIOWIZARD_FORCE_PRESET32	_IOWR(CAL_IOCTL_MAGIC, \
+							221, compat_uptr_t)
+#define AUDIO_GET_HS_IMP32			_IOWR(CAL_IOCTL_MAGIC, \
+							230, compat_uptr_t)
+#define AUDIO_SET_MODE32			_IOWR(CAL_IOCTL_MAGIC, \
+							225, compat_uptr_t)
+#define AUDIO_SET_FORMAT32			_IOWR(CAL_IOCTL_MAGIC, \
+							231, compat_uptr_t)
 
 static long audio_cal_compat_ioctl(struct file *f,
 		unsigned int cmd, unsigned long arg)
@@ -556,6 +641,19 @@ static long audio_cal_compat_ioctl(struct file *f,
 		break;
 	case AUDIO_POST_CALIBRATION32:
 		cmd64 = AUDIO_POST_CALIBRATION;
+		break;
+	/* ASUS_BSP */
+	case AUDIO_SET_AUDIOWIZARD_FORCE_PRESET32:
+		cmd64 = AUDIO_SET_AUDIOWIZARD_FORCE_PRESET;
+		break;
+	case AUDIO_GET_HS_IMP32:
+		cmd64 = AUDIO_GET_HS_IMP;
+		break;
+	case AUDIO_SET_MODE32:
+		cmd64 = AUDIO_SET_MODE;
+		break;
+	case AUDIO_SET_FORMAT32:
+		cmd64 = AUDIO_SET_FORMAT;
 		break;
 	default:
 		pr_err("%s: ioctl not found!\n", __func__);
