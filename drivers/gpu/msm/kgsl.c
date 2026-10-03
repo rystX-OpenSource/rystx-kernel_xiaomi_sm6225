@@ -24,6 +24,7 @@
 #include "kgsl_compat.h"
 #include "kgsl_debugfs.h"
 #include "kgsl_device.h"
+#include "kgsl_fld.h"
 #include "kgsl_mmu.h"
 #include "kgsl_reclaim.h"
 #include "kgsl_sync.h"
@@ -2101,6 +2102,9 @@ long kgsl_ioctl_gpu_command(struct kgsl_device_private *dev_priv,
 
 	result = device->ftbl->queue_cmds(dev_priv, context, drawobj,
 				i, &param->timestamp);
+
+	/* FLD frame tick: one submit == one frame boundary candidate. */
+	kgsl_fld_submit_tick(device);
 
 done:
 	/*
