@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config FLD_GPU
+	bool "FLD frame-load GPU scheduler for Adreno (KGSL)"
+	depends on QCOM_KGSL=y
+	help
+	  Frame Load Decision (FLD) is a GPU scheduler for Qualcomm Adreno
+	  (KGSL) that picks GPU power levels from per-frame demand instead
+	  of only reacting to averaged GPU busy time.  It combines GPU
+	  feedback (hardware busy counters) with CPU feed-forward (PELT
+	  utilization of the threads submitting GPU work), then tunes the
+	  latency-adding parts of the KGSL power path (idle timer, power
+	  level shaping) on top.
+
+	  FLD is NOT a devfreq governor: there is nothing to select.  While
+	  FLD is enabled it owns the GPU frequency decision and the stock
+	  devfreq governor's requests are ignored; all thermal and user
+	  constraints keep working.  /sys/kernel/fld/ exposes tunables and
+	  runtime status.
+
+	  Requires CONFIG_QCOM_KGSL=y (built-in).  Verified on Linux 4.19
+	  (Adreno 610 / Snapdragon 680).  See docs/fld-kgsl-hooks.md for the
+	  KGSL integration points this depends on.
+
+config FLD_GPU_DEBUG
+	bool "FLD verbose decision logging"
+	depends on FLD_GPU
+	help
+	  Log every FLD frequency decision and idle-timer change with
+	  pr_info_ratelimited().  Off by default; enable only while tuning,
+	  this can be noisy under sustained GPU load.
