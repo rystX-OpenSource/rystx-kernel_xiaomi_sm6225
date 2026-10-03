@@ -9,6 +9,7 @@
 #include <linux/msm_kgsl.h>
 
 #include "kgsl_device.h"
+#include "kgsl_fld.h"
 #include "kgsl_pwrscale.h"
 #include "kgsl_trace.h"
 
@@ -540,6 +541,16 @@ int kgsl_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 		 * but it needs to be at the max power level when waking up
 		 */
 		pwr->wakeup_maxpwrlevel = 1;
+		return 0;
+	}
+
+	/*
+	 * While the FLD GPU scheduler owns the frequency policy it applies
+	 * its own (constraint-respecting) pwrlevel changes; stand aside so
+	 * the governor does not fight it.  Stats keep flowing.
+	 */
+	if (kgsl_fld_own_freq(device)) {
+		*freq = kgsl_pwrctrl_active_freq(pwr);
 		return 0;
 	}
 
